@@ -5,8 +5,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -28,15 +26,12 @@ func TestRun_usageErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := config.Config{DatabasePath: filepath.Join(t.TempDir(), "uatu.db"), Users: tt.users}
+			cfg := config.Config{DatabaseURL: "not-a-database-url", Users: tt.users}
 
 			err := run(t.Context(), tt.args, cfg, testLogger(), io.Discard)
 			var usageErr *usageError
 			if !errors.As(err, &usageErr) {
 				t.Fatalf("run(%q) error = %v, want usage error", tt.args, err)
-			}
-			if _, statErr := os.Stat(cfg.DatabasePath); !errors.Is(statErr, os.ErrNotExist) {
-				t.Errorf("run(%q) created database; stat error = %v, want not exist", tt.args, statErr)
 			}
 		})
 	}

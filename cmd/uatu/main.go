@@ -38,7 +38,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	err := run(ctx, os.Args[1:], config.Load(), logger, os.Stdout)
+	cfg, err := config.Load()
+	if err != nil {
+		logger.Error("load configuration", "err", err)
+		os.Exit(1)
+	}
+	err = run(ctx, os.Args[1:], cfg, logger, os.Stdout)
 	if err == nil {
 		return
 	}
@@ -81,27 +86,33 @@ func run(ctx context.Context, args []string, cfg config.Config, logger *slog.Log
 	}
 }
 
-func serve(ctx context.Context, cfg config.Config, logger *slog.Logger) (err error) {
-	db, err := store.Open(ctx, cfg.DatabasePath)
+func serve(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
+	db, err := store.Open(ctx, storeOptions(cfg))
 	if err != nil {
 		return err
 	}
-	defer func() {
-		err = errors.Join(err, db.Close())
-	}()
+	defer db.Close()
 	return server.Run(ctx, cfg.Address, server.NewHandler(db, logger), logger)
 }
 
-func collect(ctx context.Context, cfg config.Config, users []string, logger *slog.Logger) (err error) {
-	db, err := store.Open(ctx, cfg.DatabasePath)
+func collect(ctx context.Context, cfg config.Config, users []string, logger *slog.Logger) error {
+	db, err := store.Open(ctx, storeOptions(cfg))
 	if err != nil {
 		return err
 	}
-	defer func() {
-		err = errors.Join(err, db.Close())
-	}()
+	defer db.Close()
 	c := collector.New(db, github.NewClient(cfg.GitHubToken, nil))
 	return collectUsers(ctx, c, collector.Sources(), users, logger)
+}
+
+func storeOptions(cfg config.Config) store.Options {
+	return store.Options{
+		URL:            cfg.DatabaseURL,
+		SSLMode:        cfg.DatabaseSSLMode,
+		MinConns:       cfg.DatabaseMinConns,
+		MaxConns:       cfg.DatabaseMaxConns,
+		ConnectTimeout: cfg.DatabaseConnectTimeout,
+	}
 }
 
 // sourceCollector collects one source for one user.

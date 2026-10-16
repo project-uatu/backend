@@ -20,13 +20,16 @@ future commands, schema or endpoints described below.
 ## Current status
 
 The repository is a small Go scaffold: `serve`, one-shot `collect`, typed
-startup configuration, SQLite snapshot storage/migrations, structured logging,
-stdlib HTTP routing, tests and a static non-root container.
+startup configuration, a PostgreSQL connection pool and initial person/event
+schema, structured logging, stdlib HTTP routing, tests and a static non-root
+container.
 
-GitHub currently lists owned repository names, not contributions. Storage
-overwrites the latest snapshot; it has no persons, identity claims, event
-history, sync reports or checkpoints. The HTTP API is read-only and never
-fetches from upstream (ADR 0003).
+GitHub currently lists owned repository names, not contributions. The
+PostgreSQL schema now represents persons, identities, raw and normalized
+events, coverage and collector state. The existing repository-list endpoint
+still uses a temporary snapshot table until issue #5 replaces it with
+contribution history. The HTTP API is read-only and never fetches from
+upstream (ADR 0003).
 There is no Kubernetes deployment or versioned person-centric API yet.
 
 The module path and imports have now been corrected and legacy-organization
@@ -62,7 +65,8 @@ backup/restore remain necessary even with multiple application replicas.
   packages. No public connector tree or embedded frontend.
 - Replace SQLite with PostgreSQL using ordered, serialized migrations. Nothing
   has shipped, so no SQLite data transition is needed. Do not maintain two
-  database backends. Design rolling-version schema compatibility.
+  database backends. Design rolling-version schema compatibility. Keep the
+  temporary repository snapshot table until issue #5 delivers GitHub history.
 - Stream bounded pages/batches instead of returning full histories in memory.
   Define interfaces at consumers, typed actor keys and event kinds, and
   `json.RawMessage` payloads. Design package dependencies to avoid import cycles.
@@ -161,11 +165,17 @@ schema (#3, #5), and the versioned API (#6).
 
 ### 3. Migrate to PostgreSQL and implement the person, identity and event schema
 
-Dependencies: none; final job-state fields also depend on step 1.
+Dependencies: accepted ADRs 0001, 0002 and 0004.
 
-ADR 0001 accepts PostgreSQL. Accept a follow-up ADR for identity evidence, event
-ownership, configuration and migration design first.
-Keep PostgreSQL queries in `internal/store` and identity rules in `internal/identity`.
+ADR 0001 accepts PostgreSQL. Keep PostgreSQL queries in `internal/store` and
+identity rules in `internal/identity`.
+
+[Accepted ADR 0004](adr/0004-person-identity-event-model.md) defines the
+person, identity and event data model. Database, migration and configuration
+choices follow ADR 0001. Detailed collection, checkpoint and job-processing
+behavior remains in issue #4 under accepted ADR 0002. Person-associated
+removal is handled in the schema; payload erasure and takedown policy are
+deferred to issue #10.
 
 Acceptance:
 - Add persons, instance-scoped identities with stable account IDs, auditable
@@ -175,8 +185,10 @@ Acceptance:
 - Define deduplication, deletion, schema/normalizer versions and query indexes.
 - Replace the SQLite driver/configuration with pure-Go `pgx`, explicit
   connection/TLS/pool settings and ordered, serialized migrations.
-- Remove the SQLite driver, snapshot store and migrations; nothing has shipped,
-  so no data transfer is required and no dual backend is kept.
+- Remove the SQLite driver and file-based migrations; nothing has shipped, so
+  no data transfer is required and no dual backend is kept. Retain only the
+  temporary PostgreSQL snapshot table used by the current repository route,
+  pending replacement in #5.
 - Use foreign keys and UTC values; test concurrent clients, migration
   serialization and rolling-version compatibility against isolated PostgreSQL.
 

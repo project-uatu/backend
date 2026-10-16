@@ -76,10 +76,10 @@ containers later. A Helm-provisioned PostgreSQL still needs persistent storage,
 backups, restores and upgrades, and it is not automatically highly available.
 Database high availability is a separate concern from application replicas.
 
-The existing SQLite driver, configuration, migrations and tests must be
-replaced. No SQLite release has shipped, so no data migration path is needed.
-Until the change lands, README runtime instructions continue to describe the
-current SQLite implementation.
+The SQLite driver, configuration, migrations and tests are replaced by issue
+#3. No SQLite release has shipped, so no data migration path is needed. A
+temporary PostgreSQL snapshot table preserves the current repository-list
+scaffold until issue #5 replaces it with contribution history.
 
 The frontend integrates through a documented, versioned HTTP contract. Identity
 emails and raw upstream payloads are not public by default.

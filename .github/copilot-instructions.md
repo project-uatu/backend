@@ -1,10 +1,9 @@
 # Uatu repository instructions
 
 Uatu is a lightweight, containerized Go service. It collects public open source
-activity for developers. PostgreSQL is the accepted target database (ADR 0001);
-the current SQLite implementation is awaiting migration. The binary
-has two modes: `collect` fetches and stores data, then exits, and `serve` is an
-HTTP API that reads from stored data.
+activity for developers and uses PostgreSQL through pure-Go `pgx` (ADR 0001).
+The binary has two modes: `collect` fetches and stores data, then exits, and
+`serve` is an HTTP API that reads from stored data.
 
 ## Required for every change
 
