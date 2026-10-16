@@ -23,15 +23,14 @@ The repository is a small Go scaffold: `serve`, one-shot `collect`, typed
 startup configuration, SQLite snapshot storage/migrations, structured logging,
 stdlib HTTP routing, tests and a static non-root container.
 
-GitHub currently lists owned repository names, not contributions. DevStats is
-still wired in despite being rejected by the design. Storage overwrites the
+GitHub currently lists owned repository names, not contributions. Storage
+overwrites the
 latest snapshot; it has no persons, identity claims, event history, sync reports
 or checkpoints. GET on a missing snapshot still triggers an upstream fetch.
 There is no Kubernetes deployment or versioned person-centric API yet.
 
 The module path and imports have now been corrected and legacy-organization
-references audited. Other behavior is unchanged. CI lint-tool compatibility
-needs verification, not a blind update to an assumed action version.
+references audited. CI pins golangci-lint v2.14.0, which supports Go 1.26.
 
 ## Collector scheduling in Kubernetes
 
@@ -132,18 +131,33 @@ Acceptance:
 
 ### 2. Align the scaffold with backend scope and reliable CI
 
-Dependencies: none; can proceed alongside the topology decision.
+Dependencies: none.
 
-First accept an ADR for removing the DevStats and placeholder endpoints and
-changing cache-miss behavior.
+[ADR 0003](adr/0003-read-only-scaffold-api.md) (accepted) removes misleading
+routes and makes GET read-only.
+
+Done: CI lint pinned to golangci-lint v2.14.0 with `golangci-lint-action@v9`
+(commit `56bb1eb`).
 
 Acceptance:
-- Remove DevStats wiring and misleading contribution routes with a documented
-  replacement/deprecation policy; remove the placeholder root response.
-- Ensure GET requests never collect or mutate stored activity.
-- Verify and pin a Go-compatible lint/action combination; keep a static-image
-  build and add CLI command/error/cancellation tests.
-- Document current versus planned behavior without claiming new API support.
+- Remove `GET /gh/users/{user}/contributions` (it returns owned repository
+  names, not contributions) and the placeholder root response.
+- GET serves stored data or a JSON `404`; it never calls upstream or writes.
+  Remove `collector.UpstreamError` and the server's collector dependency, and
+  shorten the write timeout that was sized for upstream fetches.
+- Add the unversioned, read-only `GET /github/users/{user}/repositories`,
+  returning JSON encoded from a tagged struct. Validate `{user}` as a GitHub
+  login and return `400` for invalid input.
+- Validate `collect` arguments before opening the database. Print usage for
+  unknown commands and exit with status 2. Make the collection loop testable
+  offline; cover unknown command, missing users, partial failure and
+  cancellation.
+- Move `actions/checkout` and `actions/setup-go` to Node 24 releases; keep the
+  static image build.
+- Update the README.
+
+Out of scope: case-insensitive login keys, raw payloads and the PostgreSQL
+schema (#3, #5), and the versioned API (#6).
 
 ### 3. Migrate to PostgreSQL and implement the person, identity and event schema
 
