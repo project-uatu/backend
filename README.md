@@ -90,4 +90,5 @@ the Kubernetes collector scheduling comparison. The plan describes future
 behavior; the commands and endpoints above describe the current implementation.
 
 Major changes require an accepted [architecture decision record](docs/adr/README.md)
-before implementation. Collector scheduling (ADR 0002) is proposed, not accepted.
+before implementation. Collector scheduling (ADR 0002) is accepted but not yet
+implemented.

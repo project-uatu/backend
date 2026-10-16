@@ -40,7 +40,7 @@ needs verification, not a blind update to an assumed action version.
 | CronJob + one-shot `collect` | No idle worker resources; native schedule, retries and Job history; easy batch resource/deadline settings; can access PostgreSQL from any eligible node | New-pod startup; manual sync waits for the next run unless separately triggered; long jobs can skip schedules |
 | Always-running collector | Prompt queue pickup; natural jitter/backoff; no repeated pod startup; workers can scale independently of the API | Idle memory; application scheduling/recovery code; worker health monitoring; shared quota coordination across workers |
 
-**Recommendation, not yet accepted:** separate API and continuous collector
+**Accepted in ADR 0002:** separate API and continuous collector
 workloads sharing PostgreSQL, with bounded worker concurrency. Retain one-shot
 `collect` as the job-processing primitive. This remains batch collection,
 not real-time streaming.
@@ -53,8 +53,8 @@ upstream quotas. Do not hold database locks during upstream requests.
 A CronJob remains reasonable for hourly/daily freshness. `Forbid` reduces overlap
 but is not an exactly-once guarantee. Both approaches need durable job state.
 [ADR 0001](adr/0001-postgresql-backend-scope.md) accepts PostgreSQL and the
-external-or-provisioned Helm database contract. [Proposed ADR 0002](adr/0002-kubernetes-collector.md)
-covers scheduling and must be accepted before runtime changes. Database HA and
+external-or-provisioned Helm database contract. [Accepted ADR 0002](adr/0002-kubernetes-collector.md)
+covers scheduling. Database HA and
 backup/restore remain necessary even with multiple application replicas.
 
 ## Corrections to the original design
@@ -118,13 +118,16 @@ upstream services or a real GitHub token. No frontend work belongs in these issu
 
 Dependencies: none.
 
-Use accepted ADR 0001 as the storage baseline. Review and accept proposed
-ADR 0002 (continuous workers, or a CronJob alternative) before runtime changes.
+Use accepted ADR 0001 as the storage baseline. Done: ADR 0002 was accepted on
+2026-10-16 with continuous collector workers.
 
 Acceptance:
-- Record latency, workload size, replica counts and availability assumptions.
-- Decide atomic claims, expiring leases, stale-worker fencing and quota sharing.
-- Define restart recovery, deadlines, backoff, connection budgets and rollout.
+- Confirm or revise ADR 0002's MVP assumptions: daily scheduled sync, manual
+  work normally starts within one minute, one initial collector replica, and
+  scale-out after measuring queue age and throughput.
+- Decide continuous workers versus CronJob, including the manual-trigger path.
+- Accept the PostgreSQL job-claim, lease/fencing, retry, quota-coordination,
+  shutdown, migration and rollout behavior specified by the ADR.
 - Do not implement a daemon or manifests until the decision is accepted.
 
 ### 2. Align the scaffold with backend scope and reliable CI
@@ -179,7 +182,7 @@ Acceptance:
 - Persist due times, rate-limit resets, retry times and expiring job claims.
 - Use transactional PostgreSQL claims and ownership-checked progress writes;
   fetch upstream outside transactions and coordinate shared-credential quotas.
-- Retain one-shot collection; add loop mode only after ADR 0002 is accepted.
+- Retain one-shot collection; add loop mode as specified by accepted ADR 0002.
 - Test cancellation, duplicate jobs, stale claims, crash/restart and partial
   pages without relying on network access.
 
@@ -295,7 +298,7 @@ Deferred until the Kubernetes MVP is stable. Accept separate ADRs before each
 extension; this is a follow-on planning issue, not a single large implementation.
 
 Acceptance:
-- Document one-shot and, if accepted, loop-mode standalone deployment with
+- Document one-shot and loop-mode standalone deployment with
   PostgreSQL, secrets, graceful shutdown and the same replica safety guarantees.
 - Split approved JSON/CSV exports, OIDC/OAuth self-onboarding, StackExchange,
   public sharing and tenant isolation into bounded follow-up issues.

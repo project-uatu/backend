@@ -22,4 +22,4 @@ an ADR unless they change an architectural contract.
 | Record | Status |
 |---|---|
 | [0001: PostgreSQL and backend-only scope](0001-postgresql-backend-scope.md) | Accepted |
-| [0002: Kubernetes collector scheduling](0002-kubernetes-collector.md) | Proposed |
+| [0002: Kubernetes collector scheduling](0002-kubernetes-collector.md) | Accepted |
