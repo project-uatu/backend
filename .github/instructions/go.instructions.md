@@ -101,7 +101,7 @@ Sources: [Effective Go](https://go.dev/doc/effective_go),
 - Name tests `TestFunction_scenario`, and write table-driven tests with `t.Run` subtests.
 - Failure messages state the call, the actual value and the expected value, in the form `Func(x) = got, want want`. Use `t.Fatalf` only when the test cannot continue.
 - Mark test helpers with `t.Helper()`. Use `t.TempDir`, `t.Cleanup` and `t.Context()` for test setup and cleanup.
-- Unit tests must not use the network. Use `net/http/httptest` for HTTP clients and handlers. Until the PostgreSQL store lands, existing store tests use temporary SQLite files; PostgreSQL integration tests use an isolated local/CI database, never an upstream service or production database.
+- Unit tests must not use the network. Use `net/http/httptest` for HTTP clients and handlers. PostgreSQL integration tests use an isolated local/CI database, never an upstream service or production database.
 - Cover both success and failure paths. Add or update tests with every behavior change.
 - Prefer the standard library. Use `github.com/google/go-cmp/cmp` for comparing complex values.
 

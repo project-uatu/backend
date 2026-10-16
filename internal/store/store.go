@@ -1,23 +1,21 @@
-// Package store persists collected results in a SQLite database so they
-// survive between runs of Uatu.
+// Package store persists Uatu data in PostgreSQL.
 package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
+	"net/url"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Source identifies where a stored result was collected from.
 type Source string
 
-// SourceGitHubRepositories identifies JSON-encoded GitHub repository listings.
+// SourceGitHubRepositories identifies GitHub repository listings.
 const SourceGitHubRepositories Source = "github_repositories"
 
 // Snapshot is a collected result for a user from a source.
@@ -28,44 +26,88 @@ type Snapshot struct {
 	FetchedAt time.Time
 }
 
-// Store is a SQLite-backed result store.
+// Options configures the PostgreSQL connection pool.
+type Options struct {
+	URL            string
+	SSLMode        string
+	MinConns       int32
+	MaxConns       int32
+	ConnectTimeout time.Duration
+}
+
+// Store persists source data and person-centric contribution history.
 type Store struct {
-	db *sql.DB
+	db *pgxpool.Pool
 }
 
-// Open opens (creating if needed) the SQLite database at path.
-func Open(ctx context.Context, path string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("create database directory: %w", err)
+// Open connects to PostgreSQL, verifies the connection and applies migrations.
+func Open(ctx context.Context, options Options) (*Store, error) {
+	if options.URL == "" {
+		return nil, errors.New("UATU_DATABASE_URL is required")
 	}
-
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
-	db, err := sql.Open("sqlite", dsn)
+	if options.MinConns < 0 || options.MaxConns <= 0 || options.MaxConns < options.MinConns {
+		return nil, errors.New("database connection limits must satisfy 0 <= min <= max and max > 0")
+	}
+	if options.ConnectTimeout <= 0 {
+		return nil, errors.New("database connect timeout must be positive")
+	}
+	databaseURL, err := withDefaultSSLMode(options.URL, options.SSLMode)
 	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
+		return nil, err
 	}
-	// SQLite allows a single writer; one connection avoids lock contention.
-	db.SetMaxOpenConns(1)
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, errors.New("invalid PostgreSQL database URL")
+	}
+	config.MinConns = options.MinConns
+	config.MaxConns = options.MaxConns
+	config.ConnConfig.ConnectTimeout = options.ConnectTimeout
 
-	if err := migrate(ctx, db); err != nil {
-		return nil, errors.Join(fmt.Errorf("migrate database: %w", err), db.Close())
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, fmt.Errorf("configure PostgreSQL connection pool: %w", err)
 	}
-	return &Store{db: db}, nil
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("connect to PostgreSQL: %w", err)
+	}
+	if err := migrate(ctx, pool); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("migrate PostgreSQL database: %w", err)
+	}
+	return &Store{db: pool}, nil
 }
 
-// Close closes the underlying database.
-func (s *Store) Close() error {
-	return s.db.Close()
+func withDefaultSSLMode(databaseURL, sslMode string) (string, error) {
+	parsed, err := url.Parse(databaseURL)
+	if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") {
+		return "", errors.New("UATU_DATABASE_URL must be a PostgreSQL URL")
+	}
+	if parsed.Query().Has("sslmode") {
+		return databaseURL, nil
+	}
+	if sslMode == "" {
+		sslMode = "verify-full"
+	}
+	query := parsed.Query()
+	query.Set("sslmode", sslMode)
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
+}
+
+// Close releases the underlying database connection pool.
+func (s *Store) Close() {
+	s.db.Close()
 }
 
 // Save stores data as the latest snapshot for user and source.
 func (s *Store) Save(ctx context.Context, source Source, user string, data []byte) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.db.Exec(ctx, `
 		INSERT INTO snapshots (source, username, data, fetched_at)
-		VALUES (?, ?, ?, ?)
+		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (source, username)
-		DO UPDATE SET data = excluded.data, fetched_at = excluded.fetched_at`,
-		string(source), user, data, time.Now().UTC().Unix())
+		DO UPDATE SET data = EXCLUDED.data, fetched_at = EXCLUDED.fetched_at`,
+		string(source), user, data, time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("save snapshot %s/%s: %w", source, user, err)
 	}
@@ -75,23 +117,18 @@ func (s *Store) Save(ctx context.Context, source Source, user string, data []byt
 // Get returns the latest snapshot for user and source. The boolean is false
 // when nothing has been stored yet.
 func (s *Store) Get(ctx context.Context, source Source, user string) (Snapshot, bool, error) {
-	var (
-		data      []byte
-		fetchedAt int64
-	)
-	err := s.db.QueryRowContext(ctx,
-		`SELECT data, fetched_at FROM snapshots WHERE source = ? AND username = ?`,
-		string(source), user).Scan(&data, &fetchedAt)
-	if errors.Is(err, sql.ErrNoRows) {
+	var snapshot Snapshot
+	snapshot.Source = source
+	snapshot.User = user
+	err := s.db.QueryRow(ctx,
+		`SELECT data, fetched_at FROM snapshots WHERE source = $1 AND username = $2`,
+		string(source), user).Scan(&snapshot.Data, &snapshot.FetchedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return Snapshot{}, false, nil
 	}
 	if err != nil {
 		return Snapshot{}, false, fmt.Errorf("get snapshot %s/%s: %w", source, user, err)
 	}
-	return Snapshot{
-		Source:    source,
-		User:      user,
-		Data:      data,
-		FetchedAt: time.Unix(fetchedAt, 0).UTC(),
-	}, true, nil
+	snapshot.FetchedAt = snapshot.FetchedAt.UTC()
+	return snapshot, true, nil
 }

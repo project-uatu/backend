@@ -43,6 +43,20 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: uatu_test
+          POSTGRES_USER: uatu
+          POSTGRES_PASSWORD: test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U uatu -d uatu_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -54,6 +68,8 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test
+        env:
+          UATU_TEST_DATABASE_URL: postgres://uatu:test-only@localhost:5432/uatu_test?sslmode=disable
         run: go test -race ./...
       - name: Lint
         uses: golangci/golangci-lint-action@v9
