@@ -9,8 +9,8 @@ target; standalone-container packaging is planned later.
 
 The executable is in `cmd/uatu`. Application code is under `internal/`, divided
 by responsibility: `collector` coordinates fetches and persistence, `github`
-is the upstream client, `store` manages SQLite and schema
-migrations, `server` exposes the HTTP API, and `config` loads process settings.
+is the upstream client, `store` manages SQLite and schema migrations, `server`
+exposes the read-only HTTP API, and `config` loads process settings.
 The HTTP layer uses Go's standard library. The resulting executable remains a
 static binary suitable for the distroless container.
 
@@ -18,19 +18,27 @@ static binary suitable for the distroless container.
 
 | Command | Description |
 |---|---|
-| `uatu serve` (default) | Starts the HTTP API on port 3000. Responses come from the database; data is fetched and stored only the first time a user is requested. |
-| `uatu collect [user ...]` | Fetches fresh data for the given users (or `UATU_USERS`), stores it, and exits. Run it on a schedule to keep data current. |
+| `uatu serve` (default) | Starts the HTTP API on port 3000. Responses come only from the database; the API never fetches from upstream. |
+| `uatu collect [user ...]` | Fetches fresh data for the given GitHub logins (or `UATU_USERS`), stores it, and exits. Run it on a schedule to keep data current. |
+| `uatu help` | Prints usage. |
+
+Invalid usage, such as an unknown command or an invalid GitHub login, prints
+usage and exits with status 2 without opening the database. Collection
+failures are logged and cause `collect` to exit with status 1 after attempting
+the other requested users. A failed fetch never overwrites stored data.
 
 Endpoints:
 
-- `GET /gh/users/:user/contributions` - repositories owned by the user
+- `GET /github/users/{user}/repositories` - names of public repositories the
+  GitHub user owns, as `{"repositories": [...]}`, with a `Last-Modified` header
+  set to the collection time. Returns `404` until the user has been collected
+  and `400` for an invalid GitHub login.
 - `GET /healthz` - returns `204 No Content` when the HTTP server is running
 
-Stored responses include a `Last-Modified` header with the collection time.
-If an upstream request fails, the API returns a generic JSON `502` response;
-the internal error is written to structured logs. Collection failures are
-logged and cause the `collect` command to exit nonzero after attempting the
-other requested sources and users.
+Errors are JSON objects of the form `{"error": "..."}`; internal details are
+written to structured logs only. Unversioned routes are a development scaffold
+with no compatibility guarantee and will be replaced by the versioned `/v1` API
+([ADR 0003](docs/adr/0003-read-only-scaffold-api.md)).
 
 ## Configuration
 
@@ -55,6 +63,7 @@ docker run --rm -v uatu-data:/data -e GITHUB_TOKEN -e UATU_USERS=octocat uatu co
 
 # Serve stored results
 docker run -d -p 3000:3000 -v uatu-data:/data uatu
+curl http://localhost:3000/github/users/octocat/repositories
 ```
 
 SQLite supports one writer at a time, so avoid overlapping `collect` runs and

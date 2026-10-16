@@ -12,10 +12,12 @@ type memoryStore struct {
 	source store.Source
 	user   string
 	data   []byte
+	saves  int
 	err    error
 }
 
 func (s *memoryStore) Save(_ context.Context, source store.Source, user string, data []byte) error {
+	s.saves++
 	s.source, s.user, s.data = source, user, data
 	return s.err
 }
@@ -29,32 +31,64 @@ func (r repositoryStub) Repositories(context.Context, string) ([]string, error) 
 	return r.names, r.err
 }
 
-func TestCollector_Collect_persistsSuccessfulData(t *testing.T) {
-	s := &memoryStore{}
-	c := New(s, repositoryStub{names: []string{"first", "second"}})
+func TestCollector_Collect_persistsRepositoriesAsJSON(t *testing.T) {
+	tests := []struct {
+		name  string
+		names []string
+		want  string
+	}{
+		{name: "repositories", names: []string{"first", "second"}, want: `{"repositories":["first","second"]}`},
+		{name: "none", names: nil, want: `{"repositories":[]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &memoryStore{}
+			c := New(s, repositoryStub{names: tt.names})
 
-	data, err := c.Collect(t.Context(), store.SourceGitHubRepos, "octocat")
-	if err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
-	if got, want := string(data), "first, second"; got != want {
-		t.Errorf("Collect data = %q, want %q", got, want)
-	}
-	if s.source != store.SourceGitHubRepos || s.user != "octocat" || string(s.data) != string(data) {
-		t.Errorf("saved snapshot = %s/%s %q, want GitHub/octocat %q", s.source, s.user, s.data, data)
+			if err := c.Collect(t.Context(), store.SourceGitHubRepositories, "octocat"); err != nil {
+				t.Fatalf("Collect: %v", err)
+			}
+			if s.source != store.SourceGitHubRepositories || s.user != "octocat" {
+				t.Errorf("saved key = %s/%s, want %s/octocat", s.source, s.user, store.SourceGitHubRepositories)
+			}
+			if got := string(s.data); got != tt.want {
+				t.Errorf("saved data = %s, want %s", got, tt.want)
+			}
+		})
 	}
 }
 
 func TestCollector_Collect_doesNotSaveUpstreamFailure(t *testing.T) {
 	s := &memoryStore{}
-	c := New(s, repositoryStub{err: errors.New("offline")})
+	upstreamErr := errors.New("offline")
+	c := New(s, repositoryStub{err: upstreamErr})
 
-	_, err := c.Collect(t.Context(), store.SourceGitHubRepos, "octocat")
-	var upstreamErr *UpstreamError
-	if !errors.As(err, &upstreamErr) {
-		t.Fatalf("Collect error = %v, want UpstreamError", err)
+	err := c.Collect(t.Context(), store.SourceGitHubRepositories, "octocat")
+	if !errors.Is(err, upstreamErr) {
+		t.Fatalf("Collect error = %v, want %v", err, upstreamErr)
 	}
-	if s.source != "" || s.data != nil {
-		t.Errorf("saved data after upstream failure = %s/%s %q, want none", s.source, s.user, s.data)
+	if s.saves != 0 {
+		t.Errorf("saves after upstream failure = %d, want 0", s.saves)
+	}
+}
+
+func TestCollector_Collect_rejectsUnknownSource(t *testing.T) {
+	s := &memoryStore{}
+	c := New(s, repositoryStub{})
+
+	if err := c.Collect(t.Context(), store.Source("unknown"), "octocat"); err == nil {
+		t.Fatal("Collect(unknown source) error = nil, want error")
+	}
+	if s.saves != 0 {
+		t.Errorf("saves for unknown source = %d, want 0", s.saves)
+	}
+}
+
+func TestCollector_Collect_returnsSaveFailure(t *testing.T) {
+	saveErr := errors.New("disk full")
+	c := New(&memoryStore{err: saveErr}, repositoryStub{names: []string{"first"}})
+
+	if err := c.Collect(t.Context(), store.SourceGitHubRepositories, "octocat"); !errors.Is(err, saveErr) {
+		t.Errorf("Collect error = %v, want %v", err, saveErr)
 	}
 }

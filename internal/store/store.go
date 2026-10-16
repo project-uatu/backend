@@ -17,8 +17,8 @@ import (
 // Source identifies where a stored result was collected from.
 type Source string
 
-// SourceGitHubRepos identifies GitHub repository listings.
-const SourceGitHubRepos Source = "github_repos"
+// SourceGitHubRepositories identifies JSON-encoded GitHub repository listings.
+const SourceGitHubRepositories Source = "github_repositories"
 
 // Snapshot is a collected result for a user from a source.
 type Snapshot struct {

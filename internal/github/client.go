@@ -41,7 +41,7 @@ type repository struct {
 // Repositories returns the names of repositories owned by user, most recently
 // updated first.
 func (c *Client) Repositories(ctx context.Context, user string) ([]string, error) {
-	if !validUsername(user) {
+	if !ValidLogin(user) {
 		return nil, fmt.Errorf("invalid GitHub username %q", user)
 	}
 	var names []string
@@ -91,7 +91,8 @@ func (c *Client) Repositories(ctx context.Context, user string) ([]string, error
 	return names, nil
 }
 
-func validUsername(user string) bool {
+// ValidLogin reports whether user is a syntactically valid GitHub login.
+func ValidLogin(user string) bool {
 	if len(user) == 0 || len(user) > 39 {
 		return false
 	}

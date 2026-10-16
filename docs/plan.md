@@ -24,9 +24,9 @@ startup configuration, SQLite snapshot storage/migrations, structured logging,
 stdlib HTTP routing, tests and a static non-root container.
 
 GitHub currently lists owned repository names, not contributions. Storage
-overwrites the
-latest snapshot; it has no persons, identity claims, event history, sync reports
-or checkpoints. GET on a missing snapshot still triggers an upstream fetch.
+overwrites the latest snapshot; it has no persons, identity claims, event
+history, sync reports or checkpoints. The HTTP API is read-only and never
+fetches from upstream (ADR 0003).
 There is no Kubernetes deployment or versioned person-centric API yet.
 
 The module path and imports have now been corrected and legacy-organization

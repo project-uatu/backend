@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -17,60 +18,112 @@ import (
 	"github.com/project-uatu/backend/internal/store"
 )
 
+const usage = `Usage:
+  uatu [serve]             serve stored results over HTTP (default)
+  uatu collect [user ...]  collect data for users, or UATU_USERS, and exit
+  uatu help                show this help
+`
+
+// usageError reports invalid command-line usage.
+type usageError struct {
+	err error
+}
+
+func (e *usageError) Error() string { return e.err.Error() }
+
+func (e *usageError) Unwrap() error { return e.err }
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, os.Args[1:], config.Load(), logger); err != nil {
-		logger.Error("uatu stopped", "err", err)
-		os.Exit(1)
+	err := run(ctx, os.Args[1:], config.Load(), logger, os.Stdout)
+	if err == nil {
+		return
 	}
+	var usageErr *usageError
+	if errors.As(err, &usageErr) {
+		fmt.Fprintf(os.Stderr, "uatu: %v\n\n%s", err, usage)
+		os.Exit(2)
+	}
+	logger.Error("uatu stopped", "err", err)
+	os.Exit(1)
 }
 
-func run(ctx context.Context, args []string, cfg config.Config, logger *slog.Logger) (runErr error) {
+func run(ctx context.Context, args []string, cfg config.Config, logger *slog.Logger, stdout io.Writer) error {
 	command := "serve"
 	if len(args) > 0 {
 		command, args = args[0], args[1:]
 	}
-	if command != "serve" && command != "collect" {
-		return fmt.Errorf("unknown command %q (want serve or collect)", command)
+	switch command {
+	case "help", "-h", "-help", "--help":
+		_, err := io.WriteString(stdout, usage)
+		return err
+	case "serve":
+		if len(args) > 0 {
+			return &usageError{err: fmt.Errorf("serve takes no arguments, got %q", args)}
+		}
+		return serve(ctx, cfg, logger)
+	case "collect":
+		users, err := config.ParseUsers(args, cfg.Users)
+		if err != nil {
+			return &usageError{err: err}
+		}
+		for _, user := range users {
+			if !github.ValidLogin(user) {
+				return &usageError{err: fmt.Errorf("invalid GitHub login %q", user)}
+			}
+		}
+		return collect(ctx, cfg, users, logger)
+	default:
+		return &usageError{err: fmt.Errorf("unknown command %q", command)}
 	}
+}
 
+func serve(ctx context.Context, cfg config.Config, logger *slog.Logger) (err error) {
 	db, err := store.Open(ctx, cfg.DatabasePath)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		runErr = errors.Join(runErr, db.Close())
+		err = errors.Join(err, db.Close())
 	}()
+	return server.Run(ctx, cfg.Address, server.NewHandler(db, logger), logger)
+}
 
-	activityCollector := collector.New(db, github.NewClient(cfg.GitHubToken, nil))
-
-	switch command {
-	case "serve":
-		handler := server.NewHandler(db, activityCollector, logger)
-		return server.Run(ctx, cfg.Address, handler, logger)
-	case "collect":
-		users, err := config.ParseUsers(args, cfg.Users)
-		if err != nil {
-			return err
-		}
-		var errs []error
-		for _, user := range users {
-			for _, source := range collector.Sources() {
-				if err := ctx.Err(); err != nil {
-					return errors.Join(append(errs, err)...)
-				}
-				data, err := activityCollector.Collect(ctx, source, user)
-				if err != nil {
-					errs = append(errs, fmt.Errorf("%s/%s: %w", source, user, err))
-					continue
-				}
-				logger.Info("collection stored", "source", source, "user", user, "bytes", len(data))
-			}
-		}
-		return errors.Join(errs...)
+func collect(ctx context.Context, cfg config.Config, users []string, logger *slog.Logger) (err error) {
+	db, err := store.Open(ctx, cfg.DatabasePath)
+	if err != nil {
+		return err
 	}
-	return nil
+	defer func() {
+		err = errors.Join(err, db.Close())
+	}()
+	c := collector.New(db, github.NewClient(cfg.GitHubToken, nil))
+	return collectUsers(ctx, c, collector.Sources(), users, logger)
+}
+
+// sourceCollector collects one source for one user.
+type sourceCollector interface {
+	Collect(context.Context, store.Source, string) error
+}
+
+// collectUsers attempts every source for every user, stopping early only when
+// ctx is canceled. It returns all collection errors joined.
+func collectUsers(ctx context.Context, c sourceCollector, sources []store.Source, users []string, logger *slog.Logger) error {
+	var errs []error
+	for _, user := range users {
+		for _, source := range sources {
+			if err := ctx.Err(); err != nil {
+				return errors.Join(append(errs, err)...)
+			}
+			if err := c.Collect(ctx, source, user); err != nil {
+				errs = append(errs, fmt.Errorf("%s/%s: %w", source, user, err))
+				continue
+			}
+			logger.InfoContext(ctx, "collection stored", "source", source, "user", user)
+		}
+	}
+	return errors.Join(errs...)
 }

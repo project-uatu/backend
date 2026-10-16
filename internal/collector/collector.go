@@ -3,8 +3,8 @@ package collector
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/project-uatu/backend/internal/store"
 )
@@ -25,25 +25,9 @@ type Collector struct {
 	github repositoryClient
 }
 
-// UpstreamError identifies a failure while querying an external data source.
-type UpstreamError struct {
-	Err error
-}
-
-// Error returns the underlying upstream error.
-func (e *UpstreamError) Error() string {
-	if e == nil || e.Err == nil {
-		return "upstream request failed"
-	}
-	return e.Err.Error()
-}
-
-// Unwrap returns the underlying upstream error.
-func (e *UpstreamError) Unwrap() error {
-	if e == nil {
-		return nil
-	}
-	return e.Err
+// repositoryList is the stored JSON form of SourceGitHubRepositories.
+type repositoryList struct {
+	Repositories []string `json:"repositories"`
 }
 
 // New creates a collector with its required dependencies.
@@ -56,24 +40,31 @@ func New(s snapshotStore, githubClient repositoryClient) *Collector {
 
 // Sources returns the data sources currently supported by Uatu.
 func Sources() []store.Source {
-	return []store.Source{store.SourceGitHubRepos}
+	return []store.Source{store.SourceGitHubRepositories}
 }
 
 // Collect fetches one source for a user and saves the successful result.
-func (c *Collector) Collect(ctx context.Context, source store.Source, user string) ([]byte, error) {
+// Nothing is saved when the fetch fails.
+func (c *Collector) Collect(ctx context.Context, source store.Source, user string) error {
 	var data []byte
 	switch source {
-	case store.SourceGitHubRepos:
+	case store.SourceGitHubRepositories:
 		names, err := c.github.Repositories(ctx, user)
 		if err != nil {
-			return nil, &UpstreamError{Err: fmt.Errorf("collect GitHub repositories for %s: %w", user, err)}
+			return fmt.Errorf("collect GitHub repositories for %s: %w", user, err)
 		}
-		data = []byte(strings.Join(names, ", "))
+		if names == nil {
+			names = []string{}
+		}
+		data, err = json.Marshal(repositoryList{Repositories: names})
+		if err != nil {
+			return fmt.Errorf("encode GitHub repositories for %s: %w", user, err)
+		}
 	default:
-		return nil, fmt.Errorf("unsupported source %q", source)
+		return fmt.Errorf("unsupported source %q", source)
 	}
 	if err := c.store.Save(ctx, source, user, data); err != nil {
-		return nil, fmt.Errorf("save %s result for %s: %w", source, user, err)
+		return fmt.Errorf("save %s result for %s: %w", source, user, err)
 	}
-	return data, nil
+	return nil
 }

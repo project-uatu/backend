@@ -16,13 +16,13 @@ func TestStore_persistsBetweenOpens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if _, ok, err := s.Get(ctx, SourceGitHubRepos, "octocat"); err != nil || ok {
+	if _, ok, err := s.Get(ctx, SourceGitHubRepositories, "octocat"); err != nil || ok {
 		t.Fatalf("Get on empty store = ok %v, err %v; want false, nil", ok, err)
 	}
-	if err := s.Save(ctx, SourceGitHubRepos, "octocat", []byte("first")); err != nil {
+	if err := s.Save(ctx, SourceGitHubRepositories, "octocat", []byte("first")); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if err := s.Save(ctx, SourceGitHubRepos, "octocat", []byte("second")); err != nil {
+	if err := s.Save(ctx, SourceGitHubRepositories, "octocat", []byte("second")); err != nil {
 		t.Fatalf("Save overwrite: %v", err)
 	}
 	if err := s.Close(); err != nil {
@@ -39,7 +39,7 @@ func TestStore_persistsBetweenOpens(t *testing.T) {
 		}
 	})
 
-	snap, ok, err := s.Get(ctx, SourceGitHubRepos, "octocat")
+	snap, ok, err := s.Get(ctx, SourceGitHubRepositories, "octocat")
 	if err != nil || !ok {
 		t.Fatalf("Get after reopen = ok %v, err %v; want true, nil", ok, err)
 	}
@@ -71,7 +71,7 @@ func TestOpen_migratesLegacySchema(t *testing.T) {
 			fetched_at INTEGER NOT NULL,
 			PRIMARY KEY (source, username)
 		);
-		INSERT INTO snapshots VALUES ('github_repos', 'octocat', 'repo-one', 1760540400);`)
+		INSERT INTO snapshots VALUES ('github_repositories', 'octocat', 'repo-one', 1760540400);`)
 	if err != nil {
 		t.Fatalf("create legacy snapshot: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestOpen_migratesLegacySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open legacy database: %v", err)
 	}
-	snapshot, ok, err := s.Get(ctx, SourceGitHubRepos, "octocat")
+	snapshot, ok, err := s.Get(ctx, SourceGitHubRepositories, "octocat")
 	if err != nil || !ok {
 		t.Fatalf("Get migrated snapshot = ok %v, err %v; want true, nil", ok, err)
 	}
