@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"strings"
@@ -516,6 +517,72 @@ func TestStore_concurrentIdentityReassignmentAndEventPeopleReplacement(t *testin
 	}
 	if validLinks > 1 {
 		t.Errorf("valid current links for reassigned person = %d, want at most 1", validLinks)
+	}
+}
+
+func TestStore_concurrentFirstEventLinkAndNormalization(t *testing.T) {
+	fixture := newIdentityEventFixture(t, false)
+	ctx := t.Context()
+	for i := range 20 {
+		rawEventID, err := fixture.store.SaveRawEvent(ctx, RawEventInput{
+			ForgeInstanceID:      *fixture.key.ForgeInstanceID,
+			ExternalID:           fmt.Sprintf("pull:first-link:%d", i),
+			Kind:                 "pull_request",
+			Payload:              json.RawMessage(`{}`),
+			PayloadSchemaVersion: 1,
+		})
+		if err != nil {
+			t.Fatalf("SaveRawEvent %d: %v", i, err)
+		}
+		if err := fixture.store.ReplaceNormalizedActions(ctx, rawEventID, 1,
+			[]NormalizedActionInput{fixture.action}); err != nil {
+			t.Fatalf("ReplaceNormalizedActions %d initial: %v", i, err)
+		}
+		var actionID uuid.UUID
+		if err := fixture.store.db.QueryRow(ctx, `
+			SELECT id FROM normalized_events WHERE raw_event_id = $1 AND is_current`,
+			rawEventID).Scan(&actionID); err != nil {
+			t.Fatalf("load action %d: %v", i, err)
+		}
+
+		start := make(chan struct{})
+		replaceDone := make(chan error, 1)
+		normalizeDone := make(chan error, 1)
+		go func() {
+			<-start
+			replaceDone <- fixture.store.ReplaceEventPeople(ctx, actionID, []EventPersonInput{{
+				PersonID: fixture.oldPerson.ID, Role: "author", IdentityClaimID: &fixture.claim.ID,
+			}})
+		}()
+		go func() {
+			<-start
+			normalizeDone <- fixture.store.ReplaceNormalizedActions(ctx, rawEventID, 2,
+				[]NormalizedActionInput{fixture.action})
+		}()
+		close(start)
+		replaceErr := <-replaceDone
+		if err := <-normalizeDone; err != nil {
+			t.Fatalf("ReplaceNormalizedActions %d during linking: %v", i, err)
+		}
+		if replaceErr != nil && !errors.Is(replaceErr, ErrNotFound) {
+			t.Fatalf("ReplaceEventPeople %d during normalization: %v", i, replaceErr)
+		}
+
+		var currentLinks int
+		if err := fixture.store.db.QueryRow(ctx, `
+			SELECT count(*)
+			FROM event_people ep
+			JOIN normalized_events ne ON ne.id = ep.normalized_event_id
+			WHERE ne.raw_event_id = $1 AND ne.is_current AND ep.person_id = $2`,
+			rawEventID, fixture.oldPerson.ID).Scan(&currentLinks); err != nil {
+			t.Fatalf("count current links %d: %v", i, err)
+		}
+		if replaceErr == nil && currentLinks != 1 {
+			t.Errorf("iteration %d: current links after successful ReplaceEventPeople = %d, want 1", i, currentLinks)
+		}
+		if replaceErr != nil && currentLinks != 0 {
+			t.Errorf("iteration %d: current links after rejected ReplaceEventPeople = %d, want 0", i, currentLinks)
+		}
 	}
 }
 

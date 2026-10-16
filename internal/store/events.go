@@ -13,6 +13,10 @@ import (
 
 const eventIdentityLockID int64 = 0x554154554C494E4B
 
+// lockEventIdentityChanges serializes identity assignment changes with
+// event-person link writes and copies, so links are never written against,
+// copied from or left on a stale assignment. The lock is global and held only
+// for short database transactions that perform no upstream I/O.
 func lockEventIdentityChanges(ctx context.Context, tx pgx.Tx) error {
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", eventIdentityLockID); err != nil {
 		return fmt.Errorf("lock event identity changes: %w", err)
