@@ -1,12 +1,12 @@
 # 0004: Person, identity and event data model
 
-Status: Proposed
+Status: Accepted
 
 Date: 2026-10-16
 
 Issue: [#3](https://github.com/project-uatu/backend/issues/3)
 
-Decision authority: Maintainer acceptance required before implementation.
+Decision authority: Accepted by the maintainer on 2026-10-16.
 
 ## Context
 
