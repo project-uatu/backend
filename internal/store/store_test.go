@@ -273,7 +273,8 @@ func TestStore_personTimelineAndIdentityConflicts(t *testing.T) {
 		t.Errorf("timeline after re-collection = %+v, want original action time", entries)
 	}
 
-	actions[0].OccurredAt = openedAt
+	// actions[0] still carries the changed 2023 time; a new normalizer version
+	// must keep the action's established occurrence time.
 	if err := store.ReplaceNormalizedActions(ctx, eventID, 2, actions); err != nil {
 		t.Fatalf("re-normalize actions: %v", err)
 	}
