@@ -8,7 +8,40 @@ permissions:
   contents: read
 
 jobs:
-  go:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name == 'push'
+      - uses: dorny/paths-filter@v4.0.3
+        id: filter
+        with:
+          base: ${{ github.ref }}
+          predicate-quantifier: some-with-excludes
+          filters: |
+            code:
+              - '**/*.go'
+              - 'cmd/**'
+              - 'internal/**'
+              - 'go.mod'
+              - 'go.sum'
+              - '**/*.sql'
+              - '**/migrations/**'
+              - '**/testdata/**'
+              - 'Dockerfile'
+              - '.dockerignore'
+              - '.golangci.*'
+              - '.github/workflows/ci.yml'
+              - '!**/*.md'
+
+  test-build:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -28,3 +61,23 @@ jobs:
           version: v2.14.0
       - name: Build container
         run: docker build -t uatu:ci .
+
+  go:
+    needs: [changes, test-build]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Check CI result
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CODE_CHANGED: ${{ needs.changes.outputs.code }}
+          BUILD_RESULT: ${{ needs.test-build.result }}
+        run: |
+          test "$CHANGES_RESULT" = success
+          if [ "$CODE_CHANGED" = true ]; then
+            test "$BUILD_RESULT" = success
+          else
+            test "$CODE_CHANGED" = false
+            test "$BUILD_RESULT" = skipped
+          fi
