@@ -215,7 +215,11 @@ func (s *Store) ReplaceNormalizedActions(ctx context.Context, rawEventID uuid.UU
 		err := tx.QueryRow(ctx, `
 			INSERT INTO normalized_events
 				(id, raw_event_id, normalizer_version, action_key, kind, occurred_at, project, title, url, is_current)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)
+			VALUES ($1, $2, $3, $4, $5,
+				COALESCE((SELECT occurred_at FROM normalized_events
+				          WHERE raw_event_id = $2 AND action_key = $4
+				          ORDER BY created_at, normalizer_version LIMIT 1), $6),
+				$7, $8, $9, true)
 			ON CONFLICT (raw_event_id, normalizer_version, action_key)
 			DO UPDATE SET kind = EXCLUDED.kind,
 			              project = EXCLUDED.project,
