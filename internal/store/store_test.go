@@ -519,6 +519,41 @@ func TestStore_concurrentIdentityReassignmentAndEventPeopleReplacement(t *testin
 	}
 }
 
+func TestStore_repeatedAcceptedClaimKeepsTimeline(t *testing.T) {
+	fixture := newIdentityEventFixture(t, true)
+	ctx := t.Context()
+	repeated, err := fixture.store.ClaimIdentity(ctx, IdentityClaimInput{
+		IdentityKey: fixture.key,
+		PersonID:    fixture.oldPerson.ID,
+		Method:      "manual",
+		ReviewedBy:  "maintainer",
+		Disposition: "accepted",
+	})
+	if err != nil {
+		t.Fatalf("ClaimIdentity repeated: %v", err)
+	}
+	if repeated.ID == fixture.claim.ID || repeated.Disposition != "accepted" {
+		t.Fatalf("ClaimIdentity repeated = %+v, want a new accepted claim", repeated)
+	}
+
+	entries, err := fixture.store.Timeline(ctx, fixture.oldPerson.ID,
+		time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), 10)
+	if err != nil {
+		t.Fatalf("Timeline after repeated claim: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("Timeline after repeated claim = %+v, want 1 action", entries)
+	}
+	buckets, err := fixture.store.TimelineCounts(ctx, fixture.oldPerson.ID,
+		time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), TimeBucketYear)
+	if err != nil {
+		t.Fatalf("TimelineCounts after repeated claim: %v", err)
+	}
+	if len(buckets) != 1 || buckets[0].Count != 1 {
+		t.Errorf("TimelineCounts after repeated claim = %+v, want one bucket with 1 action", buckets)
+	}
+}
+
 type identityEventFixture struct {
 	store      *Store
 	oldPerson  Person
