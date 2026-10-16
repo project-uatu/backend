@@ -161,11 +161,18 @@ schema (#3, #5), and the versioned API (#6).
 
 ### 3. Migrate to PostgreSQL and implement the person, identity and event schema
 
-Dependencies: none; final job-state fields also depend on step 1.
+Dependencies: accepted ADRs 0001 and 0002; implementation can begin after ADR
+0004 is accepted.
 
-ADR 0001 accepts PostgreSQL. Accept a follow-up ADR for identity evidence, event
-ownership, configuration and migration design first.
-Keep PostgreSQL queries in `internal/store` and identity rules in `internal/identity`.
+ADR 0001 accepts PostgreSQL. Keep PostgreSQL queries in `internal/store` and
+identity rules in `internal/identity`.
+
+[Proposed ADR 0004](adr/0004-person-identity-event-model.md) defines the
+person, identity and event data model. Database, migration and configuration
+choices follow ADR 0001. It must be accepted before this step's schema or store implementation
+begins. Detailed collection, checkpoint and job-processing behavior remains
+in issue #4 under accepted ADR 0002. Person-associated removal is handled in
+the schema; payload erasure and takedown policy are deferred to issue #10.
 
 Acceptance:
 - Add persons, instance-scoped identities with stable account IDs, auditable
