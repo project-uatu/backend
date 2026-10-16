@@ -38,7 +38,6 @@ func NewHandler(s snapshotStore, c collectionService, logger *slog.Logger) http.
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET /gh/users/{user}/contributions", storedHandler(s, c, logger, store.SourceGitHubRepos))
-	mux.HandleFunc("GET /devscores/{user}", storedHandler(s, c, logger, store.SourceDevStats))
 	return mux
 }
 
@@ -76,11 +75,7 @@ func storedHandler(s snapshotStore, c collectionService, logger *slog.Logger, so
 			}
 		}
 
-		if source == store.SourceDevStats {
-			w.Header().Set("Content-Type", "application/json")
-		} else {
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		if !snapshot.FetchedAt.IsZero() {
 			w.Header().Set("Last-Modified", snapshot.FetchedAt.UTC().Format(http.TimeFormat))
 		}

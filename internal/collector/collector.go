@@ -3,11 +3,9 @@ package collector
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
-	"github.com/project-uatu/backend/internal/devstats"
 	"github.com/project-uatu/backend/internal/store"
 )
 
@@ -21,16 +19,10 @@ type repositoryClient interface {
 	Repositories(context.Context, string) ([]string, error)
 }
 
-// devstatsClient retrieves developer contribution summaries.
-type devstatsClient interface {
-	Contributions(context.Context, string) (devstats.Contribution, error)
-}
-
 // Collector collects source data and persists successful results.
 type Collector struct {
-	store    snapshotStore
-	github   repositoryClient
-	devstats devstatsClient
+	store  snapshotStore
+	github repositoryClient
 }
 
 // UpstreamError identifies a failure while querying an external data source.
@@ -55,17 +47,16 @@ func (e *UpstreamError) Unwrap() error {
 }
 
 // New creates a collector with its required dependencies.
-func New(s snapshotStore, githubClient repositoryClient, devstatsClient devstatsClient) *Collector {
+func New(s snapshotStore, githubClient repositoryClient) *Collector {
 	return &Collector{
-		store:    s,
-		github:   githubClient,
-		devstats: devstatsClient,
+		store:  s,
+		github: githubClient,
 	}
 }
 
 // Sources returns the data sources currently supported by Uatu.
 func Sources() []store.Source {
-	return []store.Source{store.SourceGitHubRepos, store.SourceDevStats}
+	return []store.Source{store.SourceGitHubRepos}
 }
 
 // Collect fetches one source for a user and saves the successful result.
@@ -78,15 +69,6 @@ func (c *Collector) Collect(ctx context.Context, source store.Source, user strin
 			return nil, &UpstreamError{Err: fmt.Errorf("collect GitHub repositories for %s: %w", user, err)}
 		}
 		data = []byte(strings.Join(names, ", "))
-	case store.SourceDevStats:
-		result, err := c.devstats.Contributions(ctx, user)
-		if err != nil {
-			return nil, &UpstreamError{Err: fmt.Errorf("collect DevStats for %s: %w", user, err)}
-		}
-		data, err = json.Marshal(result)
-		if err != nil {
-			return nil, fmt.Errorf("encode DevStats result for %s: %w", user, err)
-		}
 	default:
 		return nil, fmt.Errorf("unsupported source %q", source)
 	}

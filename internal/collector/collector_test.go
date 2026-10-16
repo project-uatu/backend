@@ -5,7 +5,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/project-uatu/backend/internal/devstats"
 	"github.com/project-uatu/backend/internal/store"
 )
 
@@ -30,18 +29,9 @@ func (r repositoryStub) Repositories(context.Context, string) ([]string, error) 
 	return r.names, r.err
 }
 
-type devstatsStub struct {
-	result devstats.Contribution
-	err    error
-}
-
-func (d devstatsStub) Contributions(context.Context, string) (devstats.Contribution, error) {
-	return d.result, d.err
-}
-
 func TestCollector_Collect_persistsSuccessfulData(t *testing.T) {
 	s := &memoryStore{}
-	c := New(s, repositoryStub{names: []string{"first", "second"}}, devstatsStub{})
+	c := New(s, repositoryStub{names: []string{"first", "second"}})
 
 	data, err := c.Collect(t.Context(), store.SourceGitHubRepos, "octocat")
 	if err != nil {
@@ -57,7 +47,7 @@ func TestCollector_Collect_persistsSuccessfulData(t *testing.T) {
 
 func TestCollector_Collect_doesNotSaveUpstreamFailure(t *testing.T) {
 	s := &memoryStore{}
-	c := New(s, repositoryStub{err: errors.New("offline")}, devstatsStub{})
+	c := New(s, repositoryStub{err: errors.New("offline")})
 
 	_, err := c.Collect(t.Context(), store.SourceGitHubRepos, "octocat")
 	var upstreamErr *UpstreamError
@@ -66,20 +56,5 @@ func TestCollector_Collect_doesNotSaveUpstreamFailure(t *testing.T) {
 	}
 	if s.source != "" || s.data != nil {
 		t.Errorf("saved data after upstream failure = %s/%s %q, want none", s.source, s.user, s.data)
-	}
-}
-
-func TestCollector_Collect_persistsDevStatsAsJSON(t *testing.T) {
-	s := &memoryStore{}
-	c := New(s, repositoryStub{}, devstatsStub{
-		result: devstats.Contribution{Contributions: 2, Issues: 1, PRs: 0},
-	})
-
-	data, err := c.Collect(t.Context(), store.SourceDevStats, "octocat")
-	if err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
-	if got, want := string(data), `{"contributions":2,"issues":1,"prs":0}`; got != want {
-		t.Errorf("Collect data = %q, want %q", got, want)
 	}
 }

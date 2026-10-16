@@ -42,21 +42,21 @@ func (c *testCollector) Collect(_ context.Context, _ store.Source, _ string) ([]
 func TestHandler_servesStoredSnapshot(t *testing.T) {
 	fetchedAt := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
 	s := &testStore{snapshot: store.Snapshot{
-		Source: store.SourceDevStats, User: "octocat",
-		Data: []byte(`{"contributions":2}`), FetchedAt: fetchedAt,
+		Source: store.SourceGitHubRepos, User: "octocat",
+		Data: []byte("repo-one"), FetchedAt: fetchedAt,
 	}, found: true}
 	c := &testCollector{}
 	handler := NewHandler(s, c, testLogger())
 
-	req := httptest.NewRequest(http.MethodGet, "/devscores/octocat", nil)
+	req := httptest.NewRequest(http.MethodGet, "/gh/users/octocat/contributions", nil)
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, req)
 
 	if res.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", res.Code, http.StatusOK)
 	}
-	if got := res.Body.String(); got != `{"contributions":2}` {
-		t.Errorf("body = %q, want stored JSON", got)
+	if got := res.Body.String(); got != "repo-one" {
+		t.Errorf("body = %q, want stored data", got)
 	}
 	if got := res.Header().Get("Last-Modified"); got != fetchedAt.Format(http.TimeFormat) {
 		t.Errorf("Last-Modified = %q, want %q", got, fetchedAt.Format(http.TimeFormat))
@@ -95,7 +95,7 @@ func TestHandler_returnsBadGatewayForUpstreamFailure(t *testing.T) {
 	c := &testCollector{err: &collector.UpstreamError{Err: errors.New("upstream down")}}
 	handler := NewHandler(s, c, testLogger())
 
-	req := httptest.NewRequest(http.MethodGet, "/devscores/octocat", nil)
+	req := httptest.NewRequest(http.MethodGet, "/gh/users/octocat/contributions", nil)
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, req)
 
@@ -111,7 +111,7 @@ func TestHandler_returnsServerErrorForStoreFailure(t *testing.T) {
 	s := &testStore{err: errors.New("database failed")}
 	handler := NewHandler(s, &testCollector{}, testLogger())
 
-	req := httptest.NewRequest(http.MethodGet, "/devscores/octocat", nil)
+	req := httptest.NewRequest(http.MethodGet, "/gh/users/octocat/contributions", nil)
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, req)
 

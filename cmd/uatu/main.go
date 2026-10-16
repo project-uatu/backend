@@ -12,7 +12,6 @@ import (
 
 	"github.com/project-uatu/backend/internal/collector"
 	"github.com/project-uatu/backend/internal/config"
-	"github.com/project-uatu/backend/internal/devstats"
 	"github.com/project-uatu/backend/internal/github"
 	"github.com/project-uatu/backend/internal/server"
 	"github.com/project-uatu/backend/internal/store"
@@ -46,11 +45,7 @@ func run(ctx context.Context, args []string, cfg config.Config, logger *slog.Log
 		runErr = errors.Join(runErr, db.Close())
 	}()
 
-	activityCollector := collector.New(
-		db,
-		github.NewClient(cfg.GitHubToken, nil),
-		devstats.NewClient(nil),
-	)
+	activityCollector := collector.New(db, github.NewClient(cfg.GitHubToken, nil))
 
 	switch command {
 	case "serve":

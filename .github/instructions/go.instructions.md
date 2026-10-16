@@ -23,14 +23,14 @@ Sources: [Effective Go](https://go.dev/doc/effective_go),
 ## Project layout
 
 - Uatu is a server, so it has no public Go API. Put the binary's entry point in `cmd/uatu/` and all other packages under `internal/`. Do not add packages under `pkg/`.
-- Organize packages by what they provide (for example, `store`, `devstats` or `github`), not by kind (for example, `models`, `handlers` or `utils`).
+- Organize packages by what they provide (for example, `store`, `collector` or `github`), not by kind (for example, `models`, `handlers` or `utils`).
 - Each file has exactly one `package` clause. A new file uses the same package name as the other files in its directory.
 - Keep `main` thin: parse configuration, connect dependencies, run, and translate errors into exit codes.
 
 ## Naming
 
 - Package names are short, lowercase and singular, with no underscores. Avoid `util`, `common`, `helper`, `types` and `api`.
-- Do not repeat the package name in exported names. Prefer `store.Open` over `store.OpenStore`, and `devstats.Client` over `devstats.DevStatsClient`.
+- Do not repeat the package name in exported names. Prefer `store.Open` over `store.OpenStore`, and `github.Client` over `github.GitHubClient`.
 - Use MixedCaps and keep initialisms in a consistent case: `userID`, `ServeHTTP`, `apiURL`, never `userId` or `ApiUrl`.
 - Do not add a `Get` prefix to accessors or fetchers. Use noun-like names for functions that return values and verb-like names for functions that perform actions.
 - Use short receiver names, such as `s` for `*Store`, and keep them consistent across methods. Never use `this` or `self`.
@@ -70,7 +70,7 @@ Sources: [Effective Go](https://go.dev/doc/effective_go),
 
 ## HTTP
 
-- Servers use `net/http` with Go 1.22+ `ServeMux` patterns such as `GET /devscores/{user}`. Set explicit timeouts on `http.Server`.
+- Servers use `net/http` with Go 1.22+ `ServeMux` patterns such as `GET /github/users/{user}/repositories`. Set explicit timeouts on `http.Server`.
 - Outbound clients are structs holding a configured `*http.Client` with a timeout, a base URL and credentials. They do not hold per-request state.
 - Build each outbound request with `http.NewRequestWithContext`. Always close response bodies and check status codes.
 - Validate path and query input. Return appropriate status codes, and do not expose internal error details to clients.

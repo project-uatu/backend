@@ -9,7 +9,7 @@ target; standalone-container packaging is planned later.
 
 The executable is in `cmd/uatu`. Application code is under `internal/`, divided
 by responsibility: `collector` coordinates fetches and persistence, `github`
-and `devstats` are upstream clients, `store` manages SQLite and schema
+is the upstream client, `store` manages SQLite and schema
 migrations, `server` exposes the HTTP API, and `config` loads process settings.
 The HTTP layer uses Go's standard library. The resulting executable remains a
 static binary suitable for the distroless container.
@@ -24,7 +24,6 @@ static binary suitable for the distroless container.
 Endpoints:
 
 - `GET /gh/users/:user/contributions` - repositories owned by the user
-- `GET /devscores/:user` - CNCF DevStats contribution counts
 - `GET /healthz` - returns `204 No Content` when the HTTP server is running
 
 Stored responses include a `Last-Modified` header with the collection time.

@@ -16,13 +16,13 @@ func TestStore_persistsBetweenOpens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if _, ok, err := s.Get(ctx, SourceDevStats, "octocat"); err != nil || ok {
+	if _, ok, err := s.Get(ctx, SourceGitHubRepos, "octocat"); err != nil || ok {
 		t.Fatalf("Get on empty store = ok %v, err %v; want false, nil", ok, err)
 	}
-	if err := s.Save(ctx, SourceDevStats, "octocat", []byte("first")); err != nil {
+	if err := s.Save(ctx, SourceGitHubRepos, "octocat", []byte("first")); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if err := s.Save(ctx, SourceDevStats, "octocat", []byte("second")); err != nil {
+	if err := s.Save(ctx, SourceGitHubRepos, "octocat", []byte("second")); err != nil {
 		t.Fatalf("Save overwrite: %v", err)
 	}
 	if err := s.Close(); err != nil {
@@ -39,7 +39,7 @@ func TestStore_persistsBetweenOpens(t *testing.T) {
 		}
 	})
 
-	snap, ok, err := s.Get(ctx, SourceDevStats, "octocat")
+	snap, ok, err := s.Get(ctx, SourceGitHubRepos, "octocat")
 	if err != nil || !ok {
 		t.Fatalf("Get after reopen = ok %v, err %v; want true, nil", ok, err)
 	}
@@ -49,7 +49,7 @@ func TestStore_persistsBetweenOpens(t *testing.T) {
 	if snap.FetchedAt.IsZero() {
 		t.Error("FetchedAt is zero")
 	}
-	if _, ok, err := s.Get(ctx, SourceGitHubRepos, "octocat"); err != nil {
+	if _, ok, err := s.Get(ctx, Source("other"), "octocat"); err != nil {
 		t.Fatalf("Get other source: %v", err)
 	} else if ok {
 		t.Error("snapshot leaked across sources")
@@ -71,7 +71,7 @@ func TestOpen_migratesLegacySchema(t *testing.T) {
 			fetched_at INTEGER NOT NULL,
 			PRIMARY KEY (source, username)
 		);
-		INSERT INTO snapshots VALUES ('devstats', 'octocat', '{"contributions":2}', 1760540400);`)
+		INSERT INTO snapshots VALUES ('github_repos', 'octocat', 'repo-one', 1760540400);`)
 	if err != nil {
 		t.Fatalf("create legacy snapshot: %v", err)
 	}
@@ -83,11 +83,11 @@ func TestOpen_migratesLegacySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open legacy database: %v", err)
 	}
-	snapshot, ok, err := s.Get(ctx, SourceDevStats, "octocat")
+	snapshot, ok, err := s.Get(ctx, SourceGitHubRepos, "octocat")
 	if err != nil || !ok {
 		t.Fatalf("Get migrated snapshot = ok %v, err %v; want true, nil", ok, err)
 	}
-	if string(snapshot.Data) != `{"contributions":2}` {
+	if string(snapshot.Data) != "repo-one" {
 		t.Errorf("snapshot data = %q, want legacy payload", snapshot.Data)
 	}
 	if got := snapshot.FetchedAt.Unix(); got != 1760540400 {
