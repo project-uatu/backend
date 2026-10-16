@@ -37,6 +37,11 @@ Run `go run ./cmd/uatu help` to see the available commands.
 
 ## Running with Docker
 
+Each release publishes an image for `linux/amd64` and `linux/arm64` to
+`ghcr.io/project-uatu/backend`, tagged with the version (for example `0.1.0`),
+the minor version (`0.1`) and `latest`. Use that image in place of `uatu`
+below, or build it locally:
+
 ```sh
 docker build -t uatu .
 docker volume create uatu-data

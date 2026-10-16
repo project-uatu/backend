@@ -19,8 +19,8 @@ is intentionally skipped. Do not require the conditional `test-build` job.
 [Release Please](https://github.com/googleapis/release-please) runs independently
 on every push to `main`. It maintains a release PR updating `CHANGELOG.md` and
 `.release-please-manifest.json` for the single root Go package. Merging that PR
-creates a `vX.Y.Z` tag and GitHub Release; it does not publish a container image
-or change the Go toolchain version in `go.mod`.
+creates a `vX.Y.Z` tag and GitHub Release, then publishes the container image
+(see below). It does not change the Go toolchain version in `go.mod`.
 
 The initial manifest baseline is `0.0.0` (not an existing release). Conventional
 Commits determine the first and subsequent versions: `feat:` bumps the minor
@@ -52,10 +52,29 @@ Repository setup:
   do not trigger CI, which would leave the required `go` check pending.
   Release PRs created with this token run the lightweight check and skip
   Go/container work unless they also contain code changes.
-- CI retains read-only permissions; the release workflow does not check out or
+- CI retains read-only permissions. The Release Please job does not check out or
   execute repository code and uses only the scoped release token.
 
-If image publishing is added later, gate it on
-`steps.release.outputs.release_created == 'true'` in the release workflow and
-build the released tag, rather than rebuilding on release-metadata changes or
-relying on a separate tag-triggered workflow.
+## Container image
+
+When Release Please creates a release, the `publish-image` job in the same
+workflow builds the released tag and pushes it to `ghcr.io/project-uatu/backend`.
+It runs only when `release_created` is true, so release-metadata changes and
+ordinary pushes never publish an image.
+
+- Platforms: `linux/amd64` and `linux/arm64`. The `arm64` image is built
+  under QEMU emulation.
+- Tags: the version (`0.1.0`), the minor version (`0.1`), the major version
+  from `1.0.0` onwards (`1`), and `latest`. Tags never carry the `v` prefix.
+- Provenance: the job attaches a signed GitHub build provenance attestation to
+  the image digest. Verify an image with
+  `gh attestation verify oci://ghcr.io/project-uatu/backend:<tag> --repo project-uatu/backend`.
+- Permissions: the job uses the built-in `GITHUB_TOKEN` with `packages: write`,
+  `id-token: write` and `attestations: write`. No registry secret is needed.
+
+On the first publish, GitHub creates the package as private. In the package
+settings, make it public and confirm that it is linked to this repository so
+that anonymous pulls work.
+
+To retry a failed publish, re-run the failed `publish-image` job from the same
+workflow run. Pushing the tag again does not trigger a publish.
