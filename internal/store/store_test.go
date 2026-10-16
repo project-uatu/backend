@@ -405,7 +405,7 @@ func TestStore_personTimelineAndIdentityConflicts(t *testing.T) {
 	}
 	var identityKeyCount int
 	if err := store.db.QueryRow(ctx,
-		"SELECT count(*) FROM identity_keys WHERE id = $1", key.ID).Scan(&identityKeyCount); err != nil {
+		"SELECT count(*) FROM identity_keys WHERE id = $1", claimOne.IdentityKeyID).Scan(&identityKeyCount); err != nil {
 		t.Fatalf("count identity keys after final owner deletion: %v", err)
 	}
 	if identityKeyCount != 0 {
