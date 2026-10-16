@@ -249,6 +249,16 @@ func (s *Store) ClaimIdentity(ctx context.Context, input IdentityClaimInput) (cl
 			if err := moveEventPeople(ctx, tx, key.ID, previousPerson, input.PersonID, claim.ID); err != nil {
 				return IdentityClaim{}, err
 			}
+		} else {
+			if _, err := tx.Exec(ctx, `
+				UPDATE event_people ep
+				SET identity_claim_id = $3
+				FROM identity_claims previous_claim
+				WHERE ep.identity_claim_id = previous_claim.id
+				  AND previous_claim.identity_key_id = $1
+				  AND ep.person_id = $2`, key.ID, input.PersonID, claim.ID); err != nil {
+				return IdentityClaim{}, fmt.Errorf("refresh event person identity claims: %w", err)
+			}
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
