@@ -172,6 +172,9 @@ func (s *Store) ClaimIdentity(ctx context.Context, input IdentityClaimInput) (cl
 			claimErr = errors.Join(claimErr, fmt.Errorf("rollback identity claim: %w", err))
 		}
 	}()
+	if err := lockEventIdentityChanges(ctx, tx); err != nil {
+		return IdentityClaim{}, err
+	}
 
 	key.ID = uuid.New()
 	if _, err := tx.Exec(ctx, `

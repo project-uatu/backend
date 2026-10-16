@@ -421,6 +421,184 @@ func TestStore_personTimelineAndIdentityConflicts(t *testing.T) {
 	}
 }
 
+func TestStore_concurrentIdentityReassignmentAndNormalization(t *testing.T) {
+	fixture := newIdentityEventFixture(t, true)
+	start := make(chan struct{})
+	claimDone := make(chan error, 1)
+	normalizeDone := make(chan error, 1)
+	go func() {
+		<-start
+		_, err := fixture.store.ClaimIdentity(t.Context(), IdentityClaimInput{
+			IdentityKey: fixture.key,
+			PersonID:    fixture.newPerson.ID,
+			Method:      "manual",
+			ReviewedBy:  "maintainer",
+			Disposition: "accepted",
+		})
+		claimDone <- err
+	}()
+	go func() {
+		<-start
+		normalizeDone <- fixture.store.ReplaceNormalizedActions(t.Context(), fixture.rawEventID, 2, []NormalizedActionInput{
+			fixture.action,
+		})
+	}()
+	close(start)
+	if err := <-claimDone; err != nil {
+		t.Fatalf("ClaimIdentity during normalization: %v", err)
+	}
+	if err := <-normalizeDone; err != nil {
+		t.Fatalf("ReplaceNormalizedActions during reassignment: %v", err)
+	}
+
+	var linkedCount int
+	if err := fixture.store.db.QueryRow(t.Context(), `
+		SELECT count(*)
+		FROM event_people ep
+		JOIN normalized_events ne ON ne.id = ep.normalized_event_id
+		JOIN identity_assignments ia
+		  ON ia.claim_id = ep.identity_claim_id AND ia.person_id = ep.person_id
+		WHERE ne.raw_event_id = $1 AND ne.is_current AND ep.person_id = $2`,
+		fixture.rawEventID, fixture.newPerson.ID).Scan(&linkedCount); err != nil {
+		t.Fatalf("count links for reassigned person after normalization: %v", err)
+	}
+	if linkedCount != 1 {
+		t.Errorf("current links for reassigned person = %d, want 1", linkedCount)
+	}
+}
+
+func TestStore_concurrentIdentityReassignmentAndEventPeopleReplacement(t *testing.T) {
+	fixture := newIdentityEventFixture(t, false)
+	start := make(chan struct{})
+	claimDone := make(chan error, 1)
+	replaceDone := make(chan error, 1)
+	go func() {
+		<-start
+		_, err := fixture.store.ClaimIdentity(t.Context(), IdentityClaimInput{
+			IdentityKey: fixture.key,
+			PersonID:    fixture.newPerson.ID,
+			Method:      "manual",
+			ReviewedBy:  "maintainer",
+			Disposition: "accepted",
+		})
+		claimDone <- err
+	}()
+	go func() {
+		<-start
+		replaceDone <- fixture.store.ReplaceEventPeople(t.Context(), fixture.actionID, []EventPersonInput{{
+			PersonID: fixture.oldPerson.ID, Role: "author", IdentityClaimID: &fixture.claim.ID,
+		}})
+	}()
+	close(start)
+	if err := <-claimDone; err != nil {
+		t.Fatalf("ClaimIdentity during event-person replacement: %v", err)
+	}
+	replaceErr := <-replaceDone
+	if replaceErr != nil && !strings.Contains(replaceErr.Error(), "current identity assignment") {
+		t.Fatalf("ReplaceEventPeople during reassignment: %v", replaceErr)
+	}
+
+	var staleLinks, validLinks int
+	if err := fixture.store.db.QueryRow(t.Context(), `
+		SELECT count(*) FILTER (WHERE ep.person_id = $2),
+		       count(*) FILTER (WHERE ep.person_id = $3 AND ia.claim_id IS NOT NULL)
+		FROM event_people ep
+		JOIN normalized_events ne ON ne.id = ep.normalized_event_id
+		LEFT JOIN identity_assignments ia
+		  ON ia.claim_id = ep.identity_claim_id AND ia.person_id = ep.person_id
+		WHERE ne.id = $1 AND ne.is_current`,
+		fixture.actionID, fixture.oldPerson.ID, fixture.newPerson.ID).Scan(&staleLinks, &validLinks); err != nil {
+		t.Fatalf("count current event-person links after reassignment: %v", err)
+	}
+	if staleLinks != 0 {
+		t.Errorf("current links for old person = %d, want 0", staleLinks)
+	}
+	if validLinks > 1 {
+		t.Errorf("valid current links for reassigned person = %d, want at most 1", validLinks)
+	}
+}
+
+type identityEventFixture struct {
+	store      *Store
+	oldPerson  Person
+	newPerson  Person
+	key        IdentityKey
+	claim      IdentityClaim
+	rawEventID uuid.UUID
+	actionID   uuid.UUID
+	action     NormalizedActionInput
+}
+
+func newIdentityEventFixture(t *testing.T, link bool) identityEventFixture {
+	t.Helper()
+	store := testStore(t)
+	ctx := t.Context()
+	oldPerson, err := store.CreatePerson(ctx, nil)
+	if err != nil {
+		t.Fatalf("CreatePerson old: %v", err)
+	}
+	newPerson, err := store.CreatePerson(ctx, nil)
+	if err != nil {
+		t.Fatalf("CreatePerson new: %v", err)
+	}
+	instance, err := store.CreateForgeInstance(ctx, "github", "https://github.com")
+	if err != nil {
+		t.Fatalf("CreateForgeInstance: %v", err)
+	}
+	key := IdentityKey{
+		ForgeInstanceID: &instance.ID,
+		Kind:            "login",
+		Value:           "octocat",
+		Normalized:      "octocat",
+	}
+	claim, err := store.ClaimIdentity(ctx, IdentityClaimInput{
+		IdentityKey: key,
+		PersonID:    oldPerson.ID,
+		Method:      "manual",
+		ReviewedBy:  "maintainer",
+		Disposition: "accepted",
+	})
+	if err != nil {
+		t.Fatalf("ClaimIdentity initial: %v", err)
+	}
+	rawEventID, err := store.SaveRawEvent(ctx, RawEventInput{
+		ForgeInstanceID:      instance.ID,
+		ExternalID:           "pull:concurrent",
+		Kind:                 "pull_request",
+		Payload:              json.RawMessage(`{"number":1}`),
+		PayloadSchemaVersion: 1,
+	})
+	if err != nil {
+		t.Fatalf("SaveRawEvent: %v", err)
+	}
+	action := NormalizedActionInput{
+		ActionKey:  "opened",
+		Kind:       "pull_request_opened",
+		OccurredAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+	if err := store.ReplaceNormalizedActions(ctx, rawEventID, 1, []NormalizedActionInput{action}); err != nil {
+		t.Fatalf("ReplaceNormalizedActions initial: %v", err)
+	}
+	var actionID uuid.UUID
+	if err := store.db.QueryRow(ctx, `
+		SELECT id FROM normalized_events
+		WHERE raw_event_id = $1 AND action_key = $2 AND is_current`,
+		rawEventID, action.ActionKey).Scan(&actionID); err != nil {
+		t.Fatalf("load current normalized action: %v", err)
+	}
+	if link {
+		if err := store.ReplaceEventPeople(ctx, actionID, []EventPersonInput{{
+			PersonID: oldPerson.ID, Role: "author", IdentityClaimID: &claim.ID,
+		}}); err != nil {
+			t.Fatalf("ReplaceEventPeople initial: %v", err)
+		}
+	}
+	return identityEventFixture{
+		store: store, oldPerson: oldPerson, newPerson: newPerson, key: key, claim: claim,
+		rawEventID: rawEventID, actionID: actionID, action: action,
+	}
+}
+
 func testStore(t *testing.T) *Store {
 	t.Helper()
 	options, cleanup := testDatabase(t)

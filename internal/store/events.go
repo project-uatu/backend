@@ -11,6 +11,15 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+const eventIdentityLockID int64 = 0x554154554C494E4B
+
+func lockEventIdentityChanges(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", eventIdentityLockID); err != nil {
+		return fmt.Errorf("lock event identity changes: %w", err)
+	}
+	return nil
+}
+
 // RawEventInput is a source event before normalization.
 type RawEventInput struct {
 	ForgeInstanceID      uuid.UUID
@@ -166,6 +175,9 @@ func (s *Store) ReplaceNormalizedActions(ctx context.Context, rawEventID uuid.UU
 			actionErr = errors.Join(actionErr, fmt.Errorf("rollback event normalization: %w", err))
 		}
 	}()
+	if err := lockEventIdentityChanges(ctx, tx); err != nil {
+		return err
+	}
 	var lockedEventID uuid.UUID
 	if err := tx.QueryRow(ctx,
 		"SELECT id FROM raw_events WHERE id = $1 FOR UPDATE", rawEventID).Scan(&lockedEventID); err != nil {
@@ -275,6 +287,9 @@ func (s *Store) ReplaceEventPeople(ctx context.Context, eventID uuid.UUID, peopl
 			peopleErr = errors.Join(peopleErr, fmt.Errorf("rollback event person replacement: %w", err))
 		}
 	}()
+	if err := lockEventIdentityChanges(ctx, tx); err != nil {
+		return err
+	}
 	var occurredAt time.Time
 	if err := tx.QueryRow(ctx, `
 		SELECT occurred_at FROM normalized_events
