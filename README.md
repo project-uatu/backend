@@ -107,11 +107,22 @@ footers in the resulting commit message.
 
 Repository setup:
 
-- Add the Actions secret `RELEASE_PLEASE_TOKEN`: a GitHub App installation token
-  or fine-grained personal access token restricted to this repository, with
-  **Contents**, **Pull requests**, and **Issues** read/write permissions
-  (including release-label management). Keep installation tokens refreshed.
-- A separate token is intentional: PRs created with the built-in `GITHUB_TOKEN`
+- Create a GitHub App and install it on this repository only. Grant these
+  repository permissions (no organization permissions or webhook subscriptions
+  are needed):
+  - **Contents: read and write** — release branches, version/changelog commits,
+    tags, and GitHub Releases.
+  - **Pull requests: read and write** — create and update release PRs.
+  - **Issues: read and write** — manage release labels.
+  - **Metadata: read-only** — automatically granted by GitHub.
+- Set the Actions repository variable `RELEASE_APP_CLIENT_ID` to the App's
+  client ID and the Actions repository secret `RELEASE_APP_PRIVATE_KEY` to its
+  generated PEM private key. No client secret or stored installation token is
+  needed; remove the old `RELEASE_PLEASE_TOKEN` secret if previously configured.
+- The workflow mints a short-lived installation token before Release Please,
+  explicitly scoped to this repository and the three write permissions above.
+  The token action revokes it when the job finishes.
+- An App token is intentional: PRs created with the built-in `GITHUB_TOKEN`
   do not trigger CI, which would leave the required `go` check pending.
   Release PRs created with this token run the lightweight check and skip
   Go/container work unless they also contain code changes.
