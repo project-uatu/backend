@@ -64,11 +64,15 @@ schema itself lives in `internal/store` per ADR 0001. Store timestamps as
   time, raw JSON payload and payload schema version. Enforce uniqueness on
   `(forge_instance_id, external_id)`.
 - `normalized_events` stores query-facing fields derived from a raw event,
-  keyed by raw event and normalizer version. Re-normalization creates a new
-  version rather than overwriting prior output.
+  keyed by raw event, normalizer version and action. One raw record can yield
+  several contribution actions, each with its own time: a pull request can be
+  opened, merged and closed. Re-normalization creates a new version rather
+  than overwriting prior output; exactly one version per raw event is current,
+  and queries read only current output.
 - `event_people` links a normalized event to zero or more persons and roles
   such as author, reviewer or commenter. A person is never a mutable owner
-  column on a raw event.
+  column on a raw event. Associations are derived from current identity
+  assignments, and are re-derived when an assignment changes.
 - `sync_runs` records person, source instance, start/finish, status and a
   structured fetch report. `sync_coverage` records completed time ranges and
   gaps separately from `checkpoints`, which hold opaque source cursors and
@@ -84,6 +88,27 @@ schema itself lives in `internal/store` per ADR 0001. Store timestamps as
   source events independent of persons; payload erasure and retention policy
   must be settled in the privacy work under issue #10 before public profile
   endpoints are delivered.
+
+### Person history over time
+
+The primary query is a person's contributions over time, bucketed by day,
+week, month or year and broken down by kind, source and project.
+
+- `event_people` carries a copy of the event's occurrence time and is indexed
+  on `(person_id, occurred_at)`, so timeline and bucketed queries do not scan
+  every event.
+- An action's occurrence time comes from the source and never changes when the
+  raw payload is refreshed. History is append-only: collecting again adds or
+  corrects actions but does not move existing ones in time.
+- `contribution_counts` stores source-provided aggregate counts, such as
+  GitHub's daily contribution calendar, per person, forge instance, day and
+  kind, with the time they were observed. These cover activity that cannot be
+  enumerated as individual events. They are kept separate from events and are
+  never converted into fabricated individual events.
+- Charts distinguish "no activity" from "not collected" by reading
+  `sync_coverage` for the requested range.
+- Buckets are computed on the fly from the index. Precomputed summaries are
+  added only when measurement shows they are needed.
 
 ## Consequences
 
@@ -103,4 +128,9 @@ privacy decision before public profile APIs.
 - Verify foreign keys, source-scoped deduplication, conflicting identity
   claims, one current assignment per key, multiple event-person roles,
   normalizer-version coexistence and person-scoped cascade behavior.
+- Verify a multi-year person timeline bucketed by month and kind uses the
+  `(person_id, occurred_at)` index, counts each action once across normalizer
+  versions, and reports uncovered ranges as gaps rather than zero activity.
+- Verify re-collecting a person does not move existing actions in time, and
+  re-deriving associations after an assignment change updates the timeline.
 - Database, migration and configuration checks follow ADR 0001's validation.
