@@ -1,10 +1,12 @@
 # 0007: Versioned person API, authentication and privacy
 
-Status: Proposed
+Status: Accepted
 
 Date: 2026-10-17
 
 Issue: [#6](https://github.com/project-uatu/backend/issues/6)
+
+Decision authority: Accepted by the maintainer on 2026-10-17.
 
 Prerequisites: completed issues [#3](https://github.com/project-uatu/backend/issues/3),
 [#4](https://github.com/project-uatu/backend/issues/4) and
