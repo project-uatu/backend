@@ -49,10 +49,13 @@ type CollectionJobInput struct {
 // JobClaim owns a collection job and the sync run for this attempt.
 type JobClaim struct {
 	CollectionJob
-	Owner       string
-	Token       uuid.UUID
-	LeaseExpiry time.Time
-	SyncRunID   uuid.UUID
+	Owner               string
+	Token               uuid.UUID
+	LeaseExpiry         time.Time
+	SyncRunID           uuid.UUID
+	AccountNodeID       string
+	CurrentAccountLogin string
+	KnownRepositories   []string
 }
 
 // NormalizationClaim owns one raw event normalization attempt.
@@ -193,6 +196,44 @@ func (s *Store) EnqueueCollectionJob(ctx context.Context, input CollectionJobInp
 	return job, nil
 }
 
+// EnqueueGitHubHistory chooses an initial backfill or a seven-day-overlap
+// incremental scan from the completed checkpoint.
+func (s *Store) EnqueueGitHubHistory(ctx context.Context, personID, forgeInstanceID uuid.UUID) (CollectionJob, error) {
+	if personID == uuid.Nil || forgeInstanceID == uuid.Nil {
+		return CollectionJob{}, errors.New("GitHub history enqueue requires person and forge")
+	}
+	var accountCreatedAt time.Time
+	if err := s.db.QueryRow(ctx, `
+		SELECT account_created_at FROM github_accounts
+		WHERE forge_instance_id = $1 AND person_id = $2`,
+		forgeInstanceID, personID).Scan(&accountCreatedAt); err != nil {
+		return CollectionJob{}, fmt.Errorf("load GitHub account creation time: %w", err)
+	}
+	input := CollectionJobInput{
+		PersonID: personID, ForgeInstanceID: forgeInstanceID,
+		SourceKey: SourceGitHubHistory, ScanMode: "backfill",
+		Window: event.Window{From: accountCreatedAt.UTC()},
+	}
+	var backfillComplete bool
+	var completedThrough *time.Time
+	err := s.db.QueryRow(ctx, `
+		SELECT backfill_complete, completed_through
+		FROM checkpoints
+		WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3`,
+		personID, forgeInstanceID, SourceGitHubHistory).Scan(&backfillComplete, &completedThrough)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+	case err != nil:
+		return CollectionJob{}, fmt.Errorf("load GitHub history checkpoint: %w", err)
+	case backfillComplete && completedThrough != nil:
+		input.ScanMode = "incremental"
+		input.Window.From = completedThrough.Add(-7 * 24 * time.Hour).UTC()
+	default:
+	}
+	input.Window.To = time.Now().UTC()
+	return s.EnqueueCollectionJob(ctx, input)
+}
+
 func collectionJobForIdempotencyKey(ctx context.Context, tx pgx.Tx, input CollectionJobInput) (CollectionJob, bool, error) {
 	var job CollectionJob
 	var windowStart *time.Time
@@ -280,6 +321,27 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 		return JobClaim{}, false, err
 	}
 	job.IdentityKeys = keys
+	var accountNodeID, currentLogin string
+	var knownRepositories []string
+	if job.SourceKey == SourceGitHubHistory {
+		if err := tx.QueryRow(ctx, `
+			SELECT node_id, login FROM github_accounts
+			WHERE forge_instance_id = $1 AND person_id = $2`,
+			job.ForgeInstanceID, job.PersonID).Scan(&accountNodeID, &currentLogin); err != nil {
+			return JobClaim{}, false, fmt.Errorf("load GitHub account identifiers: %w", err)
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT repository FROM github_known_repositories
+			WHERE forge_instance_id = $1 AND person_id = $2 ORDER BY repository`,
+			job.ForgeInstanceID, job.PersonID)
+		if err != nil {
+			return JobClaim{}, false, fmt.Errorf("load known GitHub repositories: %w", err)
+		}
+		knownRepositories, err = pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return JobClaim{}, false, fmt.Errorf("read known GitHub repositories: %w", err)
+		}
+	}
 	if oldRunID != nil {
 		if _, err := tx.Exec(ctx, `
 			UPDATE sync_runs SET status = 'partial', finished_at = now()
@@ -318,6 +380,8 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 		Token:         token,
 		LeaseExpiry:   leaseExpiry.UTC(),
 		SyncRunID:     runID,
+		AccountNodeID: accountNodeID, CurrentAccountLogin: currentLogin,
+		KnownRepositories: knownRepositories,
 	}, true, nil
 }
 
@@ -382,6 +446,11 @@ func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page 
 			return false, errors.New("fetch report contains an invalid coverage gap")
 		}
 	}
+	for _, count := range report.ContributionCounts {
+		if count.Date.IsZero() || count.Metric == "" || count.Value < 0 {
+			return false, errors.New("fetch report contains an invalid contribution count")
+		}
+	}
 	reportJSON, err := json.Marshal(report)
 	if err != nil {
 		return false, fmt.Errorf("encode fetch report: %w", err)
@@ -444,13 +513,24 @@ func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page 
 		claim.SyncRunID, reportJSON, gapsJSON, errorsJSON); err != nil {
 		return false, fmt.Errorf("append collection page report: %w", err)
 	}
+	for _, count := range report.ContributionCounts {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO contribution_counts
+				(id, person_id, forge_instance_id, activity_date, metric, kind, value)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			uuid.New(), claim.PersonID, claim.ForgeInstanceID,
+			count.Date.UTC().Format("2006-01-02"), count.Metric, count.Kind, count.Value); err != nil {
+			return false, fmt.Errorf("persist source contribution count: %w", err)
+		}
+	}
 	for _, gap := range report.Gaps {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO sync_coverage
-				(id, person_id, forge_instance_id, source_key, range_start, range_end, status, gap_reason, sync_run_id)
-			VALUES ($1, $2, $3, $4, $5, $6, 'gap', $7, $8)`,
+				(id, person_id, forge_instance_id, source_key, range_start, range_end,
+				 status, gap_reason, sync_run_id, coverage_scope)
+			VALUES ($1, $2, $3, $4, $5, $6, 'gap', $7, $8, $9)`,
 			uuid.New(), claim.PersonID, claim.ForgeInstanceID, claim.SourceKey,
-			gap.From.UTC(), gap.To.UTC(), gap.Reason, claim.SyncRunID); err != nil {
+			gap.From.UTC(), gap.To.UTC(), gap.Reason, claim.SyncRunID, report.CoverageScope); err != nil {
 			return false, fmt.Errorf("record collection coverage gap: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
@@ -484,6 +564,14 @@ func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page 
 		}
 		return false, nil
 	}
+	for _, repo := range report.KnownRepositories {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO github_known_repositories (person_id, forge_instance_id, repository)
+			VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+			claim.PersonID, claim.ForgeInstanceID, repo); err != nil {
+			return false, fmt.Errorf("persist known GitHub repository: %w", err)
+		}
+	}
 	scanComplete := false
 	if page.Done {
 		var gapCount int
@@ -507,10 +595,11 @@ func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page 
 			}
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO sync_coverage
-					(id, person_id, forge_instance_id, source_key, range_start, range_end, status, sync_run_id)
-				VALUES ($1, $2, $3, $4, $5, $6, 'complete', $7)`,
+					(id, person_id, forge_instance_id, source_key, range_start, range_end,
+					 status, sync_run_id, coverage_scope)
+				VALUES ($1, $2, $3, $4, $5, $6, 'complete', $7, $8)`,
 				uuid.New(), claim.PersonID, claim.ForgeInstanceID, claim.SourceKey,
-				start.UTC(), claim.Window.To.UTC(), claim.SyncRunID); err != nil {
+				start.UTC(), claim.Window.To.UTC(), claim.SyncRunID, report.CoverageScope); err != nil {
 				return false, fmt.Errorf("record completed collection coverage: %w", err)
 			}
 		}
@@ -788,13 +877,13 @@ func advanceCollectionCursor(ctx context.Context, tx pgx.Tx, claim JobClaim, cur
 		VALUES ($1, $2, $3, CASE WHEN $4 = 'backfill' THEN $5 ELSE '' END,
 		                   CASE WHEN $4 = 'incremental' THEN $5 ELSE '' END,
 		                   ($4 = 'backfill' AND $6),
-		                   CASE WHEN $4 = 'incremental' AND $6 THEN $7::timestamptz ELSE NULL::timestamptz END)
+		                   CASE WHEN $6 THEN $7::timestamptz ELSE NULL::timestamptz END)
 		ON CONFLICT (person_id, forge_instance_id, source_key)
 		DO UPDATE SET cursor = CASE WHEN $4 = 'backfill' THEN EXCLUDED.cursor ELSE checkpoints.cursor END,
 		              incremental_cursor = CASE WHEN $4 = 'incremental' THEN EXCLUDED.incremental_cursor ELSE checkpoints.incremental_cursor END,
 		              backfill_complete = CASE WHEN $4 = 'backfill' AND $6 THEN true ELSE checkpoints.backfill_complete END,
 		              completed_through = CASE
-		                  WHEN $4 = 'incremental' AND $6
+		                  WHEN $6
 		                  THEN GREATEST(COALESCE(checkpoints.completed_through, EXCLUDED.completed_through),
 		                                EXCLUDED.completed_through)
 		                  ELSE checkpoints.completed_through

@@ -14,14 +14,13 @@ import (
 	"github.com/project-uatu/backend/internal/collector"
 	"github.com/project-uatu/backend/internal/config"
 	"github.com/project-uatu/backend/internal/github"
-	"github.com/project-uatu/backend/internal/normalizer"
 	"github.com/project-uatu/backend/internal/server"
 	"github.com/project-uatu/backend/internal/store"
 )
 
 const usage = `Usage:
   uatu [serve]             serve stored results over HTTP (default)
-  uatu collect [user ...]  collect legacy repository snapshots for users
+  uatu collect [user ...]  collect public contribution history for GitHub users
   uatu collect             process due event work once when no users are configured
   uatu collect --loop      run the event worker until interrupted
   uatu help                show this help
@@ -74,6 +73,9 @@ func run(ctx context.Context, args []string, cfg config.Config, logger *slog.Log
 		}
 		return serve(ctx, cfg, logger)
 	case "collect":
+		if cfg.GitHubToken == "" {
+			return &usageError{err: errors.New("collect requires GITHUB_TOKEN for GitHub identity refresh and contribution counts")}
+		}
 		if len(args) > 0 && args[0] == "--loop" {
 			if len(args) != 1 {
 				return &usageError{err: fmt.Errorf("collect --loop takes no user arguments")}
@@ -92,7 +94,7 @@ func run(ctx context.Context, args []string, cfg config.Config, logger *slog.Log
 				return &usageError{err: fmt.Errorf("invalid GitHub login %q", user)}
 			}
 		}
-		return collect(ctx, cfg, users, logger)
+		return collectPeople(ctx, cfg, users, logger)
 	default:
 		return &usageError{err: fmt.Errorf("unknown command %q", command)}
 	}
@@ -107,14 +109,38 @@ func serve(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	return server.Run(ctx, cfg.Address, server.NewHandler(db, logger), logger)
 }
 
-func collect(ctx context.Context, cfg config.Config, users []string, logger *slog.Logger) error {
+func collectPeople(ctx context.Context, cfg config.Config, users []string, logger *slog.Logger) error {
 	db, err := store.Open(ctx, storeOptions(cfg))
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	c := collector.New(db, github.NewClient(cfg.GitHubToken, nil))
-	return collectUsers(ctx, c, collector.Sources(), users, logger)
+	forge, err := db.CreateForgeInstance(ctx, "github", "https://github.com")
+	if err != nil {
+		return fmt.Errorf("create GitHub forge instance: %w", err)
+	}
+	client := github.NewClient(cfg.GitHubToken, nil)
+	for _, login := range users {
+		account, err := client.ResolveAccount(ctx, login)
+		if err != nil {
+			return fmt.Errorf("resolve GitHub user %s: %w", login, err)
+		}
+		tracked, err := db.TrackGitHubAccount(ctx, forge.ID, store.GitHubAccount{
+			AccountID: account.ID, NodeID: account.NodeID, Login: account.Login,
+			AccountCreatedAt: account.CreatedAt,
+		})
+		if err != nil {
+			return fmt.Errorf("track GitHub user %s: %w", login, err)
+		}
+		logger.InfoContext(ctx, "GitHub account tracked", "login", tracked.Login, "person_id", tracked.PersonID)
+		if _, err := db.EnqueueGitHubHistory(ctx, tracked.PersonID, forge.ID); err != nil {
+			if !errors.Is(err, store.ErrCollectionJobActive) {
+				return fmt.Errorf("enqueue GitHub history for %s: %w", login, err)
+			}
+			logger.InfoContext(ctx, "resuming existing GitHub history scan", "person_id", tracked.PersonID)
+		}
+	}
+	return runCollectionWorker(ctx, db, cfg, logger, false)
 }
 
 func collectWork(ctx context.Context, cfg config.Config, loop bool, logger *slog.Logger) error {
@@ -123,11 +149,21 @@ func collectWork(ctx context.Context, cfg config.Config, loop bool, logger *slog
 		return err
 	}
 	defer db.Close()
+	return runCollectionWorker(ctx, db, cfg, logger, loop)
+}
+
+func runCollectionWorker(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.Logger, loop bool) error {
 	host, err := os.Hostname()
 	if err != nil {
 		return fmt.Errorf("get collector hostname: %w", err)
 	}
-	runner, err := collector.NewRunner(db, nil, normalizer.New(), logger, collector.RunnerOptions{
+	transformer, err := github.NewHistoryNormalizer()
+	if err != nil {
+		return fmt.Errorf("configure GitHub history normalizer: %w", err)
+	}
+	runner, err := collector.NewRunner(db, []collector.Connector{
+		github.NewHistoryConnector(github.NewClient(cfg.GitHubToken, nil)),
+	}, transformer, logger, collector.RunnerOptions{
 		Owner: fmt.Sprintf("%s-%d", host, os.Getpid()),
 	})
 	if err != nil {
@@ -147,28 +183,4 @@ func storeOptions(cfg config.Config) store.Options {
 		MaxConns:       cfg.DatabaseMaxConns,
 		ConnectTimeout: cfg.DatabaseConnectTimeout,
 	}
-}
-
-// sourceCollector collects one source for one user.
-type sourceCollector interface {
-	Collect(context.Context, store.Source, string) error
-}
-
-// collectUsers attempts every source for every user, stopping early only when
-// ctx is canceled. It returns all collection errors joined.
-func collectUsers(ctx context.Context, c sourceCollector, sources []store.Source, users []string, logger *slog.Logger) error {
-	var errs []error
-	for _, user := range users {
-		for _, source := range sources {
-			if err := ctx.Err(); err != nil {
-				return errors.Join(append(errs, err)...)
-			}
-			if err := c.Collect(ctx, source, user); err != nil {
-				errs = append(errs, fmt.Errorf("%s/%s: %w", source, user, err))
-				continue
-			}
-			logger.InfoContext(ctx, "collection stored", "source", source, "user", user)
-		}
-	}
-	return errors.Join(errs...)
 }

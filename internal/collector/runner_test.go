@@ -150,13 +150,17 @@ func TestRunner_RunOnce_persistsBoundedPages(t *testing.T) {
 			ID: uuid.New(), PersonID: personID, ForgeInstanceID: instanceID,
 			SourceKey: "test", ScanMode: "backfill", Window: window,
 		},
-		Token: uuid.New(), SyncRunID: uuid.New(),
+		KnownRepositories: []string{"other/repo"},
+		Token:             uuid.New(), SyncRunID: uuid.New(),
 	}, quota: store.QuotaReservation{Granted: true, ID: uuid.New()}}
 	connector := &pageConnector{
 		source: "test", bucket: "test:shared",
 		fetch: func(_ context.Context, request event.PageRequest) (event.Page, event.FetchReport, error) {
 			if request.PageSize != defaultPageSize {
 				t.Errorf("FetchPage page size = %d, want %d", request.PageSize, defaultPageSize)
+			}
+			if len(request.KnownRepositories) != 1 || request.KnownRepositories[0] != "other/repo" {
+				t.Errorf("FetchPage known repositories = %v, want other/repo from claim", request.KnownRepositories)
 			}
 			switch request.Cursor {
 			case "":
@@ -178,6 +182,9 @@ func TestRunner_RunOnce_persistsBoundedPages(t *testing.T) {
 	}
 	if len(connector.requests) != 2 || connector.requests[1].Cursor != "next" {
 		t.Errorf("connector requests = %+v, want second cursor next", connector.requests)
+	}
+	if len(connector.requests) > 0 && connector.requests[0].ScanMode != "backfill" {
+		t.Errorf("first request scan mode = %q, want backfill", connector.requests[0].ScanMode)
 	}
 	if len(storeStub.pages) != 2 || !storeStub.pages[0].successful || !storeStub.pages[1].successful {
 		t.Errorf("persisted pages = %+v, want two successful pages", storeStub.pages)

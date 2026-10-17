@@ -38,13 +38,17 @@ type Window struct {
 
 // PageRequest identifies one bounded connector request.
 type PageRequest struct {
-	PersonID        uuid.UUID
-	ForgeInstanceID uuid.UUID
-	Source          Source
-	IdentityKeys    []ActorKey
-	Window          Window
-	Cursor          string
-	PageSize        int
+	PersonID          uuid.UUID
+	ForgeInstanceID   uuid.UUID
+	Source            Source
+	ScanMode          string
+	IdentityKeys      []ActorKey
+	AccountNodeID     string
+	CurrentLogin      string
+	KnownRepositories []string
+	Window            Window
+	Cursor            string
+	PageSize          int
 }
 
 // RawEvent is a source record before normalization.
@@ -76,14 +80,25 @@ type Gap struct {
 // FetchReport records page, rate-limit and coverage information. It remains
 // valid when a connector returns an error.
 type FetchReport struct {
-	Requests           int        `json:"requests"`
-	Pages              int        `json:"pages"`
-	RateLimitBucket    string     `json:"rate_limit_bucket,omitempty"`
-	RateLimitLimit     *int       `json:"rate_limit_limit,omitempty"`
-	RateLimitRemaining *int       `json:"rate_limit_remaining,omitempty"`
-	RateLimitResetAt   *time.Time `json:"rate_limit_reset_at,omitempty"`
-	Gaps               []Gap      `json:"gaps,omitempty"`
-	Errors             []string   `json:"errors,omitempty"`
+	Requests           int                 `json:"requests"`
+	Pages              int                 `json:"pages"`
+	RateLimitBucket    string              `json:"rate_limit_bucket,omitempty"`
+	RateLimitLimit     *int                `json:"rate_limit_limit,omitempty"`
+	RateLimitRemaining *int                `json:"rate_limit_remaining,omitempty"`
+	RateLimitResetAt   *time.Time          `json:"rate_limit_reset_at,omitempty"`
+	Gaps               []Gap               `json:"gaps,omitempty"`
+	Errors             []string            `json:"errors,omitempty"`
+	ContributionCounts []ContributionCount `json:"contribution_counts,omitempty"`
+	CoverageScope      string              `json:"coverage_scope,omitempty"`
+	KnownRepositories  []string            `json:"known_repositories,omitempty"`
+}
+
+// ContributionCount is an upstream aggregate observation, not a timeline event.
+type ContributionCount struct {
+	Date   time.Time `json:"date"`
+	Metric string    `json:"metric"`
+	Kind   string    `json:"kind,omitempty"`
+	Value  int64     `json:"value"`
 }
 
 // Action is one normalized contribution derived from a raw event.
