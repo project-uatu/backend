@@ -1,6 +1,30 @@
 ALTER TABLE jobs
     ADD COLUMN onboarding_login TEXT NOT NULL DEFAULT '';
 
+WITH pending_onboarding_logins AS (
+    SELECT DISTINCT ON (j.id) j.id, ik.normalized_value
+    FROM jobs j
+    JOIN identity_claims ic
+      ON ic.person_id = j.person_id AND ic.method = 'api_onboarding'
+    JOIN identity_keys ik
+      ON ik.id = ic.identity_key_id
+     AND ik.forge_instance_id = j.forge_instance_id
+     AND ik.kind = 'login'
+    WHERE j.source_key = 'github_history'
+      AND j.status IN ('queued', 'running')
+      AND j.onboarding_login = ''
+      AND NOT EXISTS (
+          SELECT 1 FROM github_accounts ga
+          WHERE ga.forge_instance_id = j.forge_instance_id
+            AND ga.person_id = j.person_id
+      )
+    ORDER BY j.id, ic.asserted_at, ic.id
+)
+UPDATE jobs j
+SET onboarding_login = pending.normalized_value
+FROM pending_onboarding_logins pending
+WHERE j.id = pending.id;
+
 CREATE TABLE raw_event_actor_keys (
     raw_event_id UUID NOT NULL REFERENCES raw_events(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,
