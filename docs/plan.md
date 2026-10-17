@@ -196,8 +196,9 @@ Acceptance:
 
 Dependencies: steps 1 and 3.
 
-Accept an ADR covering connector contracts, import boundaries, transaction
-boundaries, normalization and checkpoint semantics.
+[Proposed ADR 0005](adr/0005-resumable-collection.md) covers connector
+contracts, import boundaries, transaction boundaries, normalization and
+checkpoint semantics. Obtain maintainer acceptance before implementation.
 
 Acceptance:
 - Stream bounded pages with typed actor keys, kinds and raw JSON; valid reports
