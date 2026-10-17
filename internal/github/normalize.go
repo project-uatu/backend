@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -62,7 +63,7 @@ func normalizeIssue(raw event.RawEvent) ([]event.Action, error) {
 	}
 	project := repoName(payload.RepositoryURL, "https://api.github.com")
 	if project == "" {
-		project = projectFromExternalID(raw.ExternalID, "issue:")
+		project = projectFromURL(payload.HTMLURL)
 	}
 	actions := []event.Action{{
 		Key: "opened", Kind: "issue_opened", OccurredAt: payload.CreatedAt,
@@ -88,7 +89,7 @@ func normalizePullRequest(raw event.RawEvent) ([]event.Action, error) {
 	}
 	project := repoName(payload.RepositoryURL, "https://api.github.com")
 	if project == "" {
-		project = projectFromExternalID(raw.ExternalID, "pull_request:")
+		project = projectFromURL(payload.HTMLURL)
 	}
 	actions := []event.Action{{
 		Key: "opened", Kind: "pull_request_opened", OccurredAt: payload.CreatedAt,
@@ -109,13 +110,16 @@ func normalizePullRequest(raw event.RawEvent) ([]event.Action, error) {
 	return actions, nil
 }
 
-func projectFromExternalID(externalID, prefix string) string {
-	remainder := strings.TrimPrefix(externalID, prefix)
-	project, _, ok := strings.Cut(remainder, ":")
-	if !ok {
+func projectFromURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host != "github.com" {
 		return ""
 	}
-	return project
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[0] + "/" + parts[1]
 }
 
 func normalizeReview(raw event.RawEvent) ([]event.Action, error) {
@@ -128,7 +132,7 @@ func normalizeReview(raw event.RawEvent) ([]event.Action, error) {
 	}
 	project := payload.Repository
 	if project == "" {
-		project = projectFromExternalID(raw.ExternalID, "review:")
+		project = projectFromURL(payload.HTMLURL)
 	}
 	return []event.Action{{
 		Key: "submitted", Kind: "pull_request_reviewed", OccurredAt: *raw.OccurredAt,
@@ -147,7 +151,7 @@ func normalizeRelease(raw event.RawEvent) ([]event.Action, error) {
 	}
 	project := payload.Repository
 	if project == "" {
-		project = projectFromExternalID(raw.ExternalID, "release:")
+		project = projectFromURL(payload.HTMLURL)
 	}
 	return []event.Action{{
 		Key: "published", Kind: "release_published", OccurredAt: *raw.OccurredAt,

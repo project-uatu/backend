@@ -73,6 +73,9 @@ func run(ctx context.Context, args []string, cfg config.Config, logger *slog.Log
 		}
 		return serve(ctx, cfg, logger)
 	case "collect":
+		if cfg.GitHubToken == "" {
+			return &usageError{err: errors.New("collect requires GITHUB_TOKEN for GitHub identity refresh and contribution counts")}
+		}
 		if len(args) > 0 && args[0] == "--loop" {
 			if len(args) != 1 {
 				return &usageError{err: fmt.Errorf("collect --loop takes no user arguments")}
@@ -131,7 +134,10 @@ func collectPeople(ctx context.Context, cfg config.Config, users []string, logge
 		}
 		logger.InfoContext(ctx, "GitHub account tracked", "login", tracked.Login, "person_id", tracked.PersonID)
 		if _, err := db.EnqueueGitHubHistory(ctx, tracked.PersonID, forge.ID); err != nil {
-			return fmt.Errorf("enqueue GitHub history for %s: %w", login, err)
+			if !errors.Is(err, store.ErrCollectionJobActive) {
+				return fmt.Errorf("enqueue GitHub history for %s: %w", login, err)
+			}
+			logger.InfoContext(ctx, "resuming existing GitHub history scan", "person_id", tracked.PersonID)
 		}
 	}
 	return runCollectionWorker(ctx, db, cfg, logger, false)

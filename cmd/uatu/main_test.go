@@ -25,7 +25,7 @@ func TestRun_usageErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := config.Config{DatabaseURL: "not-a-database-url", Users: tt.users}
+			cfg := config.Config{DatabaseURL: "not-a-database-url", Users: tt.users, GitHubToken: "test-token"}
 
 			err := run(t.Context(), tt.args, cfg, testLogger(), io.Discard)
 			var usageErr *usageError
@@ -38,6 +38,7 @@ func TestRun_usageErrors(t *testing.T) {
 
 func TestRun_collectWithoutUsersRunsTheQueueWorker(t *testing.T) {
 	cfg := config.Config{
+		GitHubToken:            "test-token",
 		DatabaseURL:            "not-a-database-url",
 		DatabaseMinConns:       0,
 		DatabaseMaxConns:       1,
@@ -50,6 +51,16 @@ func TestRun_collectWithoutUsersRunsTheQueueWorker(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("run(collect) error = nil, want database connection error")
+	}
+}
+
+func TestRun_collectRequiresToken(t *testing.T) {
+	for _, args := range [][]string{{"collect"}, {"collect", "octocat"}, {"collect", "--loop"}} {
+		err := run(t.Context(), args, config.Config{}, testLogger(), io.Discard)
+		var usageErr *usageError
+		if !errors.As(err, &usageErr) || !strings.Contains(err.Error(), "GITHUB_TOKEN") {
+			t.Errorf("run(%q) error = %v, want token requirement before database or upstream access", args, err)
+		}
 	}
 }
 

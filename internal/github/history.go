@@ -165,6 +165,9 @@ func (c *HistoryConnector) FetchPage(ctx context.Context, request event.PageRequ
 			request.ScanMode == "" && !request.Window.From.IsZero()
 		state.Stage = "discover"
 		state.Tasks = []scanTask{{Kind: "owned_repos", Page: 1}}
+		for _, repo := range request.KnownRepositories {
+			state.Tasks = append(state.Tasks, scanTask{Kind: "verify_repo", Repo: repo})
+		}
 		if request.AccountNodeID != "" {
 			state.NodeID = request.AccountNodeID
 			if request.CurrentLogin != "" {
@@ -173,8 +176,12 @@ func (c *HistoryConnector) FetchPage(ctx context.Context, request event.PageRequ
 			state.Tasks = append([]scanTask{{Kind: "resolve_account"}}, state.Tasks...)
 		}
 		for _, kind := range []string{"authored_issue", "authored_pr", "review_candidates"} {
+			searchStart := start
+			if kind == "review_candidates" && !state.Updated {
+				searchStart = time.Date(2008, 1, 1, 0, 0, 0, 0, time.UTC)
+			}
 			state.Tasks = append(state.Tasks, scanTask{
-				Kind: kind, Start: start.UTC().Format("2006-01-02"),
+				Kind: kind, Start: searchStart.UTC().Format("2006-01-02"),
 				End: end.Add(-time.Nanosecond).UTC().Format("2006-01-02"), Page: 1,
 			})
 		}
@@ -190,6 +197,7 @@ func (c *HistoryConnector) FetchPage(ctx context.Context, request event.PageRequ
 	}
 
 	task := state.Tasks[0]
+	repoCount := len(state.Repos)
 	report := event.FetchReport{
 		RateLimitBucket: c.QuotaBucketFor(request),
 		CoverageScope:   historyCoverageScope,
@@ -222,6 +230,7 @@ func (c *HistoryConnector) FetchPage(ctx context.Context, request event.PageRequ
 	if len(state.Tasks) == 0 {
 		c.advanceStage(&state, request)
 	}
+	report.KnownRepositories = append([]string(nil), state.Repos[repoCount:]...)
 	cursorBytes, err := json.Marshal(state)
 	if err != nil {
 		return event.Page{}, report, fmt.Errorf("encode GitHub history cursor: %w", err)
@@ -313,20 +322,19 @@ func (c *HistoryConnector) advanceStage(state *scanState, request event.PageRequ
 		if end.IsZero() {
 			end = time.Now().UTC()
 		}
-		for year := start.Year(); year <= end.Year(); year++ {
-			yearStart := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)
-			yearEnd := yearStart.AddDate(1, 0, 0)
-			if yearStart.Before(start) {
-				yearStart = start
+		start = start.UTC().Truncate(24 * time.Hour)
+		if !end.Equal(end.UTC().Truncate(24 * time.Hour)) {
+			end = end.UTC().Truncate(24*time.Hour).AddDate(0, 0, 1)
+		}
+		for start.Before(end) {
+			next := time.Date(start.Year(), start.Month()+1, 1, 0, 0, 0, 0, time.UTC)
+			if next.After(end) {
+				next = end
 			}
-			if yearEnd.After(end) {
-				yearEnd = end
-			}
-			if yearStart.Before(yearEnd) {
-				state.Tasks = append(state.Tasks, scanTask{
-					Kind: "counts", Start: yearStart.Format(time.RFC3339), End: yearEnd.Format(time.RFC3339),
-				})
-			}
+			state.Tasks = append(state.Tasks, scanTask{
+				Kind: "counts", Start: start.Format(time.RFC3339), End: next.Format(time.RFC3339),
+			})
+			start = next
 		}
 	}
 }
@@ -375,7 +383,7 @@ func (c *HistoryConnector) fetchSearch(ctx context.Context, request event.PageRe
 	case "review_candidates":
 		query = "is:pr reviewed-by:" + state.Login
 	}
-	query += " " + dateQualifier + ":" + task.Start + ".." + task.End
+	query += " is:public " + dateQualifier + ":" + task.Start + ".." + task.End
 	values := url.Values{"q": {query}, "per_page": {"100"}, "page": {strconv.Itoa(max(task.Page, 1))}}
 	target := c.client.baseURL + "/search/issues?" + values.Encode()
 	body, upstreamReport, err := c.client.do(ctx, http.MethodGet, target, nil, report.RateLimitBucket)
@@ -450,10 +458,6 @@ func (c *HistoryConnector) fetchSearch(ctx context.Context, request event.PageRe
 }
 
 func (c *HistoryConnector) verifyRepo(ctx context.Context, request event.PageRequest, state *scanState, task scanTask, report *event.FetchReport) ([]event.RawEvent, error) {
-	if len(task.Records) == 0 {
-		popTask(state)
-		return nil, nil
-	}
 	owner, repo, ok := strings.Cut(task.Repo, "/")
 	if !ok || owner == "" || repo == "" {
 		popTask(state)
@@ -516,7 +520,7 @@ func (c *HistoryConnector) processSearchRecord(request event.PageRequest, state 
 		}
 		return nil, nil
 	}
-	raw, ok, err := issueRawEvent(request, record, kind, repo, payload)
+	raw, ok, err := issueRawEvent(request, record, kind, payload)
 	if err != nil || !ok {
 		return nil, err
 	}
@@ -542,9 +546,12 @@ func (c *HistoryConnector) fetchPullRequestDetails(ctx context.Context, request 
 	}
 	forgeID := request.ForgeInstanceID
 	occurredAt := record.CreatedAt.UTC()
+	if record.ID <= 0 {
+		return nil, errors.New("GitHub pull request has no immutable ID")
+	}
 	return []event.RawEvent{{
 		ForgeInstanceID: forgeID, Source: request.Source,
-		ExternalID: fmt.Sprintf("pull_request:%s/%s:%d", task.Owner, task.Repo, task.Number),
+		ExternalID: fmt.Sprintf("pull_request:%d", record.ID),
 		Kind:       "pull_request", OccurredAt: &occurredAt, Payload: body,
 		PayloadSchemaVersion: 1,
 		Actors: []event.Actor{{Key: event.ActorKey{
@@ -593,12 +600,15 @@ type searchRecord struct {
 	PullRequest json.RawMessage `json:"pull_request"`
 }
 
-func issueRawEvent(request event.PageRequest, record searchRecord, taskKind, repo string, payload json.RawMessage) (event.RawEvent, bool, error) {
+func issueRawEvent(request event.PageRequest, record searchRecord, taskKind string, payload json.RawMessage) (event.RawEvent, bool, error) {
 	if record.CreatedAt.IsZero() {
 		return event.RawEvent{}, false, nil
 	}
 	if !json.Valid(payload) {
 		return event.RawEvent{}, false, errors.New("GitHub search record payload is invalid JSON")
+	}
+	if record.ID <= 0 {
+		return event.RawEvent{}, false, errors.New("GitHub issue has no immutable ID")
 	}
 	kind := "issue"
 	if taskKind == "authored_pr" {
@@ -609,7 +619,7 @@ func issueRawEvent(request event.PageRequest, record searchRecord, taskKind, rep
 	return event.RawEvent{
 		ForgeInstanceID:      forgeID,
 		Source:               request.Source,
-		ExternalID:           fmt.Sprintf("%s:%s:%d", kind, repo, record.Number),
+		ExternalID:           fmt.Sprintf("%s:%d", kind, record.ID),
 		Kind:                 event.Kind(kind),
 		OccurredAt:           &occurredAt,
 		Payload:              append(json.RawMessage(nil), payload...),
@@ -655,7 +665,7 @@ func (c *HistoryConnector) fetchReviews(ctx context.Context, request event.PageR
 		occurredAt := review.SubmittedAt.UTC()
 		events = append(events, event.RawEvent{
 			ForgeInstanceID: forgeID, Source: request.Source,
-			ExternalID: fmt.Sprintf("review:%s/%s:%d", task.Owner, task.Repo, review.ID), Kind: "review",
+			ExternalID: fmt.Sprintf("review:%d", review.ID), Kind: "review",
 			OccurredAt: &occurredAt, Payload: append(json.RawMessage(nil), payload...), PayloadSchemaVersion: 1,
 			Actors: []event.Actor{{Key: event.ActorKey{
 				IdentityKey:     identity.Key{Kind: identity.KindAccountID, Value: state.AccountID},
@@ -714,7 +724,7 @@ func (c *HistoryConnector) fetchReleases(ctx context.Context, request event.Page
 		occurredAt := release.PublishedAt.UTC()
 		events = append(events, event.RawEvent{
 			ForgeInstanceID: forgeID, Source: request.Source,
-			ExternalID: fmt.Sprintf("release:%s:%d", task.Repo, release.ID), Kind: "release",
+			ExternalID: fmt.Sprintf("release:%d", release.ID), Kind: "release",
 			OccurredAt: &occurredAt, Payload: append(json.RawMessage(nil), payload...), PayloadSchemaVersion: 1,
 			Actors: []event.Actor{{Key: event.ActorKey{
 				IdentityKey:     identity.Key{Kind: identity.KindAccountID, Value: state.AccountID},
@@ -739,19 +749,39 @@ func (c *HistoryConnector) fetchCounts(ctx context.Context, state *scanState, ta
 	if err != nil {
 		return fmt.Errorf("parse GraphQL contribution window end: %w", err)
 	}
+	if !from.Before(to) {
+		return errors.New("GitHub contribution window start must precede its end")
+	}
+	from = from.UTC().Truncate(24 * time.Hour)
+	if !to.Equal(to.UTC().Truncate(24 * time.Hour)) {
+		to = to.UTC().Truncate(24*time.Hour).AddDate(0, 0, 1)
+	}
 	query := `query($login:String!, $from:DateTime!, $to:DateTime!) {
 		user(login:$login) {
-			contributionsCollection(from:$from,to:$to,includePrivateContributions:false) {
-				totalCommitContributions totalIssueContributions totalPullRequestContributions
-				totalPullRequestReviewContributions
-				contributionCalendar { weeks { contributionDays { date contributionCount } } }
+			contributionsCollection(from:$from,to:$to) {
+				commits: commitContributionsByRepository(maxRepositories:100) {
+					repository { visibility }
+					contributions(first:100) { nodes { occurredAt commitCount } pageInfo { hasNextPage } }
+				}
+				issues: issueContributionsByRepository(maxRepositories:100) {
+					repository { visibility }
+					contributions(first:100) { nodes { occurredAt } pageInfo { hasNextPage } }
+				}
+				pull_requests: pullRequestContributionsByRepository(maxRepositories:100) {
+					repository { visibility }
+					contributions(first:100) { nodes { occurredAt } pageInfo { hasNextPage } }
+				}
+				reviews: pullRequestReviewContributionsByRepository(maxRepositories:100) {
+					repository { visibility }
+					contributions(first:100) { nodes { occurredAt } pageInfo { hasNextPage } }
+				}
 			}
 		}
 	}`
 	payload, err := json.Marshal(map[string]any{
 		"query": query,
 		"variables": map[string]string{
-			"login": state.Login, "from": from.Format(time.RFC3339), "to": to.Format(time.RFC3339),
+			"login": state.Login, "from": from.Format(time.RFC3339), "to": to.Add(-time.Second).Format(time.RFC3339),
 		},
 	})
 	if err != nil {
@@ -762,24 +792,25 @@ func (c *HistoryConnector) fetchCounts(ctx context.Context, state *scanState, ta
 	if err != nil {
 		return err
 	}
+	type repositoryContributions struct {
+		Repository struct {
+			Visibility string `json:"visibility"`
+		} `json:"repository"`
+		Contributions struct {
+			Nodes []struct {
+				OccurredAt  time.Time `json:"occurredAt"`
+				CommitCount int64     `json:"commitCount"`
+			} `json:"nodes"`
+			PageInfo struct {
+				HasNextPage bool `json:"hasNextPage"`
+			} `json:"pageInfo"`
+		} `json:"contributions"`
+	}
 	var result struct {
 		Errors []json.RawMessage `json:"errors"`
 		Data   struct {
 			User *struct {
-				Collection struct {
-					Commits  int64 `json:"totalCommitContributions"`
-					Issues   int64 `json:"totalIssueContributions"`
-					PRs      int64 `json:"totalPullRequestContributions"`
-					Reviews  int64 `json:"totalPullRequestReviewContributions"`
-					Calendar struct {
-						Weeks []struct {
-							Days []struct {
-								Date  string `json:"date"`
-								Count int64  `json:"contributionCount"`
-							} `json:"contributionDays"`
-						} `json:"weeks"`
-					} `json:"contributionCalendar"`
-				} `json:"contributionsCollection"`
+				Collection map[string][]repositoryContributions `json:"contributionsCollection"`
 			} `json:"user"`
 		} `json:"data"`
 	}
@@ -790,25 +821,77 @@ func (c *HistoryConnector) fetchCounts(ctx context.Context, state *scanState, ta
 		return errors.New("GitHub GraphQL contribution query failed")
 	}
 	collection := result.Data.User.Collection
-	date := from.UTC()
-	for metric, value := range map[string]int64{
-		"commits": collection.Commits, "issues": collection.Issues,
-		"pull_requests": collection.PRs, "reviews": collection.Reviews,
-	} {
-		report.ContributionCounts = append(report.ContributionCounts, event.ContributionCount{
-			Date: date, Metric: metric, Value: value,
-		})
-	}
-	for _, week := range collection.Calendar.Weeks {
-		for _, day := range week.Days {
-			activityDate, err := time.Parse("2006-01-02", day.Date)
-			if err != nil {
-				return fmt.Errorf("parse GitHub contribution date: %w", err)
-			}
-			report.ContributionCounts = append(report.ContributionCounts, event.ContributionCount{
-				Date: activityDate, Metric: "daily_total", Value: day.Count,
-			})
+	metrics := []string{"commits", "issues", "pull_requests", "reviews"}
+	capped := false
+	for _, metric := range metrics {
+		repos, ok := collection[metric]
+		if !ok {
+			return fmt.Errorf("GitHub contribution response is missing %s", metric)
 		}
+		capped = capped || len(repos) >= 100
+		for _, repo := range repos {
+			switch repo.Repository.Visibility {
+			case "PUBLIC", "PRIVATE", "INTERNAL":
+			default:
+				return errors.New("GitHub contribution repository has invalid visibility")
+			}
+			if repo.Repository.Visibility == "PUBLIC" {
+				capped = capped || repo.Contributions.PageInfo.HasNextPage
+			}
+		}
+	}
+	if capped {
+		popTask(state)
+		days := int(to.Sub(from) / (24 * time.Hour))
+		if days <= 1 {
+			report.Gaps = append(report.Gaps, event.Gap{
+				From: from, To: to, Reason: "GitHub public contribution aggregates capped for one UTC day",
+			})
+			return nil
+		}
+		midpoint := from.AddDate(0, 0, days/2)
+		state.Tasks = prependTasks(state.Tasks, []scanTask{
+			{Kind: "counts", Start: from.Format(time.RFC3339), End: midpoint.Format(time.RFC3339)},
+			{Kind: "counts", Start: midpoint.Format(time.RFC3339), End: to.Format(time.RFC3339)},
+		})
+		return nil
+	}
+	counts := make(map[time.Time]map[string]int64)
+	for date := from; date.Before(to); date = date.AddDate(0, 0, 1) {
+		counts[date] = make(map[string]int64)
+	}
+	for _, metric := range metrics {
+		for _, repo := range collection[metric] {
+			if repo.Repository.Visibility != "PUBLIC" {
+				continue
+			}
+			for _, node := range repo.Contributions.Nodes {
+				if node.OccurredAt.IsZero() || node.OccurredAt.Before(from) || !node.OccurredAt.Before(to) {
+					return errors.New("GitHub contribution has an invalid occurrence time")
+				}
+				value := int64(1)
+				if metric == "commits" {
+					value = node.CommitCount
+				}
+				if value < 0 {
+					return errors.New("GitHub contribution has a negative commit count")
+				}
+				counts[node.OccurredAt.UTC().Truncate(24*time.Hour)][metric] += value
+			}
+		}
+	}
+	for date := from; date.Before(to); date = date.AddDate(0, 0, 1) {
+		var total int64
+		for _, metric := range metrics {
+			value := counts[date][metric]
+			report.ContributionCounts = append(report.ContributionCounts, event.ContributionCount{
+				Date: date, Metric: metric, Value: value,
+			})
+			total += value
+		}
+		report.ContributionCounts = append(report.ContributionCounts, event.ContributionCount{
+			Date: date, Metric: "daily_total", Value: total,
+		})
 	}
 	popTask(state)
 	return nil

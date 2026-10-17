@@ -31,6 +31,7 @@ In another terminal, configure the database URL and run the collector and API:
 
 ```sh
 export UATU_DATABASE_URL='postgres://uatu:local-only@localhost:5432/uatu?sslmode=disable'
+export GITHUB_TOKEN='<your-token>'
 go run ./cmd/uatu collect octocat
 go run ./cmd/uatu serve
 ```
@@ -42,14 +43,29 @@ known public repositories, source-reported contribution counts and search
 coverage gaps. Repeating the command reuses the person record and schedules an
 incremental scan with a seven-day overlap after a successful backfill.
 
-Set `GITHUB_TOKEN` to increase API limits. It is optional for local development.
-The collector verifies repository visibility before storing search results and
-never persists private repository activity. `sslmode=disable` is for this
+`GITHUB_TOKEN` is required for all `collect` modes: GitHub GraphQL requires
+authentication for stable account refresh and contribution aggregates. Serving
+stored data does not require a token. Repeating `collect` while work is queued
+or interrupted resumes its original window and saved cursor.
+Searches are restricted to public results. The collector verifies repository
+visibility before emitting search events and never persists private repository
+activity. `sslmode=disable` is for this
 local-only database; use verified TLS for shared or production databases.
 
 `collect` with no user arguments processes due queued event work once, and
 `collect --loop` continuously polls for work. `UATU_USERS` can provide usernames
 for a one-shot `collect`.
+
+Known public repositories are retained across scans and their visibility is
+rechecked before reuse. Review backfills search PRs created before the person's
+account as well, since those PRs can receive later reviews.
+
+Contribution counts are daily UTC observations derived from public-repository
+GraphQL contributions, not whole-window totals assigned to one date. Private,
+internal and restricted contributions are excluded. `daily_total` sums the
+reported commits, issues, pull requests and reviews; it is not GitHub's profile
+calendar total. Capped aggregate windows are split; unresolved daily caps are
+recorded as coverage gaps. Repeated observations are retained, not additive.
 
 After collection, use the logged person ID to query the timeline and source
 metadata. `from` and `to` are required RFC3339 timestamps; `limit` is optional
@@ -70,7 +86,7 @@ curl 'http://localhost:3000/v1/persons/<person-id>/counts?from=2020-01-01T00:00:
 | `UATU_DB_CONNECT_TIMEOUT` | `5s` | Timeout when opening a database connection |
 | `UATU_ADDR` | `:3000` | HTTP listen address |
 | `UATU_USERS` | | Comma-separated GitHub users to track and collect |
-| `GITHUB_TOKEN` | | Optional GitHub API token for higher public-data limits |
+| `GITHUB_TOKEN` | Required for `collect` | GitHub API token for identity refresh and public contribution counts |
 
 Run `go run ./cmd/uatu help` to see the available commands.
 

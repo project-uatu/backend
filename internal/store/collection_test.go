@@ -784,17 +784,33 @@ func TestStore_EnqueueGitHubHistoryUsesBackfillThenOverlap(t *testing.T) {
 		t.Errorf("initial GitHub scan = mode %q, from %s; want backfill from account creation %s",
 			initial.ScanMode, initial.Window.From, createdAt)
 	}
-	if _, err := s.db.Exec(ctx, "UPDATE jobs SET status = 'succeeded' WHERE id = $1", initial.ID); err != nil {
-		t.Fatalf("complete initial job: %v", err)
+	claim, found, err := s.ClaimCollectionJob(ctx, "backfill-worker", time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimCollectionJob = %t, %v; want initial backfill", found, err)
 	}
-	completedThrough := time.Date(2025, 1, 20, 12, 0, 0, 0, time.UTC)
-	if _, err := s.db.Exec(ctx, `
-		INSERT INTO checkpoints
-			(person_id, forge_instance_id, source_key, backfill_complete, completed_through)
-		VALUES ($1, $2, $3, true, $4)`,
-		tracked.PersonID, forge.ID, SourceGitHubHistory, completedThrough); err != nil {
-		t.Fatalf("save completed checkpoint: %v", err)
+	// Exercise the conflict-update checkpoint branch as well as scan completion.
+	if _, err := s.PersistCollectionPage(ctx, claim, event.Page{NextCursor: "page-2"},
+		event.FetchReport{}, true, 1, uuid.Nil); err != nil {
+		t.Fatalf("PersistCollectionPage(first): %v", err)
 	}
+	claim.Cursor = "page-2"
+	if _, err := s.EnqueueGitHubHistory(ctx, tracked.PersonID, forge.ID); !errors.Is(err, ErrCollectionJobActive) {
+		t.Fatalf("EnqueueGitHubHistory(interrupted) error = %v, want existing resumable work", err)
+	}
+	if err := s.ReleaseCollectionJob(ctx, claim); err != nil {
+		t.Fatalf("ReleaseCollectionJob: %v", err)
+	}
+	claim, found, err = s.ClaimCollectionJob(ctx, "resumed-worker", time.Minute)
+	if err != nil || !found || claim.ID != initial.ID || claim.Cursor != "page-2" ||
+		!claim.Window.To.Equal(initial.Window.To) {
+		t.Fatalf("resumed scan = %+v, found %t, error %v; want original job, window and cursor", claim, found, err)
+	}
+	if _, err := s.PersistCollectionPage(ctx, claim, event.Page{Done: true},
+		event.FetchReport{KnownRepositories: []string{"other/repo"}}, true, 1, uuid.Nil); err != nil {
+		t.Fatalf("PersistCollectionPage(completed backfill): %v", err)
+	}
+
+	completedThrough := claim.Window.To
 	incremental, err := s.EnqueueGitHubHistory(ctx, tracked.PersonID, forge.ID)
 	if err != nil {
 		t.Fatalf("EnqueueGitHubHistory(incremental): %v", err)
@@ -803,5 +819,51 @@ func TestStore_EnqueueGitHubHistoryUsesBackfillThenOverlap(t *testing.T) {
 	if incremental.ScanMode != "incremental" || !incremental.Window.From.Equal(wantFrom) {
 		t.Errorf("incremental scan = mode %q, from %s; want from %s with seven-day overlap",
 			incremental.ScanMode, incremental.Window.From, wantFrom)
+	}
+	nextClaim, found, err := s.ClaimCollectionJob(ctx, "incremental-worker", time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimCollectionJob(incremental) = %t, %v", found, err)
+	}
+	if len(nextClaim.KnownRepositories) != 1 || nextClaim.KnownRepositories[0] != "other/repo" {
+		t.Errorf("incremental known repositories = %v, want persisted other/repo", nextClaim.KnownRepositories)
+	}
+}
+
+func TestStore_CompletedBackfillSetsWatermarkOnFirstPage(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	person, err := s.CreatePerson(ctx, nil)
+	if err != nil {
+		t.Fatalf("CreatePerson: %v", err)
+	}
+	forge, err := s.CreateForgeInstance(ctx, "forgejo", "https://forge.example")
+	if err != nil {
+		t.Fatalf("CreateForgeInstance: %v", err)
+	}
+	windowEnd := time.Date(2025, 1, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := s.EnqueueCollectionJob(ctx, CollectionJobInput{
+		PersonID: person.ID, ForgeInstanceID: forge.ID, SourceKey: "forge",
+		ScanMode: "backfill", Window: event.Window{To: windowEnd},
+	}); err != nil {
+		t.Fatalf("EnqueueCollectionJob: %v", err)
+	}
+	claim, found, err := s.ClaimCollectionJob(ctx, "worker", time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimCollectionJob = %t, %v", found, err)
+	}
+	if _, err := s.PersistCollectionPage(ctx, claim, event.Page{Done: true}, event.FetchReport{},
+		true, 1, uuid.Nil); err != nil {
+		t.Fatalf("PersistCollectionPage: %v", err)
+	}
+	var complete bool
+	var through *time.Time
+	if err := s.db.QueryRow(ctx, `
+		SELECT backfill_complete, completed_through FROM checkpoints
+		WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = 'forge'`,
+		person.ID, forge.ID).Scan(&complete, &through); err != nil {
+		t.Fatalf("load checkpoint: %v", err)
+	}
+	if !complete || through == nil || !through.Equal(windowEnd) {
+		t.Errorf("checkpoint = complete %t, through %v; want complete through %s", complete, through, windowEnd)
 	}
 }

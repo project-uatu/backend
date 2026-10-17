@@ -55,6 +55,7 @@ type JobClaim struct {
 	SyncRunID           uuid.UUID
 	AccountNodeID       string
 	CurrentAccountLogin string
+	KnownRepositories   []string
 }
 
 // NormalizationClaim owns one raw event normalization attempt.
@@ -321,12 +322,24 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 	}
 	job.IdentityKeys = keys
 	var accountNodeID, currentLogin string
+	var knownRepositories []string
 	if job.SourceKey == SourceGitHubHistory {
 		if err := tx.QueryRow(ctx, `
 			SELECT node_id, login FROM github_accounts
 			WHERE forge_instance_id = $1 AND person_id = $2`,
 			job.ForgeInstanceID, job.PersonID).Scan(&accountNodeID, &currentLogin); err != nil {
 			return JobClaim{}, false, fmt.Errorf("load GitHub account identifiers: %w", err)
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT repository FROM github_known_repositories
+			WHERE forge_instance_id = $1 AND person_id = $2 ORDER BY repository`,
+			job.ForgeInstanceID, job.PersonID)
+		if err != nil {
+			return JobClaim{}, false, fmt.Errorf("load known GitHub repositories: %w", err)
+		}
+		knownRepositories, err = pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return JobClaim{}, false, fmt.Errorf("read known GitHub repositories: %w", err)
 		}
 	}
 	if oldRunID != nil {
@@ -368,6 +381,7 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 		LeaseExpiry:   leaseExpiry.UTC(),
 		SyncRunID:     runID,
 		AccountNodeID: accountNodeID, CurrentAccountLogin: currentLogin,
+		KnownRepositories: knownRepositories,
 	}, true, nil
 }
 
@@ -549,6 +563,14 @@ func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page 
 			return false, fmt.Errorf("commit partial collection page: %w", err)
 		}
 		return false, nil
+	}
+	for _, repo := range report.KnownRepositories {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO github_known_repositories (person_id, forge_instance_id, repository)
+			VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+			claim.PersonID, claim.ForgeInstanceID, repo); err != nil {
+			return false, fmt.Errorf("persist known GitHub repository: %w", err)
+		}
 	}
 	scanComplete := false
 	if page.Done {
@@ -855,13 +877,13 @@ func advanceCollectionCursor(ctx context.Context, tx pgx.Tx, claim JobClaim, cur
 		VALUES ($1, $2, $3, CASE WHEN $4 = 'backfill' THEN $5 ELSE '' END,
 		                   CASE WHEN $4 = 'incremental' THEN $5 ELSE '' END,
 		                   ($4 = 'backfill' AND $6),
-		                   CASE WHEN $4 = 'incremental' AND $6 THEN $7::timestamptz ELSE NULL::timestamptz END)
+		                   CASE WHEN $6 THEN $7::timestamptz ELSE NULL::timestamptz END)
 		ON CONFLICT (person_id, forge_instance_id, source_key)
 		DO UPDATE SET cursor = CASE WHEN $4 = 'backfill' THEN EXCLUDED.cursor ELSE checkpoints.cursor END,
 		              incremental_cursor = CASE WHEN $4 = 'incremental' THEN EXCLUDED.incremental_cursor ELSE checkpoints.incremental_cursor END,
 		              backfill_complete = CASE WHEN $4 = 'backfill' AND $6 THEN true ELSE checkpoints.backfill_complete END,
 		              completed_through = CASE
-		                  WHEN $4 = 'incremental' AND $6
+		                  WHEN $6
 		                  THEN GREATEST(COALESCE(checkpoints.completed_through, EXCLUDED.completed_through),
 		                                EXCLUDED.completed_through)
 		                  ELSE checkpoints.completed_through

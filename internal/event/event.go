@@ -38,16 +38,17 @@ type Window struct {
 
 // PageRequest identifies one bounded connector request.
 type PageRequest struct {
-	PersonID        uuid.UUID
-	ForgeInstanceID uuid.UUID
-	Source          Source
-	ScanMode        string
-	IdentityKeys    []ActorKey
-	AccountNodeID   string
-	CurrentLogin    string
-	Window          Window
-	Cursor          string
-	PageSize        int
+	PersonID          uuid.UUID
+	ForgeInstanceID   uuid.UUID
+	Source            Source
+	ScanMode          string
+	IdentityKeys      []ActorKey
+	AccountNodeID     string
+	CurrentLogin      string
+	KnownRepositories []string
+	Window            Window
+	Cursor            string
+	PageSize          int
 }
 
 // RawEvent is a source record before normalization.
@@ -89,6 +90,7 @@ type FetchReport struct {
 	Errors             []string            `json:"errors,omitempty"`
 	ContributionCounts []ContributionCount `json:"contribution_counts,omitempty"`
 	CoverageScope      string              `json:"coverage_scope,omitempty"`
+	KnownRepositories  []string            `json:"known_repositories,omitempty"`
 }
 
 // ContributionCount is an upstream aggregate observation, not a timeline event.
