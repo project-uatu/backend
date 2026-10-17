@@ -37,6 +37,47 @@ func TestClient_ResolveAccount(t *testing.T) {
 	}
 }
 
+func TestHistoryConnector_resolvesLoginBeforeBackfill(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || r.URL.Path != "/users/octocat" {
+			t.Errorf("initial account request = %s %s, want GET /users/octocat", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"id":42,"node_id":"MDQ6VXNlcjQy","login":"octocat","created_at":"2011-01-25T18:44:36Z"}`))
+	}))
+	defer server.Close()
+
+	connector := NewHistoryConnector(NewClient("", server.Client()))
+	connector.client.baseURL = server.URL
+	forgeID := uuid.New()
+	request := event.PageRequest{
+		ForgeInstanceID: forgeID,
+		Source:          historySource,
+		ScanMode:        "backfill",
+		IdentityKeys: []event.ActorKey{{
+			IdentityKey:     identity.Key{Kind: identity.KindLogin, Value: "octocat"},
+			ForgeInstanceID: &forgeID,
+		}},
+		Window: event.Window{To: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)},
+	}
+	if got := connector.QuotaBucketFor(request); got != "github/core" {
+		t.Fatalf("QuotaBucketFor(login-only request) = %q, want github/core", got)
+	}
+	page, report, err := connector.FetchPage(t.Context(), request)
+	if err != nil {
+		t.Fatalf("FetchPage(login-only request): %v", err)
+	}
+	if requests != 1 || page.ResolvedAccount == nil || page.ResolvedAccount.AccountID != "42" ||
+		page.ResolvedAccount.Login != "octocat" || page.ResolvedAccount.CreatedAt.IsZero() ||
+		page.NextCursor == "" || page.Done || len(page.Events) != 0 {
+		t.Fatalf("FetchPage(login-only request) = page %+v after %d requests, want one resolved-account page", page, requests)
+	}
+	if report.RateLimitBucket != "github/core" {
+		t.Errorf("resolution report bucket = %q, want github/core", report.RateLimitBucket)
+	}
+}
+
 func TestHistoryConnector_SearchPaginatesAndValidatesActor(t *testing.T) {
 	var calls int
 	var server *httptest.Server

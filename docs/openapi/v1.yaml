@@ -1,0 +1,624 @@
+openapi: 3.1.0
+info:
+  title: Uatu API
+  version: "1.0"
+  description: >
+    Private, operator-authenticated API for tracked people and their public
+    contribution history. Keep the bearer key on a trusted server; do not
+    expose it to browser clients.
+servers:
+  - url: https://uatu.example
+security:
+  - bearerAuth: []
+paths:
+  /v1/persons:
+    get:
+      operationId: listPersons
+      summary: List or search tracked people
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 100
+        - $ref: "#/components/parameters/limit100"
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: Person page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonPage"
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      operationId: createPerson
+      summary: Onboard a GitHub account and queue its initial history scan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePerson"
+      responses:
+        "201":
+          description: Person created and initial collection job queued
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [person, job]
+                    properties:
+                      person:
+                        $ref: "#/components/schemas/Person"
+                      job:
+                        $ref: "#/components/schemas/Job"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/persons/{id}:
+    parameters:
+      - $ref: "#/components/parameters/personID"
+    get:
+      operationId: getPerson
+      summary: Get a profile and its recorded source coverage
+      responses:
+        "200":
+          description: Person profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonResponse"
+        default:
+          $ref: "#/components/responses/Error"
+    patch:
+      operationId: updatePersonIdentifiers
+      summary: Add or remove GitHub login and email identifiers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IdentifierPatch"
+      responses:
+        "200":
+          description: Updated profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonResponse"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/persons/{id}/sync:
+    post:
+      operationId: requestPersonSync
+      summary: Queue or coalesce a GitHub history sync
+      parameters:
+        - $ref: "#/components/parameters/personID"
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+      responses:
+        "202":
+          description: Collection job accepted
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobResponse"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/jobs/{id}:
+    get:
+      operationId: getJob
+      summary: Get a collection job status
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Collection job status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobResponse"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/persons/{id}/activity:
+    get:
+      operationId: getPersonActivity
+      summary: Read a keyset-paginated activity timeline
+      parameters:
+        - $ref: "#/components/parameters/personID"
+        - name: from
+          in: query
+          required: true
+          description: Inclusive RFC3339 timestamp.
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: true
+          description: Exclusive RFC3339 timestamp; must be later than from.
+          schema:
+            type: string
+            format: date-time
+        - name: source
+          in: query
+          schema:
+            type: string
+            maxLength: 100
+        - name: kind
+          in: query
+          schema:
+            type: string
+            maxLength: 100
+        - $ref: "#/components/parameters/limit500"
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: Activity page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActivityPage"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/persons/{id}/summary:
+    get:
+      operationId: getPersonSummary
+      summary: Get event counts grouped by year, source, and kind
+      parameters:
+        - $ref: "#/components/parameters/personID"
+      responses:
+        "200":
+          description: Summary rows
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Summary"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/persons/{id}/projects:
+    get:
+      operationId: getPersonProjects
+      summary: List distinct contributed projects
+      parameters:
+        - $ref: "#/components/parameters/personID"
+        - name: from
+          in: query
+          description: Inclusive RFC3339 timestamp; provide with to.
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: Exclusive RFC3339 timestamp; provide with from.
+          schema:
+            type: string
+            format: date-time
+        - $ref: "#/components/parameters/limit500"
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: Project page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectPage"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/persons/{id}/coverage:
+    get:
+      operationId: getPersonCoverage
+      summary: Get recorded coverage intervals and gaps
+      parameters:
+        - $ref: "#/components/parameters/personID"
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Coverage intervals
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Coverage"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/persons/{id}/counts:
+    get:
+      operationId: getPersonCounts
+      summary: Get stored contribution-count observations
+      parameters:
+        - $ref: "#/components/parameters/personID"
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Contribution-count observations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Count"
+        default:
+          $ref: "#/components/responses/Error"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    personID:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+        maxLength: 2048
+    limit100:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+    limit500:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 100
+  responses:
+    Error:
+      description: >
+        Error envelope. Depending on the route, status codes include 400, 401,
+        403, 404, 405, 409, 413, 415, and 500.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    Person:
+      type: object
+      required: [id, created_at, sources]
+      properties:
+        id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/SourceCoverage"
+    PersonResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/Person"
+    PersonPage:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/PersonListItem"
+        page:
+          $ref: "#/components/schemas/Page"
+    PersonListItem:
+      type: object
+      required: [id, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    CreatePerson:
+      type: object
+      additionalProperties: false
+      required: [login]
+      properties:
+        login:
+          type: string
+          minLength: 1
+          maxLength: 39
+          pattern: "^(?:[A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9-]{0,37}[A-Za-z0-9])$"
+        display_name:
+          type: string
+          maxLength: 200
+        emails:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            format: email
+    Identifier:
+      type: object
+      additionalProperties: false
+      required: [kind, value]
+      properties:
+        kind:
+          type: string
+          enum: [login, email]
+        value:
+          type: string
+          minLength: 1
+          maxLength: 320
+    IdentifierPatch:
+      type: object
+      additionalProperties: false
+      description: Provide between 1 and 20 identifiers total across add and remove.
+      anyOf:
+        - required: [add]
+        - required: [remove]
+      properties:
+        add:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/Identifier"
+        remove:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/Identifier"
+    Job:
+      type: object
+      required: [id, person_id, source, status, attempts, max_attempts, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        person_id:
+          type: string
+          format: uuid
+        source:
+          type: string
+        status:
+          type: string
+          enum: [queued, running, succeeded, failed, canceled]
+        attempts:
+          type: integer
+        max_attempts:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    JobResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/Job"
+    Page:
+      type: object
+      required: [has_more]
+      properties:
+        has_more:
+          type: boolean
+        next_cursor:
+          type: string
+    Activity:
+      type: object
+      required: [event_id, kind, role, occurred_at, project, title, url]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+        role:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
+        project:
+          type: string
+        title:
+          type: string
+        url:
+          type: string
+          format: uri
+    ActivityPage:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Activity"
+        page:
+          $ref: "#/components/schemas/Page"
+    Summary:
+      type: object
+      required: [year, source, kind, count]
+      properties:
+        year:
+          type: integer
+        source:
+          type: string
+        kind:
+          type: string
+        count:
+          type: integer
+          format: int64
+    Project:
+      type: object
+      required: [project, count]
+      properties:
+        project:
+          type: string
+        count:
+          type: integer
+          format: int64
+    ProjectPage:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Project"
+        page:
+          $ref: "#/components/schemas/Page"
+    SourceCoverage:
+      type: object
+      required: [source, status, gap_count, recorded_at]
+      properties:
+        source:
+          type: string
+        status:
+          type: string
+          enum: [complete, partial]
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        gap_count:
+          type: integer
+          format: int64
+        recorded_at:
+          type: string
+          format: date-time
+    Coverage:
+      type: object
+      required: [forge_instance_id, source, from, to, status, scope, recorded_at]
+      properties:
+        forge_instance_id:
+          type: string
+          format: uuid
+        source:
+          type: string
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        status:
+          type: string
+        gap_reason:
+          type: string
+        scope:
+          type: string
+        recorded_at:
+          type: string
+          format: date-time
+    Count:
+      type: object
+      required: [forge_instance_id, date, metric, value, observed_at]
+      properties:
+        forge_instance_id:
+          type: string
+          format: uuid
+        date:
+          type: string
+          format: date-time
+        metric:
+          type: string
+        kind:
+          type: string
+        value:
+          type: integer
+          format: int64
+        observed_at:
+          type: string
+          format: date-time
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            request_id:
+              type: string
+              format: uuid

@@ -18,6 +18,7 @@ const defaultPageSize = 100
 
 type durableWork interface {
 	ClaimCollectionJob(context.Context, string, time.Duration) (store.JobClaim, bool, error)
+	TrackGitHubAccountForPerson(context.Context, uuid.UUID, uuid.UUID, store.GitHubAccount) (store.GitHubAccount, error)
 	RenewCollectionLease(context.Context, store.JobClaim, time.Duration) error
 	PersistCollectionPage(context.Context, store.JobClaim, event.Page, event.FetchReport, bool, int, uuid.UUID) (bool, error)
 	DeferCollectionJob(context.Context, store.JobClaim, time.Time) error
@@ -211,6 +212,18 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 			reservationID = reservation.ID
 		}
 		page, report, fetchErr := r.fetchPage(ctx, connector, request, claim)
+		if fetchErr == nil && page.ResolvedAccount != nil {
+			account := page.ResolvedAccount
+			tracked, err := r.store.TrackGitHubAccountForPerson(ctx, claim.PersonID, claim.ForgeInstanceID, store.GitHubAccount{
+				AccountID: account.AccountID, NodeID: account.NodeID, Login: account.Login,
+				AccountCreatedAt: account.CreatedAt,
+			})
+			if err != nil {
+				fetchErr = fmt.Errorf("persist resolved GitHub account: %w", err)
+			} else {
+				claim.Window.From = tracked.AccountCreatedAt.UTC()
+			}
+		}
 		report = sanitizeFetchReport(report)
 		report.Requests++
 		report.Pages++

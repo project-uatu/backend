@@ -19,6 +19,9 @@ var ErrLeaseLost = errors.New("work lease lost")
 // ErrCollectionJobActive indicates a conflicting scan is already queued or running.
 var ErrCollectionJobActive = errors.New("collection scan already active")
 
+// ErrIdempotencyConflict indicates an idempotency key is bound to different work.
+var ErrIdempotencyConflict = errors.New("idempotency key is already assigned to another job")
+
 // CollectionJob describes durable work for one person and source.
 type CollectionJob struct {
 	ID              uuid.UUID
@@ -199,24 +202,56 @@ func (s *Store) EnqueueCollectionJob(ctx context.Context, input CollectionJobInp
 // EnqueueGitHubHistory chooses an initial backfill or a seven-day-overlap
 // incremental scan from the completed checkpoint.
 func (s *Store) EnqueueGitHubHistory(ctx context.Context, personID, forgeInstanceID uuid.UUID) (CollectionJob, error) {
-	if personID == uuid.Nil || forgeInstanceID == uuid.Nil {
-		return CollectionJob{}, errors.New("GitHub history enqueue requires person and forge")
+	input, err := s.githubHistoryInput(ctx, personID, forgeInstanceID, "")
+	if err != nil {
+		return CollectionJob{}, err
 	}
-	var accountCreatedAt time.Time
-	if err := s.db.QueryRow(ctx, `
-		SELECT account_created_at FROM github_accounts
-		WHERE forge_instance_id = $1 AND person_id = $2`,
-		forgeInstanceID, personID).Scan(&accountCreatedAt); err != nil {
-		return CollectionJob{}, fmt.Errorf("load GitHub account creation time: %w", err)
+	return s.EnqueueCollectionJob(ctx, input)
+}
+
+// EnqueueGitHubHistoryWithKey enqueues or coalesces a GitHub sync and binds
+// the idempotency key to the resulting durable job.
+func (s *Store) EnqueueGitHubHistoryWithKey(ctx context.Context, personID, forgeInstanceID uuid.UUID, idempotencyKey string) (CollectionJob, error) {
+	if idempotencyKey == "" || len(idempotencyKey) > 200 {
+		return CollectionJob{}, errors.New("idempotency key must contain 1 to 200 bytes")
+	}
+	input, err := s.githubHistoryInput(ctx, personID, forgeInstanceID, idempotencyKey)
+	if err != nil {
+		return CollectionJob{}, err
+	}
+	job, err := s.EnqueueCollectionJob(ctx, input)
+	if err == nil {
+		return job, nil
+	}
+	if !errors.Is(err, ErrCollectionJobActive) {
+		return CollectionJob{}, err
+	}
+	return s.bindIdempotencyKeyToActiveJob(ctx, personID, forgeInstanceID, idempotencyKey)
+}
+
+func (s *Store) githubHistoryInput(ctx context.Context, personID, forgeInstanceID uuid.UUID, idempotencyKey string) (CollectionJobInput, error) {
+	if personID == uuid.Nil || forgeInstanceID == uuid.Nil {
+		return CollectionJobInput{}, errors.New("GitHub history enqueue requires person and forge")
 	}
 	input := CollectionJobInput{
 		PersonID: personID, ForgeInstanceID: forgeInstanceID,
 		SourceKey: SourceGitHubHistory, ScanMode: "backfill",
-		Window: event.Window{From: accountCreatedAt.UTC()},
+		IdempotencyKey: idempotencyKey,
+	}
+	var accountCreatedAt time.Time
+	err := s.db.QueryRow(ctx, `
+		SELECT account_created_at FROM github_accounts
+		WHERE forge_instance_id = $1 AND person_id = $2`,
+		forgeInstanceID, personID).Scan(&accountCreatedAt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return CollectionJobInput{}, fmt.Errorf("load GitHub account creation time: %w", err)
+	}
+	if !accountCreatedAt.IsZero() {
+		input.Window.From = accountCreatedAt.UTC()
 	}
 	var backfillComplete bool
 	var completedThrough *time.Time
-	err := s.db.QueryRow(ctx, `
+	err = s.db.QueryRow(ctx, `
 		SELECT backfill_complete, completed_through
 		FROM checkpoints
 		WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3`,
@@ -224,14 +259,111 @@ func (s *Store) EnqueueGitHubHistory(ctx context.Context, personID, forgeInstanc
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 	case err != nil:
-		return CollectionJob{}, fmt.Errorf("load GitHub history checkpoint: %w", err)
+		return CollectionJobInput{}, fmt.Errorf("load GitHub history checkpoint: %w", err)
 	case backfillComplete && completedThrough != nil:
 		input.ScanMode = "incremental"
 		input.Window.From = completedThrough.Add(-7 * 24 * time.Hour).UTC()
 	default:
 	}
 	input.Window.To = time.Now().UTC()
-	return s.EnqueueCollectionJob(ctx, input)
+	return input, nil
+}
+
+func (s *Store) bindIdempotencyKeyToActiveJob(ctx context.Context, personID, forgeInstanceID uuid.UUID, key string) (job CollectionJob, bindErr error) {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return CollectionJob{}, fmt.Errorf("begin active job idempotency binding: %w", err)
+	}
+	defer rollbackTx(ctx, tx, "active job idempotency binding", &bindErr)
+	lockKey := fmt.Sprintf("%s:%s:%d:%s:%d:%s",
+		personID, forgeInstanceID, len(SourceGitHubHistory), SourceGitHubHistory, len(key), key)
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", lockKey); err != nil {
+		return CollectionJob{}, fmt.Errorf("lock active job idempotency key: %w", err)
+	}
+	var existingID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		SELECT job_id FROM job_idempotency_keys
+		WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3
+		  AND idempotency_key = $4`,
+		personID, forgeInstanceID, SourceGitHubHistory, key).Scan(&existingID)
+	if err == nil {
+		job, err = collectionJobByID(ctx, tx, existingID)
+		if err != nil {
+			return CollectionJob{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return CollectionJob{}, fmt.Errorf("commit existing job idempotency binding: %w", err)
+		}
+		return job, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return CollectionJob{}, fmt.Errorf("check active job idempotency key: %w", err)
+	}
+	job, err = activeCollectionJob(ctx, tx, personID, forgeInstanceID, SourceGitHubHistory)
+	if err != nil {
+		return CollectionJob{}, err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO job_idempotency_keys
+			(person_id, forge_instance_id, source_key, idempotency_key, job_id)
+		VALUES ($1, $2, $3, $4, $5)`,
+		personID, forgeInstanceID, SourceGitHubHistory, key, job.ID)
+	if err != nil {
+		return CollectionJob{}, fmt.Errorf("bind idempotency key to active job: %w", err)
+	}
+	_, err = tx.Exec(ctx, `
+		UPDATE jobs SET idempotency_key = COALESCE(idempotency_key, $2)
+		WHERE id = $1`, job.ID, key)
+	if err != nil {
+		return CollectionJob{}, fmt.Errorf("update active job idempotency key: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return CollectionJob{}, fmt.Errorf("commit active job idempotency binding: %w", err)
+	}
+	return job, nil
+}
+
+func activeCollectionJob(ctx context.Context, tx pgx.Tx, personID, forgeInstanceID uuid.UUID, source string) (CollectionJob, error) {
+	var job CollectionJob
+	var windowStart *time.Time
+	err := tx.QueryRow(ctx, `
+		SELECT id, person_id, forge_instance_id, source_key, scan_mode, window_start,
+		       window_end, cursor, due_at, attempts, max_attempts
+		FROM jobs WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3
+		  AND status IN ('queued', 'running')
+		FOR UPDATE`, personID, forgeInstanceID, source).Scan(
+		&job.ID, &job.PersonID, &job.ForgeInstanceID, &job.SourceKey, &job.ScanMode,
+		&windowStart, &job.Window.To, &job.Cursor, &job.DueAt, &job.Attempts, &job.MaxAttempts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CollectionJob{}, fmt.Errorf("%w: no active GitHub history job", ErrCollectionJobActive)
+	}
+	if err != nil {
+		return CollectionJob{}, fmt.Errorf("load active collection job: %w", err)
+	}
+	if windowStart != nil {
+		job.Window.From = windowStart.UTC()
+	}
+	job.Window.To, job.DueAt = job.Window.To.UTC(), job.DueAt.UTC()
+	return job, nil
+}
+
+func collectionJobByID(ctx context.Context, tx pgx.Tx, jobID uuid.UUID) (CollectionJob, error) {
+	var job CollectionJob
+	var windowStart *time.Time
+	err := tx.QueryRow(ctx, `
+		SELECT id, person_id, forge_instance_id, source_key, scan_mode, window_start,
+		       window_end, cursor, due_at, attempts, max_attempts
+		FROM jobs WHERE id = $1`, jobID).Scan(
+		&job.ID, &job.PersonID, &job.ForgeInstanceID, &job.SourceKey, &job.ScanMode,
+		&windowStart, &job.Window.To, &job.Cursor, &job.DueAt, &job.Attempts, &job.MaxAttempts)
+	if err != nil {
+		return CollectionJob{}, fmt.Errorf("load collection job %s: %w", jobID, err)
+	}
+	if windowStart != nil {
+		job.Window.From = windowStart.UTC()
+	}
+	job.Window.To, job.DueAt = job.Window.To.UTC(), job.DueAt.UTC()
+	return job, nil
 }
 
 func collectionJobForIdempotencyKey(ctx context.Context, tx pgx.Tx, input CollectionJobInput) (CollectionJob, bool, error) {
@@ -322,13 +454,29 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 	}
 	job.IdentityKeys = keys
 	var accountNodeID, currentLogin string
+	var accountCreatedAt time.Time
 	var knownRepositories []string
 	if job.SourceKey == SourceGitHubHistory {
-		if err := tx.QueryRow(ctx, `
-			SELECT node_id, login FROM github_accounts
+		err := tx.QueryRow(ctx, `
+			SELECT node_id, login, account_created_at FROM github_accounts
 			WHERE forge_instance_id = $1 AND person_id = $2`,
-			job.ForgeInstanceID, job.PersonID).Scan(&accountNodeID, &currentLogin); err != nil {
+			job.ForgeInstanceID, job.PersonID).Scan(&accountNodeID, &currentLogin, &accountCreatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			for _, key := range keys {
+				if key.IdentityKey.Kind == "login" && key.ForgeInstanceID != nil &&
+					*key.ForgeInstanceID == job.ForgeInstanceID {
+					currentLogin = key.IdentityKey.Value
+					break
+				}
+			}
+			if currentLogin == "" {
+				return JobClaim{}, false, errors.New("GitHub history job has no account or assigned login")
+			}
+		} else if err != nil {
 			return JobClaim{}, false, fmt.Errorf("load GitHub account identifiers: %w", err)
+		}
+		if job.ScanMode == "backfill" && job.Window.From.IsZero() && !accountCreatedAt.IsZero() {
+			job.Window.From = accountCreatedAt.UTC()
 		}
 		rows, err := tx.Query(ctx, `
 			SELECT repository FROM github_known_repositories

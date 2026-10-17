@@ -7,7 +7,6 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,22 +14,43 @@ import (
 )
 
 type historyStore interface {
-	Timeline(context.Context, uuid.UUID, time.Time, time.Time, int) ([]store.TimelineEntry, error)
 	CoverageForPerson(context.Context, uuid.UUID, time.Time, time.Time) ([]store.CoverageInterval, error)
 	ContributionCounts(context.Context, uuid.UUID, time.Time, time.Time) ([]store.ContributionCount, error)
 }
 
-// NewHandler returns the HTTP API handler. Handlers only read stored data;
-// collection happens in the collector.
-func NewHandler(s historyStore, logger *slog.Logger) http.Handler {
+type pageMetadata struct {
+	NextCursor string `json:"next_cursor,omitempty"`
+	HasMore    bool   `json:"has_more"`
+}
+
+// NewHandler returns the HTTP handler for health and authenticated API routes.
+func NewHandler(s apiStore, logger *slog.Logger, options Options) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	mux.HandleFunc("GET /v1/persons/{id}/activity", activityHandler(s, logger))
+	registerAPI(mux, s, logger)
 	mux.HandleFunc("GET /v1/persons/{id}/coverage", coverageHandler(s, logger))
 	mux.HandleFunc("GET /v1/persons/{id}/counts", countsHandler(s, logger))
-	return mux
+	for _, pattern := range []string{
+		"/v1/persons",
+		"/v1/persons/{id}",
+		"/v1/persons/{id}/sync",
+		"/v1/persons/{id}/activity",
+		"/v1/persons/{id}/summary",
+		"/v1/persons/{id}/projects",
+		"/v1/persons/{id}/coverage",
+		"/v1/persons/{id}/counts",
+		"/v1/jobs/{id}",
+	} {
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			writeError(w, r, logger, http.StatusMethodNotAllowed, "method not allowed")
+		})
+	}
+	mux.HandleFunc("/v1/", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, r, logger, http.StatusNotFound, "API route not found")
+	})
+	return secureAPI(mux, options, logger)
 }
 
 type activityEntry struct {
@@ -63,48 +83,18 @@ type countEntry struct {
 	ObservedAt      time.Time `json:"observed_at"`
 }
 
-func activityHandler(s historyStore, logger *slog.Logger) http.HandlerFunc {
+func coverageHandler(s apiStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		personID, from, to, ok := requestedPersonRange(w, r, logger)
 		if !ok {
 			return
 		}
-		limit := 100
-		if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
-			var err error
-			limit, err = strconv.Atoi(rawLimit)
-			if err != nil || limit < 1 || limit > 500 {
-				writeError(w, r, logger, http.StatusBadRequest, "limit must be between 1 and 500")
-				return
-			}
-		}
-		entries, err := s.Timeline(r.Context(), personID, from, to, limit)
-		if err != nil {
-			logger.ErrorContext(r.Context(), "read person activity", "person_id", personID, "err", err)
-			writeError(w, r, logger, http.StatusInternalServerError, "failed to read activity")
-			return
-		}
-		response := make([]activityEntry, 0, len(entries))
-		for _, entry := range entries {
-			response = append(response, activityEntry{
-				EventID: entry.EventID, Kind: entry.Kind, Role: entry.Role,
-				OccurredAt: entry.OccurredAt, Project: entry.Project,
-				Title: entry.Title, URL: entry.URL,
-			})
-		}
-		writeJSON(w, r, logger, response)
-	}
-}
-
-func coverageHandler(s historyStore, logger *slog.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		personID, from, to, ok := requestedPersonRange(w, r, logger)
-		if !ok {
+		if _, ok := requirePerson(w, r, s, logger, personID); !ok {
 			return
 		}
 		intervals, err := s.CoverageForPerson(r.Context(), personID, from, to)
 		if err != nil {
-			logger.ErrorContext(r.Context(), "read person coverage", "person_id", personID, "err", err)
+			logger.ErrorContext(r.Context(), "read person coverage", "request_id", r.Header.Get("X-Request-ID"), "person_id", personID, "err", err)
 			writeError(w, r, logger, http.StatusInternalServerError, "failed to read coverage")
 			return
 		}
@@ -121,15 +111,18 @@ func coverageHandler(s historyStore, logger *slog.Logger) http.HandlerFunc {
 	}
 }
 
-func countsHandler(s historyStore, logger *slog.Logger) http.HandlerFunc {
+func countsHandler(s apiStore, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		personID, from, to, ok := requestedPersonRange(w, r, logger)
 		if !ok {
 			return
 		}
+		if _, ok := requirePerson(w, r, s, logger, personID); !ok {
+			return
+		}
 		counts, err := s.ContributionCounts(r.Context(), personID, from, to)
 		if err != nil {
-			logger.ErrorContext(r.Context(), "read person contribution counts", "person_id", personID, "err", err)
+			logger.ErrorContext(r.Context(), "read person contribution counts", "request_id", r.Header.Get("X-Request-ID"), "person_id", personID, "err", err)
 			writeError(w, r, logger, http.StatusInternalServerError, "failed to read contribution counts")
 			return
 		}
@@ -145,40 +138,77 @@ func countsHandler(s historyStore, logger *slog.Logger) http.HandlerFunc {
 	}
 }
 
+func requirePerson(w http.ResponseWriter, r *http.Request, s apiStore, logger apiLogger, personID uuid.UUID) (store.APIPerson, bool) {
+	person, err := s.APIPersonByID(r.Context(), personID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, r, logger, http.StatusNotFound, "person not found")
+		return store.APIPerson{}, false
+	}
+	if err != nil {
+		logger.ErrorContext(r.Context(), "check API person", "request_id", r.Header.Get("X-Request-ID"), "person_id", personID, "err", err)
+		writeError(w, r, logger, http.StatusInternalServerError, "failed to read person")
+		return store.APIPerson{}, false
+	}
+	return person, true
+}
+
 func requestedPersonRange(w http.ResponseWriter, r *http.Request, logger *slog.Logger) (uuid.UUID, time.Time, time.Time, bool) {
-	personID, err := uuid.Parse(r.PathValue("id"))
-	if err != nil {
-		writeError(w, r, logger, http.StatusBadRequest, "invalid person ID")
+	if !allowQueryKeys(w, r, logger, "from", "to") {
 		return uuid.Nil, time.Time{}, time.Time{}, false
 	}
-	from, err := time.Parse(time.RFC3339Nano, r.URL.Query().Get("from"))
-	if err != nil {
-		writeError(w, r, logger, http.StatusBadRequest, "from must be an RFC3339 timestamp")
+	personID, ok := requestedPersonID(w, r, logger)
+	if !ok {
 		return uuid.Nil, time.Time{}, time.Time{}, false
 	}
-	to, err := time.Parse(time.RFC3339Nano, r.URL.Query().Get("to"))
-	if err != nil || !from.Before(to) {
-		writeError(w, r, logger, http.StatusBadRequest, "to must be an RFC3339 timestamp after from")
+	from, to, ok := requestedTimeRange(w, r, logger, true)
+	if !ok {
 		return uuid.Nil, time.Time{}, time.Time{}, false
 	}
 	return personID, from, to, true
 }
 
-func writeJSON(w http.ResponseWriter, r *http.Request, logger *slog.Logger, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(value); err != nil {
-		logger.ErrorContext(r.Context(), "write JSON response", "err", err)
-	}
+func writeJSON(w http.ResponseWriter, r *http.Request, logger apiLogger, value any) {
+	writeResponse(w, r, logger, value, nil)
 }
 
-func writeError(w http.ResponseWriter, r *http.Request, logger *slog.Logger, status int, message string) {
+func writeResponse(w http.ResponseWriter, r *http.Request, logger apiLogger, value any, page *pageMetadata) {
+	writeResponseStatus(w, r, logger, http.StatusOK, value, page)
+}
+
+func writeResponseStatus(w http.ResponseWriter, r *http.Request, logger apiLogger, status int, value any, page *pageMetadata) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(struct {
-		Error string `json:"error"`
-	}{Error: message}); err != nil {
-		logger.ErrorContext(r.Context(), "write HTTP error response", "err", err)
+		Data any           `json:"data"`
+		Page *pageMetadata `json:"page,omitempty"`
+	}{Data: value, Page: page}); err != nil {
+		logger.ErrorContext(r.Context(), "write JSON response", "request_id", r.Header.Get("X-Request-ID"), "err", err)
 	}
+}
+
+func writeError(w http.ResponseWriter, r *http.Request, logger apiLogger, status int, message string) {
+	code := "internal_error"
+	switch status {
+	case http.StatusBadRequest:
+		code = "invalid_request"
+	case http.StatusUnauthorized:
+		code = "unauthorized"
+	case http.StatusForbidden:
+		code = "forbidden"
+	case http.StatusNotFound:
+		code = "not_found"
+	case http.StatusConflict:
+		code = "conflict"
+	case http.StatusRequestEntityTooLarge:
+		code = "request_too_large"
+	case http.StatusUnsupportedMediaType:
+		code = "unsupported_media_type"
+	case http.StatusMethodNotAllowed:
+		code = "method_not_allowed"
+	case http.StatusTooManyRequests:
+		code = "rate_limited"
+	}
+	writeAuthError(w, logger, r.Header.Get("X-Request-ID"), status, code, message)
 }
 
 // Run serves handler until ctx is canceled or the server encounters an error.

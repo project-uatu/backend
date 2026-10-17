@@ -26,6 +26,8 @@ type runnerStore struct {
 	released              bool
 	quota                 store.QuotaReservation
 	quotaBucket           string
+	trackedAccount        store.GitHubAccount
+	trackAccountCalls     int
 	completed             int
 	normalizedRetry       int
 	collectionRenewals    int
@@ -38,6 +40,7 @@ type persistedPage struct {
 	report     event.FetchReport
 	successful bool
 	cursor     string
+	windowFrom time.Time
 }
 
 func (s *runnerStore) ClaimCollectionJob(context.Context, string, time.Duration) (store.JobClaim, bool, error) {
@@ -49,13 +52,23 @@ func (s *runnerStore) ClaimCollectionJob(context.Context, string, time.Duration)
 	return claim, true, nil
 }
 
+func (s *runnerStore) TrackGitHubAccountForPerson(_ context.Context, personID, forgeID uuid.UUID, account store.GitHubAccount) (store.GitHubAccount, error) {
+	s.trackAccountCalls++
+	account.PersonID, account.ForgeInstanceID = personID, forgeID
+	s.trackedAccount = account
+	return account, nil
+}
+
 func (s *runnerStore) RenewCollectionLease(context.Context, store.JobClaim, time.Duration) error {
 	s.collectionRenewals++
 	return nil
 }
 
 func (s *runnerStore) PersistCollectionPage(_ context.Context, claim store.JobClaim, page event.Page, report event.FetchReport, successful bool, _ int, _ uuid.UUID) (bool, error) {
-	s.pages = append(s.pages, persistedPage{page: page, report: report, successful: successful, cursor: claim.Cursor})
+	s.pages = append(s.pages, persistedPage{
+		page: page, report: report, successful: successful, cursor: claim.Cursor,
+		windowFrom: claim.Window.From,
+	})
 	return successful && page.Done, nil
 }
 
@@ -135,6 +148,47 @@ type normalizerFunc func(event.RawEvent) ([]event.Action, error)
 
 func (f normalizerFunc) Normalize(raw event.RawEvent) ([]event.Action, error) {
 	return f(raw)
+}
+
+func TestRunner_RunOnce_tracksResolvedAccountBeforePersistingPage(t *testing.T) {
+	personID, forgeID := uuid.New(), uuid.New()
+	createdAt := time.Date(2011, 1, 25, 18, 44, 36, 0, time.UTC)
+	storeStub := &runnerStore{collectionClaim: &store.JobClaim{
+		CollectionJob: store.CollectionJob{
+			ID: uuid.New(), PersonID: personID, ForgeInstanceID: forgeID,
+			SourceKey: "github_history", ScanMode: "backfill",
+			Window: event.Window{To: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)},
+		},
+		Token: uuid.New(), SyncRunID: uuid.New(),
+	}, quota: store.QuotaReservation{Granted: true, ID: uuid.New()}}
+	connector := &pageConnector{
+		source: "github_history", bucket: "github/core",
+		fetch: func(_ context.Context, request event.PageRequest) (event.Page, event.FetchReport, error) {
+			if request.Cursor == "resolved" {
+				return event.Page{Done: true}, event.FetchReport{RateLimitBucket: "github/core"}, nil
+			}
+			return event.Page{
+				NextCursor: "resolved",
+				ResolvedAccount: &event.ResolvedAccount{
+					AccountID: "42", NodeID: "MDQ6VXNlcjQy", Login: "octocat", CreatedAt: createdAt,
+				},
+			}, event.FetchReport{RateLimitBucket: "github/core"}, nil
+		},
+	}
+	runner := newTestRunner(t, storeStub, []Connector{connector}, normalizerFunc(func(event.RawEvent) ([]event.Action, error) {
+		return nil, nil
+	}))
+	worked, err := runner.RunOnce(t.Context())
+	if err != nil || !worked {
+		t.Fatalf("RunOnce() = %t, %v; want true, nil", worked, err)
+	}
+	if storeStub.trackAccountCalls != 1 || storeStub.trackedAccount.PersonID != personID ||
+		storeStub.trackedAccount.ForgeInstanceID != forgeID || storeStub.trackedAccount.AccountID != "42" {
+		t.Errorf("tracked account = %+v after %d calls, want resolved account for person %s", storeStub.trackedAccount, storeStub.trackAccountCalls, personID)
+	}
+	if len(storeStub.pages) != 2 || !storeStub.pages[0].windowFrom.Equal(createdAt) {
+		t.Errorf("persisted page windows = %+v, want resolved start %s on first page", storeStub.pages, createdAt)
+	}
 }
 
 func TestRunner_RunOnce_persistsBoundedPages(t *testing.T) {

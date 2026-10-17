@@ -121,6 +121,9 @@ func (s *Store) DeletePerson(ctx context.Context, personID uuid.UUID) (deleteErr
 // ErrNotFound indicates a requested stored record does not exist.
 var ErrNotFound = errors.New("record not found")
 
+// ErrIdentityConflict indicates an identifier is already assigned to another person.
+var ErrIdentityConflict = errors.New("identity is assigned to another person")
+
 // CreateForgeInstance creates a forge instance or returns its existing record.
 func (s *Store) CreateForgeInstance(ctx context.Context, provider, baseURL string) (ForgeInstance, error) {
 	if provider == "" || baseURL == "" {
@@ -143,6 +146,19 @@ func (s *Store) CreateForgeInstance(ctx context.Context, provider, baseURL strin
 // TrackGitHubAccount creates or finds a person by immutable account ID and
 // refreshes the account's current login without changing person identity.
 func (s *Store) TrackGitHubAccount(ctx context.Context, forgeInstanceID uuid.UUID, account GitHubAccount) (tracked GitHubAccount, trackErr error) {
+	return s.trackGitHubAccount(ctx, uuid.Nil, forgeInstanceID, account)
+}
+
+// TrackGitHubAccountForPerson stores a resolved GitHub account for the person
+// whose authenticated onboarding request initiated resolution.
+func (s *Store) TrackGitHubAccountForPerson(ctx context.Context, personID, forgeInstanceID uuid.UUID, account GitHubAccount) (GitHubAccount, error) {
+	if personID == uuid.Nil {
+		return GitHubAccount{}, errors.New("GitHub account tracking requires a person")
+	}
+	return s.trackGitHubAccount(ctx, personID, forgeInstanceID, account)
+}
+
+func (s *Store) trackGitHubAccount(ctx context.Context, expectedPersonID, forgeInstanceID uuid.UUID, account GitHubAccount) (tracked GitHubAccount, trackErr error) {
 	accountID, parseErr := strconv.ParseInt(account.AccountID, 10, 64)
 	if forgeInstanceID == uuid.Nil || parseErr != nil || accountID <= 0 ||
 		account.NodeID == "" || account.Login == "" || account.AccountCreatedAt.IsZero() {
@@ -169,13 +185,20 @@ func (s *Store) TrackGitHubAccount(ctx context.Context, forgeInstanceID uuid.UUI
 			return GitHubAccount{}, err
 		}
 		if personID == uuid.Nil {
-			personID = uuid.New()
-			if _, err := tx.Exec(ctx, "INSERT INTO persons (id) VALUES ($1)", personID); err != nil {
-				return GitHubAccount{}, fmt.Errorf("create tracked GitHub person: %w", err)
+			personID = expectedPersonID
+			if personID == uuid.Nil {
+				personID = uuid.New()
+				if _, err := tx.Exec(ctx, "INSERT INTO persons (id) VALUES ($1)", personID); err != nil {
+					return GitHubAccount{}, fmt.Errorf("create tracked GitHub person: %w", err)
+				}
 			}
+		} else if expectedPersonID != uuid.Nil && personID != expectedPersonID {
+			return GitHubAccount{}, fmt.Errorf("%w: GitHub account is already assigned to another person", ErrIdentityConflict)
 		}
 	} else if err != nil {
 		return GitHubAccount{}, fmt.Errorf("find tracked GitHub account: %w", err)
+	} else if expectedPersonID != uuid.Nil && personID != expectedPersonID {
+		return GitHubAccount{}, fmt.Errorf("%w: GitHub account is already assigned to another person", ErrIdentityConflict)
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO github_accounts
@@ -201,6 +224,16 @@ func (s *Store) TrackGitHubAccount(ctx context.Context, forgeInstanceID uuid.UUI
 	}
 	if err := ensureGitHubIdentity(ctx, tx, forgeInstanceID, personID, "login", account.Login); err != nil {
 		return GitHubAccount{}, err
+	}
+	if expectedPersonID != uuid.Nil {
+		if _, err := tx.Exec(ctx, `
+			UPDATE jobs SET window_start = $3, updated_at = now()
+			WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $4
+			  AND status IN ('queued', 'running') AND scan_mode = 'backfill'
+			  AND window_start IS NULL`,
+			personID, forgeInstanceID, account.AccountCreatedAt.UTC(), SourceGitHubHistory); err != nil {
+			return GitHubAccount{}, fmt.Errorf("set GitHub onboarding history start: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return GitHubAccount{}, fmt.Errorf("commit GitHub account tracking: %w", err)
@@ -252,7 +285,7 @@ func ensureGitHubIdentity(ctx context.Context, tx pgx.Tx, forgeInstanceID, perso
 		return nil
 	case err == nil:
 		if kind == "login" {
-			return errors.New("GitHub login is already assigned to another person")
+			return fmt.Errorf("%w: GitHub login is already assigned to another person", ErrIdentityConflict)
 		}
 		return nil
 	case !errors.Is(err, pgx.ErrNoRows):

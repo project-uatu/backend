@@ -65,9 +65,18 @@ type RawEvent struct {
 
 // Page is one bounded result from a connector.
 type Page struct {
-	Events     []RawEvent
-	NextCursor string
-	Done       bool
+	Events          []RawEvent
+	NextCursor      string
+	Done            bool
+	ResolvedAccount *ResolvedAccount
+}
+
+// ResolvedAccount contains stable identity metadata returned while onboarding a source account.
+type ResolvedAccount struct {
+	AccountID string
+	NodeID    string
+	Login     string
+	CreatedAt time.Time
 }
 
 // Gap records a source interval that could not be fully scanned.
