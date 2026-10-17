@@ -1,10 +1,12 @@
 # 0005: Resumable bounded collection and normalization
 
-Status: Proposed
+Status: Accepted
 
 Date: 2026-10-17
 
 Issue: [#4](https://github.com/project-uatu/backend/issues/4)
+
+Decision authority: Accepted by the maintainer on 2026-10-17.
 
 Prerequisites: accepted ADRs [0001](0001-postgresql-backend-scope.md),
 [0002](0002-kubernetes-collector.md) and
