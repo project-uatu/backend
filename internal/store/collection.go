@@ -29,6 +29,7 @@ type CollectionJob struct {
 	ForgeInstanceID uuid.UUID
 	SourceKey       string
 	ScanMode        string
+	OnboardingLogin string
 	Window          event.Window
 	IdentityKeys    []event.ActorKey
 	Cursor          string
@@ -424,7 +425,7 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 	var oldRunID *uuid.UUID
 	var windowStart *time.Time
 	err = tx.QueryRow(ctx, `
-		SELECT id, person_id, forge_instance_id, source_key, scan_mode,
+		SELECT id, person_id, forge_instance_id, source_key, scan_mode, onboarding_login,
 		       window_start, window_end, cursor, due_at, attempts, max_attempts, sync_run_id
 		FROM jobs
 		WHERE (status = 'queued' AND GREATEST(due_at, COALESCE(retry_at, due_at),
@@ -434,7 +435,7 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 		                  COALESCE(rate_limit_reset_at, due_at)), created_at
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED`).Scan(&job.ID, &job.PersonID, &job.ForgeInstanceID, &job.SourceKey,
-		&job.ScanMode, &windowStart, &job.Window.To, &job.Cursor, &job.DueAt,
+		&job.ScanMode, &job.OnboardingLogin, &windowStart, &job.Window.To, &job.Cursor, &job.DueAt,
 		&job.Attempts, &job.MaxAttempts, &oldRunID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {
@@ -619,6 +620,15 @@ func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page 
 	defer rollbackTx(ctx, tx, "collection page persistence", &persistErr)
 	if err := lockJobClaim(ctx, tx, claim.ID, claim.Token); err != nil {
 		return false, err
+	}
+	if successful && page.ResolvedAccount != nil {
+		account := page.ResolvedAccount
+		if _, err := trackGitHubAccountTx(ctx, tx, claim.PersonID, claim.ForgeInstanceID, GitHubAccount{
+			AccountID: account.AccountID, NodeID: account.NodeID, Login: account.Login,
+			AccountCreatedAt: account.CreatedAt,
+		}, claim.OnboardingLogin); err != nil {
+			return false, fmt.Errorf("persist resolved GitHub account: %w", err)
+		}
 	}
 	for _, raw := range page.Events {
 		if err := raw.Validate(claim.ForgeInstanceID); err != nil {
@@ -1014,7 +1024,35 @@ func upsertRawEvent(ctx context.Context, tx pgx.Tx, raw event.RawEvent, actorJSO
 	if err != nil {
 		return uuid.Nil, false, fmt.Errorf("persist raw event %s: %w", raw.ExternalID, err)
 	}
+	if err := replaceRawEventActorKeys(ctx, tx, eventID, raw.Actors); err != nil {
+		return uuid.Nil, false, err
+	}
 	return eventID, true, nil
+}
+
+func replaceRawEventActorKeys(ctx context.Context, tx pgx.Tx, rawEventID uuid.UUID, actors []event.Actor) error {
+	if _, err := tx.Exec(ctx, "DELETE FROM raw_event_actor_keys WHERE raw_event_id = $1", rawEventID); err != nil {
+		return fmt.Errorf("delete indexed raw event actor identities: %w", err)
+	}
+	for _, actor := range actors {
+		key := actor.Key
+		normalized, err := identity.Normalize("github", key.IdentityKey.Kind, key.IdentityKey.Value)
+		if err != nil {
+			continue
+		}
+		scopeID := uuid.Nil
+		if key.ForgeInstanceID != nil {
+			scopeID = *key.ForgeInstanceID
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO raw_event_actor_keys (raw_event_id, kind, forge_instance_id, normalized_value)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT DO NOTHING`,
+			rawEventID, key.IdentityKey.Kind, scopeID, normalized); err != nil {
+			return fmt.Errorf("index raw event actor identity: %w", err)
+		}
+	}
+	return nil
 }
 
 func advanceCollectionCursor(ctx context.Context, tx pgx.Tx, claim JobClaim, cursor string, scanComplete bool) error {

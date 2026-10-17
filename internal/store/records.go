@@ -146,7 +146,16 @@ func (s *Store) CreateForgeInstance(ctx context.Context, provider, baseURL strin
 // TrackGitHubAccount creates or finds a person by immutable account ID and
 // refreshes the account's current login without changing person identity.
 func (s *Store) TrackGitHubAccount(ctx context.Context, forgeInstanceID uuid.UUID, account GitHubAccount) (tracked GitHubAccount, trackErr error) {
-	return s.trackGitHubAccount(ctx, uuid.Nil, forgeInstanceID, account)
+	return s.trackGitHubAccount(ctx, uuid.Nil, forgeInstanceID, account, account.Login)
+}
+
+// TrackGitHubAccountForLogin reconciles a resolved account with pending onboarding
+// initiated for the supplied login before creating a new person.
+func (s *Store) TrackGitHubAccountForLogin(ctx context.Context, forgeInstanceID uuid.UUID, login string, account GitHubAccount) (GitHubAccount, error) {
+	if login == "" {
+		return GitHubAccount{}, errors.New("GitHub account tracking requires an onboarding login")
+	}
+	return s.trackGitHubAccount(ctx, uuid.Nil, forgeInstanceID, account, login)
 }
 
 // TrackGitHubAccountForPerson stores a resolved GitHub account for the person
@@ -155,26 +164,38 @@ func (s *Store) TrackGitHubAccountForPerson(ctx context.Context, personID, forge
 	if personID == uuid.Nil {
 		return GitHubAccount{}, errors.New("GitHub account tracking requires a person")
 	}
-	return s.trackGitHubAccount(ctx, personID, forgeInstanceID, account)
+	return s.trackGitHubAccount(ctx, personID, forgeInstanceID, account, account.Login)
 }
 
-func (s *Store) trackGitHubAccount(ctx context.Context, expectedPersonID, forgeInstanceID uuid.UUID, account GitHubAccount) (tracked GitHubAccount, trackErr error) {
-	accountID, parseErr := strconv.ParseInt(account.AccountID, 10, 64)
-	if forgeInstanceID == uuid.Nil || parseErr != nil || accountID <= 0 ||
-		account.NodeID == "" || account.Login == "" || account.AccountCreatedAt.IsZero() {
-		return GitHubAccount{}, errors.New("GitHub account requires forge, account ID, node ID, login and creation time")
-	}
+func (s *Store) trackGitHubAccount(ctx context.Context, expectedPersonID, forgeInstanceID uuid.UUID, account GitHubAccount, onboardingLogin string) (tracked GitHubAccount, trackErr error) {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return GitHubAccount{}, fmt.Errorf("begin GitHub account tracking: %w", err)
 	}
 	defer rollbackTx(ctx, tx, "GitHub account tracking", &trackErr)
+	tracked, err = trackGitHubAccountTx(ctx, tx, expectedPersonID, forgeInstanceID, account, onboardingLogin)
+	if err != nil {
+		return GitHubAccount{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return GitHubAccount{}, fmt.Errorf("commit GitHub account tracking: %w", err)
+	}
+	return tracked, nil
+}
+
+func trackGitHubAccountTx(ctx context.Context, tx pgx.Tx, expectedPersonID, forgeInstanceID uuid.UUID, account GitHubAccount, onboardingLogin string) (GitHubAccount, error) {
+	accountID, parseErr := strconv.ParseInt(account.AccountID, 10, 64)
+	if forgeInstanceID == uuid.Nil || parseErr != nil || accountID <= 0 ||
+		account.NodeID == "" || account.Login == "" || account.AccountCreatedAt.IsZero() {
+		return GitHubAccount{}, errors.New("GitHub account requires forge, account ID, node ID, login and creation time")
+	}
 	lockKey := fmt.Sprintf("github:%s:%s", forgeInstanceID, account.AccountID)
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", lockKey); err != nil {
 		return GitHubAccount{}, fmt.Errorf("lock GitHub account identity: %w", err)
 	}
 
 	var personID uuid.UUID
+	var err error
 	err = tx.QueryRow(ctx, `
 		SELECT person_id FROM github_accounts
 		WHERE forge_instance_id = $1 AND account_id = $2 FOR UPDATE`,
@@ -185,7 +206,18 @@ func (s *Store) trackGitHubAccount(ctx context.Context, expectedPersonID, forgeI
 			return GitHubAccount{}, err
 		}
 		if personID == uuid.Nil {
-			personID = expectedPersonID
+			if expectedPersonID == uuid.Nil {
+				if onboardingLogin == "" {
+					onboardingLogin = account.Login
+				}
+				personID, err = pendingOnboardingPersonForLogin(ctx, tx, forgeInstanceID, onboardingLogin)
+				if err != nil {
+					return GitHubAccount{}, err
+				}
+			}
+			if personID == uuid.Nil {
+				personID = expectedPersonID
+			}
 			if personID == uuid.Nil {
 				personID = uuid.New()
 				if _, err := tx.Exec(ctx, "INSERT INTO persons (id) VALUES ($1)", personID); err != nil {
@@ -235,12 +267,37 @@ func (s *Store) trackGitHubAccount(ctx context.Context, expectedPersonID, forgeI
 			return GitHubAccount{}, fmt.Errorf("set GitHub onboarding history start: %w", err)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return GitHubAccount{}, fmt.Errorf("commit GitHub account tracking: %w", err)
-	}
 	account.PersonID = personID
 	account.ForgeInstanceID = forgeInstanceID
 	return account, nil
+}
+
+func pendingOnboardingPersonForLogin(ctx context.Context, tx pgx.Tx, forgeInstanceID uuid.UUID, login string) (uuid.UUID, error) {
+	var personID uuid.UUID
+	err := tx.QueryRow(ctx, `
+		SELECT j.person_id
+		FROM jobs j
+		JOIN identity_assignments ia ON ia.person_id = j.person_id
+		JOIN identity_keys ik ON ik.id = ia.identity_key_id
+		WHERE j.forge_instance_id = $1 AND j.source_key = $2
+		  AND j.status IN ('queued', 'running')
+		  AND j.onboarding_login = lower($3)
+		  AND ik.forge_instance_id = $1 AND ik.kind = 'login'
+		  AND ik.normalized_value = lower($3)
+		  AND NOT EXISTS (
+		      SELECT 1 FROM github_accounts ga
+		      WHERE ga.forge_instance_id = j.forge_instance_id
+		        AND ga.person_id = j.person_id
+		  )
+		ORDER BY j.created_at
+		LIMIT 1`, forgeInstanceID, SourceGitHubHistory, login).Scan(&personID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, nil
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("find pending GitHub onboarding person: %w", err)
+	}
+	return personID, nil
 }
 
 func assignedPersonForGitHubID(ctx context.Context, tx pgx.Tx, forgeInstanceID uuid.UUID, accountID string) (uuid.UUID, error) {

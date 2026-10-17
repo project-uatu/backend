@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -145,16 +146,17 @@ func (s *Store) CreateGitHubPerson(ctx context.Context, displayName, login strin
 	job = CollectionJob{
 		ID: uuid.New(), PersonID: person.ID, ForgeInstanceID: forge.ID,
 		SourceKey: SourceGitHubHistory, ScanMode: "backfill",
-		Window: event.Window{To: time.Now().UTC()}, MaxAttempts: 10,
+		OnboardingLogin: strings.ToLower(login),
+		Window:          event.Window{To: time.Now().UTC()}, MaxAttempts: 10,
 	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO jobs
 			(id, person_id, forge_instance_id, source_key, status, due_at, max_attempts,
-			 cursor, scan_mode, window_start, window_end)
-		VALUES ($1, $2, $3, $4, 'queued', now(), $5, '', $6, NULL, $7)
+			 cursor, scan_mode, onboarding_login, window_start, window_end)
+		VALUES ($1, $2, $3, $4, 'queued', now(), $5, '', $6, $7, NULL, $8)
 		RETURNING due_at`,
 		job.ID, job.PersonID, job.ForgeInstanceID, job.SourceKey,
-		job.MaxAttempts, job.ScanMode, job.Window.To).Scan(&job.DueAt)
+		job.MaxAttempts, job.ScanMode, job.OnboardingLogin, job.Window.To).Scan(&job.DueAt)
 	if err != nil {
 		return Person{}, CollectionJob{}, fmt.Errorf("enqueue initial GitHub account resolution: %w", err)
 	}
@@ -273,6 +275,27 @@ func (s *Store) UpdatePersonIdentifiers(ctx context.Context, personID, forgeID u
 		}
 	}
 	for _, item := range remove {
+		if item.Kind == identity.KindLogin {
+			var pendingJobID uuid.UUID
+			err := tx.QueryRow(ctx, `
+				SELECT j.id FROM jobs j
+				WHERE j.person_id = $1 AND j.forge_instance_id = $2
+				  AND j.source_key = $3 AND j.status IN ('queued', 'running')
+				  AND j.onboarding_login = $4
+				  AND NOT EXISTS (
+				      SELECT 1 FROM github_accounts ga
+				      WHERE ga.forge_instance_id = j.forge_instance_id
+				        AND ga.person_id = j.person_id
+				  )
+				FOR UPDATE OF j`,
+				personID, forgeID, SourceGitHubHistory, strings.ToLower(item.Value)).Scan(&pendingJobID)
+			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("check pending onboarding login: %w", err)
+			}
+			if err == nil {
+				return errors.New("cannot remove the GitHub login while account resolution is pending")
+			}
+		}
 		keyID, claimID, assigned, err := lockAssignedAPIIdentity(ctx, tx, forgeID, personID, item)
 		if err != nil {
 			return err
@@ -349,29 +372,23 @@ func queueIdentityRenormalization(ctx context.Context, tx pgx.Tx, forgeID uuid.U
 	if err != nil {
 		return fmt.Errorf("normalize API identity: %w", err)
 	}
+	scopeID := uuid.Nil
+	if item.Kind != identity.KindEmail {
+		scopeID = forgeID
+	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO normalization_jobs (raw_event_id, normalizer_version)
 		SELECT re.id, COALESCE(state.active_version, 1)
 		FROM raw_events re
 		LEFT JOIN raw_event_normalization_state state ON state.raw_event_id = re.id
-		WHERE EXISTS (
-			SELECT 1 FROM jsonb_array_elements(re.actor_keys) actor
-			WHERE actor->'key'->'identity_key'->>'kind' = $1
-			  AND (
-			      ($1 = 'email'
-			       AND split_part(actor->'key'->'identity_key'->>'value', '@', 1)
-			           || '@' || lower(split_part(actor->'key'->'identity_key'->>'value', '@', 2)) = $2
-			       AND actor->'key'->>'forge_instance_id' IS NULL)
-			      OR ($1 = 'login'
-			          AND lower(actor->'key'->'identity_key'->>'value') = $2
-			          AND actor->'key'->>'forge_instance_id' = $3)
-			  )
-		)
+		JOIN raw_event_actor_keys actor ON actor.raw_event_id = re.id
+		WHERE actor.kind = $1 AND actor.forge_instance_id = $3
+		  AND actor.normalized_value = $2
 		ON CONFLICT (raw_event_id, normalizer_version)
 		DO UPDATE SET status = 'queued', due_at = now(), retry_at = NULL,
 		              attempts = 0, lease_owner = '', lease_expires_at = NULL,
 		              fencing_token = NULL, last_error = '', updated_at = now()`,
-		item.Kind, normalized, forgeID.String())
+		item.Kind, normalized, scopeID)
 	if err != nil {
 		return fmt.Errorf("queue identity-driven event normalization: %w", err)
 	}

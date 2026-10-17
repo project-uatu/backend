@@ -43,6 +43,7 @@ type PageRequest struct {
 	Source            Source
 	ScanMode          string
 	IdentityKeys      []ActorKey
+	OnboardingLogin   string
 	AccountNodeID     string
 	CurrentLogin      string
 	KnownRepositories []string

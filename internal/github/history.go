@@ -38,29 +38,29 @@ type Account struct {
 }
 
 // ResolveAccount resolves a login to immutable GitHub account identifiers.
-func (c *Client) ResolveAccount(ctx context.Context, login string) (Account, error) {
+func (c *Client) ResolveAccount(ctx context.Context, login string) (Account, event.FetchReport, error) {
 	if !ValidLogin(login) {
-		return Account{}, fmt.Errorf("invalid GitHub login %q", login)
+		return Account{}, event.FetchReport{}, fmt.Errorf("invalid GitHub login %q", login)
 	}
 	target := c.baseURL + "/users/" + url.PathEscape(login)
-	body, _, err := c.do(ctx, http.MethodGet, target, nil, "github/core")
+	body, report, err := c.do(ctx, http.MethodGet, target, nil, "github/core")
 	if err != nil {
-		return Account{}, fmt.Errorf("resolve GitHub account: %w", err)
+		return Account{}, report, fmt.Errorf("resolve GitHub account: %w", err)
 	}
 	var user githubUser
 	if err := json.Unmarshal(body, &user); err != nil {
-		return Account{}, fmt.Errorf("decode GitHub account: %w", err)
+		return Account{}, report, fmt.Errorf("decode GitHub account: %w", err)
 	}
 	if user.ID <= 0 || user.NodeID == "" || !ValidLogin(user.Login) {
-		return Account{}, errors.New("GitHub returned an invalid account identity")
+		return Account{}, report, errors.New("GitHub returned an invalid account identity")
 	}
 	if user.CreatedAt.IsZero() {
-		return Account{}, errors.New("GitHub returned an account without a creation time")
+		return Account{}, report, errors.New("GitHub returned an account without a creation time")
 	}
 	return Account{
 		ID: strconv.FormatInt(user.ID, 10), NodeID: user.NodeID,
 		Login: user.Login, CreatedAt: user.CreatedAt.UTC(),
-	}, nil
+	}, report, nil
 }
 
 type scanTask struct {
@@ -149,6 +149,9 @@ func (c *HistoryConnector) FetchPage(ctx context.Context, request event.PageRequ
 		return event.Page{}, event.FetchReport{}, err
 	}
 	if state.Login == "" {
+		state.Login = request.CurrentLogin
+	}
+	if state.Login == "" {
 		return event.Page{}, event.FetchReport{}, errors.New("GitHub history requires an assigned login identity")
 	}
 	if !ValidLogin(state.Login) {
@@ -159,7 +162,8 @@ func (c *HistoryConnector) FetchPage(ctx context.Context, request event.PageRequ
 		CoverageScope:   historyCoverageScope,
 	}
 	if request.Cursor == "" && state.AccountID == "" {
-		account, err := c.client.ResolveAccount(ctx, state.Login)
+		account, resolutionReport, err := c.client.ResolveAccount(ctx, state.Login)
+		mergeReport(&report, resolutionReport)
 		if err != nil {
 			return event.Page{}, report, err
 		}
@@ -283,11 +287,13 @@ func (c *HistoryConnector) FetchPage(ctx context.Context, request event.PageRequ
 }
 
 func decodeScanState(request event.PageRequest) (scanState, error) {
-	state := scanState{}
+	state := scanState{Login: request.OnboardingLogin}
 	for _, key := range request.IdentityKeys {
 		switch key.IdentityKey.Kind {
 		case identity.KindLogin:
-			state.Login = key.IdentityKey.Value
+			if state.Login == "" {
+				state.Login = key.IdentityKey.Value
+			}
 		case identity.KindAccountID:
 			state.AccountID = key.IdentityKey.Value
 		}

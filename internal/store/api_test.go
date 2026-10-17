@@ -1,10 +1,12 @@
 package store
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/project-uatu/backend/internal/event"
 	"github.com/project-uatu/backend/internal/identity"
 )
 
@@ -159,5 +161,124 @@ func TestStore_ActivityPageUsesDeterministicKeyset(t *testing.T) {
 	projects, hasMore, err := fixture.store.PersonProjects(ctx, fixture.oldPerson.ID, nil, nil, "", 10)
 	if err != nil || hasMore || len(projects) != 1 || projects[0].Project != "owner/repo" || projects[0].Count != 2 {
 		t.Errorf("PersonProjects = %+v, %t, %v; want one project with two actions", projects, hasMore, err)
+	}
+}
+
+func TestStore_APIOnboardingProtectsPendingLoginAndLeavesJobsClaimable(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	firstPerson, firstJob, err := s.CreateGitHubPerson(ctx, "", "octocat", nil)
+	if err != nil {
+		t.Fatalf("CreateGitHubPerson(octocat): %v", err)
+	}
+	_, secondJob, err := s.CreateGitHubPerson(ctx, "", "zebra", nil)
+	if err != nil {
+		t.Fatalf("CreateGitHubPerson(zebra): %v", err)
+	}
+	if err := s.UpdatePersonIdentifiers(ctx, firstPerson.ID, firstJob.ForgeInstanceID, nil,
+		[]APIIdentity{{Kind: identity.KindLogin, Value: "octocat"}}); err == nil {
+		t.Fatal("UpdatePersonIdentifiers(remove pending login) error = nil; want rejection")
+	}
+	firstClaim, found, err := s.ClaimCollectionJob(ctx, "worker-one", time.Minute)
+	if err != nil || !found || firstClaim.ID != firstJob.ID {
+		t.Fatalf("ClaimCollectionJob(first) = %+v, %t, %v; want first queued onboarding job", firstClaim, found, err)
+	}
+	secondClaim, found, err := s.ClaimCollectionJob(ctx, "worker-two", time.Minute)
+	if err != nil || !found || secondClaim.ID != secondJob.ID {
+		t.Fatalf("ClaimCollectionJob(second) = %+v, %t, %v; want other queued onboarding job", secondClaim, found, err)
+	}
+}
+
+func TestStore_APIOnboardingRetainsTargetLoginAndIndexesActorIdentities(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	person, job, err := s.CreateGitHubPerson(ctx, "", "octocat", nil)
+	if err != nil {
+		t.Fatalf("CreateGitHubPerson: %v", err)
+	}
+	if err := s.UpdatePersonIdentifiers(ctx, person.ID, job.ForgeInstanceID,
+		[]APIIdentity{{Kind: identity.KindLogin, Value: "zebra"}}, nil); err != nil {
+		t.Fatalf("UpdatePersonIdentifiers(add alias): %v", err)
+	}
+	claim, found, err := s.ClaimCollectionJob(ctx, "worker", time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimCollectionJob = %t, %v; want onboarding job", found, err)
+	}
+	if claim.OnboardingLogin != "octocat" {
+		t.Errorf("claimed onboarding login = %q, want original login octocat", claim.OnboardingLogin)
+	}
+
+	raw := event.RawEvent{
+		ForgeInstanceID:      job.ForgeInstanceID,
+		Source:               event.Source(SourceGitHubHistory),
+		ExternalID:           "indexed-actors",
+		Kind:                 "activity",
+		Payload:              json.RawMessage(`{}`),
+		PayloadSchemaVersion: 1,
+		Actors: []event.Actor{
+			{Key: event.ActorKey{
+				IdentityKey:     identity.Key{Kind: identity.KindLogin, Value: "Zebra"},
+				ForgeInstanceID: &job.ForgeInstanceID,
+			}, Role: "author"},
+			{Key: event.ActorKey{
+				IdentityKey: identity.Key{Kind: identity.KindEmail, Value: "octo@EXAMPLE.COM"},
+			}, Role: "author"},
+		},
+	}
+	if _, err := s.PersistCollectionPage(ctx, claim, event.Page{
+		Events: []event.RawEvent{raw}, Done: true,
+		ResolvedAccount: &event.ResolvedAccount{
+			AccountID: "42", NodeID: "MDQ6VXNlcjQy", Login: "octocat",
+			CreatedAt: time.Date(2011, 1, 25, 18, 44, 36, 0, time.UTC),
+		},
+	}, event.FetchReport{}, true, 1, uuid.Nil); err != nil {
+		t.Fatalf("PersistCollectionPage: %v", err)
+	}
+	if err := s.UpdatePersonIdentifiers(ctx, person.ID, job.ForgeInstanceID,
+		[]APIIdentity{
+			{Kind: identity.KindLogin, Value: "zebra"},
+			{Kind: identity.KindEmail, Value: "octo@example.com"},
+		}, nil); err != nil {
+		t.Fatalf("UpdatePersonIdentifiers(add indexed actors): %v", err)
+	}
+	if got := countRows(t, s, `
+		SELECT count(*) FROM normalization_jobs nj
+		JOIN raw_events re ON re.id = nj.raw_event_id
+		WHERE re.external_id = 'indexed-actors'`); got != 1 {
+		t.Errorf("normalization jobs after actor identity additions = %d, want 1 deduplicated job", got)
+	}
+	if got := countRows(t, s, `
+		SELECT count(*) FROM raw_event_actor_keys
+		WHERE raw_event_id = (SELECT id FROM raw_events WHERE external_id = 'indexed-actors')
+		  AND ((kind = 'login' AND normalized_value = 'zebra')
+		       OR (kind = 'email' AND normalized_value = 'octo@example.com'))`); got != 2 {
+		t.Errorf("indexed normalized actor identities = %d, want login and email entries", got)
+	}
+}
+
+func TestStore_CollectCLIReusesPendingAPIOnboarding(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	person, job, err := s.CreateGitHubPerson(ctx, "", "octocat", nil)
+	if err != nil {
+		t.Fatalf("CreateGitHubPerson: %v", err)
+	}
+	account, err := s.TrackGitHubAccountForLogin(ctx, job.ForgeInstanceID, "octocat", GitHubAccount{
+		AccountID: "42", NodeID: "MDQ6VXNlcjQy", Login: "octo-cat",
+		AccountCreatedAt: time.Date(2011, 1, 25, 18, 44, 36, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("TrackGitHubAccountForLogin: %v", err)
+	}
+	if account.PersonID != person.ID {
+		t.Fatalf("tracked person = %s, want API-onboarded person %s", account.PersonID, person.ID)
+	}
+	if got := countRows(t, s, "SELECT count(*) FROM persons"); got != 1 {
+		t.Errorf("person count after CLI account tracking = %d, want no duplicate person", got)
+	}
+	claim, found, err := s.ClaimCollectionJob(ctx, "collector", time.Minute)
+	if err != nil || !found || claim.ID != job.ID || claim.PersonID != person.ID ||
+		claim.CurrentAccountLogin != "octo-cat" {
+		t.Fatalf("ClaimCollectionJob after CLI tracking = %+v, %t, %v; want pending API job", claim, found, err)
 	}
 }

@@ -26,8 +26,6 @@ type runnerStore struct {
 	released              bool
 	quota                 store.QuotaReservation
 	quotaBucket           string
-	trackedAccount        store.GitHubAccount
-	trackAccountCalls     int
 	completed             int
 	normalizedRetry       int
 	collectionRenewals    int
@@ -50,13 +48,6 @@ func (s *runnerStore) ClaimCollectionJob(context.Context, string, time.Duration)
 	claim := *s.collectionClaim
 	s.collectionClaim = nil
 	return claim, true, nil
-}
-
-func (s *runnerStore) TrackGitHubAccountForPerson(_ context.Context, personID, forgeID uuid.UUID, account store.GitHubAccount) (store.GitHubAccount, error) {
-	s.trackAccountCalls++
-	account.PersonID, account.ForgeInstanceID = personID, forgeID
-	s.trackedAccount = account
-	return account, nil
 }
 
 func (s *runnerStore) RenewCollectionLease(context.Context, store.JobClaim, time.Duration) error {
@@ -182,9 +173,9 @@ func TestRunner_RunOnce_tracksResolvedAccountBeforePersistingPage(t *testing.T) 
 	if err != nil || !worked {
 		t.Fatalf("RunOnce() = %t, %v; want true, nil", worked, err)
 	}
-	if storeStub.trackAccountCalls != 1 || storeStub.trackedAccount.PersonID != personID ||
-		storeStub.trackedAccount.ForgeInstanceID != forgeID || storeStub.trackedAccount.AccountID != "42" {
-		t.Errorf("tracked account = %+v after %d calls, want resolved account for person %s", storeStub.trackedAccount, storeStub.trackAccountCalls, personID)
+	if len(storeStub.pages) != 2 || storeStub.pages[0].page.ResolvedAccount == nil ||
+		storeStub.pages[0].page.ResolvedAccount.AccountID != "42" {
+		t.Errorf("resolved account page = %+v; want resolved account to be persisted with its page", storeStub.pages)
 	}
 	if len(storeStub.pages) != 2 || !storeStub.pages[0].windowFrom.Equal(createdAt) {
 		t.Errorf("persisted page windows = %+v, want resolved start %s on first page", storeStub.pages, createdAt)

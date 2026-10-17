@@ -28,12 +28,15 @@ func TestClient_ResolveAccount(t *testing.T) {
 
 	client := NewClient("test-token", server.Client())
 	client.baseURL = server.URL
-	account, err := client.ResolveAccount(t.Context(), "octocat")
+	account, report, err := client.ResolveAccount(t.Context(), "octocat")
 	if err != nil {
 		t.Fatalf("ResolveAccount: %v", err)
 	}
 	if account.ID != "42" || account.NodeID != "MDQ6VXNlcjQy" || account.Login != "octocat" {
 		t.Errorf("ResolveAccount = %+v, want stable account identifiers", account)
+	}
+	if report.RateLimitBucket != "github/core" {
+		t.Errorf("ResolveAccount report bucket = %q, want github/core", report.RateLimitBucket)
 	}
 }
 
@@ -75,6 +78,74 @@ func TestHistoryConnector_resolvesLoginBeforeBackfill(t *testing.T) {
 	}
 	if report.RateLimitBucket != "github/core" {
 		t.Errorf("resolution report bucket = %q, want github/core", report.RateLimitBucket)
+	}
+}
+
+func TestHistoryConnector_UsesOnboardingLoginBeforeAssignedAliases(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/users/octocat" {
+			t.Errorf("request path = %q, want onboarding login /users/octocat", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"id":42,"node_id":"MDQ6VXNlcjQy","login":"octocat","created_at":"2011-01-25T18:44:36Z"}`))
+	}))
+	defer server.Close()
+
+	connector := NewHistoryConnector(NewClient("", server.Client()))
+	connector.client.baseURL = server.URL
+	forgeID := uuid.New()
+	request := event.PageRequest{
+		ForgeInstanceID: forgeID,
+		Source:          historySource,
+		ScanMode:        "backfill",
+		OnboardingLogin: "octocat",
+		IdentityKeys: []event.ActorKey{
+			{IdentityKey: identity.Key{Kind: identity.KindLogin, Value: "octocat"}, ForgeInstanceID: &forgeID},
+			{IdentityKey: identity.Key{Kind: identity.KindLogin, Value: "zebra"}, ForgeInstanceID: &forgeID},
+		},
+		Window: event.Window{To: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)},
+	}
+	page, _, err := connector.FetchPage(t.Context(), request)
+	if err != nil {
+		t.Fatalf("FetchPage(onboarding login with aliases): %v", err)
+	}
+	if page.ResolvedAccount == nil || page.ResolvedAccount.Login != "octocat" {
+		t.Errorf("resolved account = %+v, want onboarding account octocat", page.ResolvedAccount)
+	}
+}
+
+func TestHistoryConnector_UsesStoredLoginWithoutAssignedAlias(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/graphql" {
+			t.Errorf("request path = %q, want /graphql", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":{"node":{"databaseId":42,"login":"octocat"}}}`))
+	}))
+	defer server.Close()
+
+	connector := NewHistoryConnector(NewClient("", server.Client()))
+	connector.client.baseURL = server.URL
+	forgeID := uuid.New()
+	request := event.PageRequest{
+		ForgeInstanceID: forgeID,
+		Source:          historySource,
+		ScanMode:        "backfill",
+		CurrentLogin:    "octocat",
+		AccountNodeID:   "MDQ6VXNlcjQy",
+		IdentityKeys: []event.ActorKey{{
+			IdentityKey:     identity.Key{Kind: identity.KindAccountID, Value: "42"},
+			ForgeInstanceID: &forgeID,
+		}},
+		Window: event.Window{
+			From: time.Date(2011, 1, 25, 0, 0, 0, 0, time.UTC),
+			To:   time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+	}
+	page, _, err := connector.FetchPage(t.Context(), request)
+	if err != nil {
+		t.Fatalf("FetchPage(with stored login): %v", err)
+	}
+	if page.NextCursor == "" {
+		t.Error("FetchPage(with stored login) returned no cursor; want collection to continue")
 	}
 }
 
@@ -465,6 +536,35 @@ func TestHistoryConnector_RateLimitRetryAfter(t *testing.T) {
 	if report.RateLimitRemaining == nil || *report.RateLimitRemaining != 0 ||
 		report.RateLimitResetAt == nil || time.Until(*report.RateLimitResetAt) < 8*time.Second {
 		t.Errorf("rate-limit report = %+v, want zero remaining and Retry-After reset", report)
+	}
+}
+
+func TestHistoryConnector_ResolveAccountRateLimitReport(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/users/octocat" {
+			t.Errorf("request path = %q, want /users/octocat", r.URL.Path)
+		}
+		w.Header().Set("Retry-After", "9")
+		w.Header().Set("X-RateLimit-Limit", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	connector := NewHistoryConnector(NewClient("", server.Client()))
+	connector.client.baseURL = server.URL
+	request := historyRequest(t, "")
+	request.IdentityKeys = []event.ActorKey{{
+		IdentityKey: identity.Key{Kind: identity.KindLogin, Value: "octocat"},
+	}}
+	_, report, err := connector.FetchPage(t.Context(), request)
+	if err == nil {
+		t.Fatal("FetchPage(login-only request) error = nil, want rate-limit error")
+	}
+	if report.RateLimitBucket != "github/core" || report.RateLimitLimit == nil ||
+		*report.RateLimitLimit != 60 || report.RateLimitRemaining == nil ||
+		*report.RateLimitRemaining != 0 || report.RateLimitResetAt == nil ||
+		time.Until(*report.RateLimitResetAt) < 8*time.Second {
+		t.Errorf("FetchPage(login-only request) report = %+v; want core quota and Retry-After metadata", report)
 	}
 }
 

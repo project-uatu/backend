@@ -127,11 +127,11 @@ func collectPeople(ctx context.Context, cfg config.Config, users []string, logge
 	}
 	client := github.NewClient(cfg.GitHubToken, nil)
 	for _, login := range users {
-		account, err := client.ResolveAccount(ctx, login)
+		account, _, err := client.ResolveAccount(ctx, login)
 		if err != nil {
 			return fmt.Errorf("resolve GitHub user %s: %w", login, err)
 		}
-		tracked, err := db.TrackGitHubAccount(ctx, forge.ID, store.GitHubAccount{
+		tracked, err := db.TrackGitHubAccountForLogin(ctx, forge.ID, login, store.GitHubAccount{
 			AccountID: account.ID, NodeID: account.NodeID, Login: account.Login,
 			AccountCreatedAt: account.CreatedAt,
 		})
