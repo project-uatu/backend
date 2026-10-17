@@ -19,6 +19,12 @@ var ErrLeaseLost = errors.New("work lease lost")
 // ErrCollectionJobActive indicates a conflicting scan is already queued or running.
 var ErrCollectionJobActive = errors.New("collection scan already active")
 
+// ErrIdempotencyConflict indicates an idempotency key is bound to different work.
+var ErrIdempotencyConflict = errors.New("idempotency key is already assigned to another job")
+
+// ErrOnboardingTargetUnavailable indicates account resolution has no assigned target login.
+var ErrOnboardingTargetUnavailable = errors.New("GitHub account resolution target is unavailable")
+
 // CollectionJob describes durable work for one person and source.
 type CollectionJob struct {
 	ID              uuid.UUID
@@ -26,6 +32,7 @@ type CollectionJob struct {
 	ForgeInstanceID uuid.UUID
 	SourceKey       string
 	ScanMode        string
+	OnboardingLogin string
 	Window          event.Window
 	IdentityKeys    []event.ActorKey
 	Cursor          string
@@ -40,6 +47,7 @@ type CollectionJobInput struct {
 	ForgeInstanceID uuid.UUID
 	SourceKey       string
 	ScanMode        string
+	OnboardingLogin string
 	Window          event.Window
 	DueAt           time.Time
 	MaxAttempts     int
@@ -112,6 +120,35 @@ func (s *Store) EnqueueCollectionJob(ctx context.Context, input CollectionJobInp
 		return CollectionJob{}, fmt.Errorf("begin collection enqueue: %w", err)
 	}
 	defer rollbackTx(ctx, tx, "collection enqueue", &enqueueErr)
+	if input.SourceKey == SourceGitHubHistory {
+		var accountExists bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM github_accounts
+				WHERE forge_instance_id = $1 AND person_id = $2
+			)`, input.ForgeInstanceID, input.PersonID).Scan(&accountExists); err != nil {
+			return CollectionJob{}, fmt.Errorf("check GitHub account before enqueue: %w", err)
+		}
+		if !accountExists {
+			if input.OnboardingLogin == "" {
+				return CollectionJob{}, ErrOnboardingTargetUnavailable
+			}
+			var targetKeyID uuid.UUID
+			err := tx.QueryRow(ctx, `
+				SELECT ia.identity_key_id FROM identity_assignments ia
+				JOIN identity_keys ik ON ik.id = ia.identity_key_id
+				WHERE ia.person_id = $1 AND ik.forge_instance_id = $2
+				  AND ik.kind = 'login' AND ik.normalized_value = $3
+				FOR UPDATE OF ia, ik`,
+				input.PersonID, input.ForgeInstanceID, input.OnboardingLogin).Scan(&targetKeyID)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return CollectionJob{}, ErrOnboardingTargetUnavailable
+			}
+			if err != nil {
+				return CollectionJob{}, fmt.Errorf("validate GitHub onboarding target: %w", err)
+			}
+		}
+	}
 	if input.IdempotencyKey != "" {
 		lockKey := fmt.Sprintf("%s:%s:%d:%s:%d:%s",
 			input.PersonID, input.ForgeInstanceID, len(input.SourceKey), input.SourceKey,
@@ -132,28 +169,31 @@ func (s *Store) EnqueueCollectionJob(ctx context.Context, input CollectionJobInp
 	}
 	job = CollectionJob{
 		ID: uuid.New(), PersonID: input.PersonID, ForgeInstanceID: input.ForgeInstanceID,
-		SourceKey: input.SourceKey, ScanMode: input.ScanMode, Window: input.Window,
+		SourceKey: input.SourceKey, ScanMode: input.ScanMode,
+		OnboardingLogin: input.OnboardingLogin, Window: input.Window,
 		Cursor: "", DueAt: input.DueAt, MaxAttempts: input.MaxAttempts,
 	}
 	var windowStart *time.Time
 	err = tx.QueryRow(ctx, `
 		INSERT INTO jobs
 			(id, person_id, forge_instance_id, source_key, status, due_at, max_attempts, cursor,
-			 idempotency_key, scan_mode, window_start, window_end)
-		VALUES ($1, $2, $3, $4, 'queued', $5, $6, '', NULLIF($7, ''), $8, $9, $10)
+			 idempotency_key, scan_mode, onboarding_login, window_start, window_end)
+		VALUES ($1, $2, $3, $4, 'queued', $5, $6, '', NULLIF($7, ''), $8, $9, $10, $11)
 		ON CONFLICT (person_id, forge_instance_id, source_key)
 			WHERE status IN ('queued', 'running')
 		DO UPDATE SET due_at = LEAST(jobs.due_at, EXCLUDED.due_at),
 		              idempotency_key = COALESCE(jobs.idempotency_key, EXCLUDED.idempotency_key),
+		              onboarding_login = COALESCE(NULLIF(jobs.onboarding_login, ''), EXCLUDED.onboarding_login),
 		              updated_at = now()
 		WHERE jobs.scan_mode = EXCLUDED.scan_mode
 		  AND jobs.window_start IS NOT DISTINCT FROM EXCLUDED.window_start
 		  AND jobs.window_end = EXCLUDED.window_end
-		RETURNING id, scan_mode, window_start, window_end, cursor, due_at, attempts, max_attempts`,
+		RETURNING id, scan_mode, onboarding_login, window_start, window_end, cursor, due_at, attempts, max_attempts`,
 		job.ID, input.PersonID, input.ForgeInstanceID, input.SourceKey, input.DueAt,
-		input.MaxAttempts, input.IdempotencyKey, input.ScanMode, nullableTime(input.Window.From),
-		input.Window.To.UTC()).Scan(&job.ID, &job.ScanMode, &windowStart, &job.Window.To,
-		&job.Cursor, &job.DueAt, &job.Attempts, &job.MaxAttempts)
+		input.MaxAttempts, input.IdempotencyKey, input.ScanMode, input.OnboardingLogin,
+		nullableTime(input.Window.From),
+		input.Window.To.UTC()).Scan(&job.ID, &job.ScanMode, &job.OnboardingLogin,
+		&windowStart, &job.Window.To, &job.Cursor, &job.DueAt, &job.Attempts, &job.MaxAttempts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CollectionJob{}, fmt.Errorf("%w: requested scan window or mode differs from active work", ErrCollectionJobActive)
 	}
@@ -199,24 +239,71 @@ func (s *Store) EnqueueCollectionJob(ctx context.Context, input CollectionJobInp
 // EnqueueGitHubHistory chooses an initial backfill or a seven-day-overlap
 // incremental scan from the completed checkpoint.
 func (s *Store) EnqueueGitHubHistory(ctx context.Context, personID, forgeInstanceID uuid.UUID) (CollectionJob, error) {
-	if personID == uuid.Nil || forgeInstanceID == uuid.Nil {
-		return CollectionJob{}, errors.New("GitHub history enqueue requires person and forge")
+	input, err := s.githubHistoryInput(ctx, personID, forgeInstanceID, "")
+	if err != nil {
+		return CollectionJob{}, err
 	}
-	var accountCreatedAt time.Time
-	if err := s.db.QueryRow(ctx, `
-		SELECT account_created_at FROM github_accounts
-		WHERE forge_instance_id = $1 AND person_id = $2`,
-		forgeInstanceID, personID).Scan(&accountCreatedAt); err != nil {
-		return CollectionJob{}, fmt.Errorf("load GitHub account creation time: %w", err)
+	return s.EnqueueCollectionJob(ctx, input)
+}
+
+// EnqueueGitHubHistoryWithKey enqueues or coalesces a GitHub sync and binds
+// the idempotency key to the resulting durable job.
+func (s *Store) EnqueueGitHubHistoryWithKey(ctx context.Context, personID, forgeInstanceID uuid.UUID, idempotencyKey string) (CollectionJob, error) {
+	if idempotencyKey == "" || len(idempotencyKey) > 200 {
+		return CollectionJob{}, errors.New("idempotency key must contain 1 to 200 bytes")
+	}
+	input, err := s.githubHistoryInput(ctx, personID, forgeInstanceID, idempotencyKey)
+	if err != nil {
+		return CollectionJob{}, err
+	}
+	job, err := s.EnqueueCollectionJob(ctx, input)
+	if err == nil {
+		return job, nil
+	}
+	if !errors.Is(err, ErrCollectionJobActive) {
+		return CollectionJob{}, err
+	}
+	return s.bindIdempotencyKeyToActiveJob(ctx, personID, forgeInstanceID, idempotencyKey)
+}
+
+func (s *Store) githubHistoryInput(ctx context.Context, personID, forgeInstanceID uuid.UUID, idempotencyKey string) (CollectionJobInput, error) {
+	if personID == uuid.Nil || forgeInstanceID == uuid.Nil {
+		return CollectionJobInput{}, errors.New("GitHub history enqueue requires person and forge")
 	}
 	input := CollectionJobInput{
 		PersonID: personID, ForgeInstanceID: forgeInstanceID,
 		SourceKey: SourceGitHubHistory, ScanMode: "backfill",
-		Window: event.Window{From: accountCreatedAt.UTC()},
+		IdempotencyKey: idempotencyKey,
+	}
+	var accountCreatedAt time.Time
+	err := s.db.QueryRow(ctx, `
+		SELECT account_created_at FROM github_accounts
+		WHERE forge_instance_id = $1 AND person_id = $2`,
+		forgeInstanceID, personID).Scan(&accountCreatedAt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return CollectionJobInput{}, fmt.Errorf("load GitHub account creation time: %w", err)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = s.db.QueryRow(ctx, `
+			SELECT onboarding_login FROM jobs
+			WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3
+			  AND onboarding_login <> ''
+			ORDER BY created_at, id
+			LIMIT 1`,
+			personID, forgeInstanceID, SourceGitHubHistory).Scan(&input.OnboardingLogin)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return CollectionJobInput{}, ErrOnboardingTargetUnavailable
+		}
+		if err != nil {
+			return CollectionJobInput{}, fmt.Errorf("load GitHub onboarding target: %w", err)
+		}
+	}
+	if !accountCreatedAt.IsZero() {
+		input.Window.From = accountCreatedAt.UTC()
 	}
 	var backfillComplete bool
 	var completedThrough *time.Time
-	err := s.db.QueryRow(ctx, `
+	err = s.db.QueryRow(ctx, `
 		SELECT backfill_complete, completed_through
 		FROM checkpoints
 		WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3`,
@@ -224,14 +311,113 @@ func (s *Store) EnqueueGitHubHistory(ctx context.Context, personID, forgeInstanc
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 	case err != nil:
-		return CollectionJob{}, fmt.Errorf("load GitHub history checkpoint: %w", err)
+		return CollectionJobInput{}, fmt.Errorf("load GitHub history checkpoint: %w", err)
 	case backfillComplete && completedThrough != nil:
 		input.ScanMode = "incremental"
 		input.Window.From = completedThrough.Add(-7 * 24 * time.Hour).UTC()
 	default:
 	}
 	input.Window.To = time.Now().UTC()
-	return s.EnqueueCollectionJob(ctx, input)
+	return input, nil
+}
+
+func (s *Store) bindIdempotencyKeyToActiveJob(ctx context.Context, personID, forgeInstanceID uuid.UUID, key string) (job CollectionJob, bindErr error) {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return CollectionJob{}, fmt.Errorf("begin active job idempotency binding: %w", err)
+	}
+	defer rollbackTx(ctx, tx, "active job idempotency binding", &bindErr)
+	lockKey := fmt.Sprintf("%s:%s:%d:%s:%d:%s",
+		personID, forgeInstanceID, len(SourceGitHubHistory), SourceGitHubHistory, len(key), key)
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", lockKey); err != nil {
+		return CollectionJob{}, fmt.Errorf("lock active job idempotency key: %w", err)
+	}
+	var existingID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		SELECT job_id FROM job_idempotency_keys
+		WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3
+		  AND idempotency_key = $4`,
+		personID, forgeInstanceID, SourceGitHubHistory, key).Scan(&existingID)
+	if err == nil {
+		job, err = collectionJobByID(ctx, tx, existingID)
+		if err != nil {
+			return CollectionJob{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return CollectionJob{}, fmt.Errorf("commit existing job idempotency binding: %w", err)
+		}
+		return job, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return CollectionJob{}, fmt.Errorf("check active job idempotency key: %w", err)
+	}
+	job, err = activeCollectionJob(ctx, tx, personID, forgeInstanceID, SourceGitHubHistory)
+	if err != nil {
+		return CollectionJob{}, err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO job_idempotency_keys
+			(person_id, forge_instance_id, source_key, idempotency_key, job_id)
+		VALUES ($1, $2, $3, $4, $5)`,
+		personID, forgeInstanceID, SourceGitHubHistory, key, job.ID)
+	if err != nil {
+		return CollectionJob{}, fmt.Errorf("bind idempotency key to active job: %w", err)
+	}
+	_, err = tx.Exec(ctx, `
+		UPDATE jobs SET idempotency_key = COALESCE(idempotency_key, $2)
+		WHERE id = $1`, job.ID, key)
+	if err != nil {
+		return CollectionJob{}, fmt.Errorf("update active job idempotency key: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return CollectionJob{}, fmt.Errorf("commit active job idempotency binding: %w", err)
+	}
+	return job, nil
+}
+
+func activeCollectionJob(ctx context.Context, tx pgx.Tx, personID, forgeInstanceID uuid.UUID, source string) (CollectionJob, error) {
+	var job CollectionJob
+	var windowStart *time.Time
+	err := tx.QueryRow(ctx, `
+		SELECT id, person_id, forge_instance_id, source_key, scan_mode, onboarding_login, window_start,
+		       window_end, cursor, due_at, attempts, max_attempts
+		FROM jobs WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3
+		  AND status IN ('queued', 'running')
+		FOR UPDATE`, personID, forgeInstanceID, source).Scan(
+		&job.ID, &job.PersonID, &job.ForgeInstanceID, &job.SourceKey, &job.ScanMode,
+		&job.OnboardingLogin, &windowStart, &job.Window.To, &job.Cursor, &job.DueAt,
+		&job.Attempts, &job.MaxAttempts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CollectionJob{}, fmt.Errorf("%w: no active GitHub history job", ErrCollectionJobActive)
+	}
+	if err != nil {
+		return CollectionJob{}, fmt.Errorf("load active collection job: %w", err)
+	}
+	if windowStart != nil {
+		job.Window.From = windowStart.UTC()
+	}
+	job.Window.To, job.DueAt = job.Window.To.UTC(), job.DueAt.UTC()
+	return job, nil
+}
+
+func collectionJobByID(ctx context.Context, tx pgx.Tx, jobID uuid.UUID) (CollectionJob, error) {
+	var job CollectionJob
+	var windowStart *time.Time
+	err := tx.QueryRow(ctx, `
+		SELECT id, person_id, forge_instance_id, source_key, scan_mode, onboarding_login, window_start,
+		       window_end, cursor, due_at, attempts, max_attempts
+		FROM jobs WHERE id = $1`, jobID).Scan(
+		&job.ID, &job.PersonID, &job.ForgeInstanceID, &job.SourceKey, &job.ScanMode,
+		&job.OnboardingLogin, &windowStart, &job.Window.To, &job.Cursor, &job.DueAt,
+		&job.Attempts, &job.MaxAttempts)
+	if err != nil {
+		return CollectionJob{}, fmt.Errorf("load collection job %s: %w", jobID, err)
+	}
+	if windowStart != nil {
+		job.Window.From = windowStart.UTC()
+	}
+	job.Window.To, job.DueAt = job.Window.To.UTC(), job.DueAt.UTC()
+	return job, nil
 }
 
 func collectionJobForIdempotencyKey(ctx context.Context, tx pgx.Tx, input CollectionJobInput) (CollectionJob, bool, error) {
@@ -239,14 +425,15 @@ func collectionJobForIdempotencyKey(ctx context.Context, tx pgx.Tx, input Collec
 	var windowStart *time.Time
 	err := tx.QueryRow(ctx, `
 		SELECT j.id, j.person_id, j.forge_instance_id, j.source_key, j.scan_mode,
-		       j.window_start, j.window_end, j.cursor, j.due_at, j.attempts, j.max_attempts
+		       j.onboarding_login, j.window_start, j.window_end, j.cursor, j.due_at,
+		       j.attempts, j.max_attempts
 		FROM job_idempotency_keys k
 		JOIN jobs j ON j.id = k.job_id
 		WHERE k.person_id = $1 AND k.forge_instance_id = $2
 		  AND k.source_key = $3 AND k.idempotency_key = $4`,
 		input.PersonID, input.ForgeInstanceID, input.SourceKey, input.IdempotencyKey).
 		Scan(&job.ID, &job.PersonID, &job.ForgeInstanceID, &job.SourceKey,
-			&job.ScanMode, &windowStart, &job.Window.To, &job.Cursor,
+			&job.ScanMode, &job.OnboardingLogin, &windowStart, &job.Window.To, &job.Cursor,
 			&job.DueAt, &job.Attempts, &job.MaxAttempts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CollectionJob{}, false, nil
@@ -273,6 +460,23 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 	}
 	defer rollbackTx(ctx, tx, "collection claim", &claimErr)
 	if _, err := tx.Exec(ctx, `
+		UPDATE jobs j
+		SET status = 'failed', last_error = 'GitHub account resolution target is unavailable',
+		    updated_at = now()
+		WHERE j.status = 'queued' AND j.source_key = $1
+		  AND NOT EXISTS (
+		      SELECT 1 FROM github_accounts ga
+		      WHERE ga.forge_instance_id = j.forge_instance_id AND ga.person_id = j.person_id
+		  )
+		  AND (j.onboarding_login = '' OR NOT EXISTS (
+		      SELECT 1 FROM identity_assignments ia
+		      JOIN identity_keys ik ON ik.id = ia.identity_key_id
+		      WHERE ia.person_id = j.person_id AND ik.forge_instance_id = j.forge_instance_id
+		        AND ik.kind = 'login' AND ik.normalized_value = j.onboarding_login
+		  ))`, SourceGitHubHistory); err != nil {
+		return JobClaim{}, false, fmt.Errorf("fail collection jobs without a GitHub onboarding target: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
 		UPDATE sync_runs sr SET status = 'failed', finished_at = now()
 		FROM jobs j
 		WHERE j.sync_run_id = sr.id AND j.status = 'running'
@@ -292,7 +496,7 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 	var oldRunID *uuid.UUID
 	var windowStart *time.Time
 	err = tx.QueryRow(ctx, `
-		SELECT id, person_id, forge_instance_id, source_key, scan_mode,
+		SELECT id, person_id, forge_instance_id, source_key, scan_mode, onboarding_login,
 		       window_start, window_end, cursor, due_at, attempts, max_attempts, sync_run_id
 		FROM jobs
 		WHERE (status = 'queued' AND GREATEST(due_at, COALESCE(retry_at, due_at),
@@ -302,7 +506,7 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 		                  COALESCE(rate_limit_reset_at, due_at)), created_at
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED`).Scan(&job.ID, &job.PersonID, &job.ForgeInstanceID, &job.SourceKey,
-		&job.ScanMode, &windowStart, &job.Window.To, &job.Cursor, &job.DueAt,
+		&job.ScanMode, &job.OnboardingLogin, &windowStart, &job.Window.To, &job.Cursor, &job.DueAt,
 		&job.Attempts, &job.MaxAttempts, &oldRunID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {
@@ -322,13 +526,23 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 	}
 	job.IdentityKeys = keys
 	var accountNodeID, currentLogin string
+	var accountCreatedAt time.Time
 	var knownRepositories []string
 	if job.SourceKey == SourceGitHubHistory {
-		if err := tx.QueryRow(ctx, `
-			SELECT node_id, login FROM github_accounts
+		err := tx.QueryRow(ctx, `
+			SELECT node_id, login, account_created_at FROM github_accounts
 			WHERE forge_instance_id = $1 AND person_id = $2`,
-			job.ForgeInstanceID, job.PersonID).Scan(&accountNodeID, &currentLogin); err != nil {
+			job.ForgeInstanceID, job.PersonID).Scan(&accountNodeID, &currentLogin, &accountCreatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			currentLogin = job.OnboardingLogin
+			if currentLogin == "" {
+				return JobClaim{}, false, ErrOnboardingTargetUnavailable
+			}
+		} else if err != nil {
 			return JobClaim{}, false, fmt.Errorf("load GitHub account identifiers: %w", err)
+		}
+		if job.ScanMode == "backfill" && job.Window.From.IsZero() && !accountCreatedAt.IsZero() {
+			job.Window.From = accountCreatedAt.UTC()
 		}
 		rows, err := tx.Query(ctx, `
 			SELECT repository FROM github_known_repositories
@@ -471,6 +685,15 @@ func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page 
 	defer rollbackTx(ctx, tx, "collection page persistence", &persistErr)
 	if err := lockJobClaim(ctx, tx, claim.ID, claim.Token); err != nil {
 		return false, err
+	}
+	if successful && page.ResolvedAccount != nil {
+		account := page.ResolvedAccount
+		if _, err := trackGitHubAccountTx(ctx, tx, claim.PersonID, claim.ForgeInstanceID, GitHubAccount{
+			AccountID: account.AccountID, NodeID: account.NodeID, Login: account.Login,
+			AccountCreatedAt: account.CreatedAt,
+		}, claim.OnboardingLogin); err != nil {
+			return false, fmt.Errorf("persist resolved GitHub account: %w", err)
+		}
 	}
 	for _, raw := range page.Events {
 		if err := raw.Validate(claim.ForgeInstanceID); err != nil {
@@ -866,7 +1089,35 @@ func upsertRawEvent(ctx context.Context, tx pgx.Tx, raw event.RawEvent, actorJSO
 	if err != nil {
 		return uuid.Nil, false, fmt.Errorf("persist raw event %s: %w", raw.ExternalID, err)
 	}
+	if err := replaceRawEventActorKeys(ctx, tx, eventID, raw.Actors); err != nil {
+		return uuid.Nil, false, err
+	}
 	return eventID, true, nil
+}
+
+func replaceRawEventActorKeys(ctx context.Context, tx pgx.Tx, rawEventID uuid.UUID, actors []event.Actor) error {
+	if _, err := tx.Exec(ctx, "DELETE FROM raw_event_actor_keys WHERE raw_event_id = $1", rawEventID); err != nil {
+		return fmt.Errorf("delete indexed raw event actor identities: %w", err)
+	}
+	for _, actor := range actors {
+		key := actor.Key
+		normalized, err := identity.Normalize("github", key.IdentityKey.Kind, key.IdentityKey.Value)
+		if err != nil {
+			continue
+		}
+		scopeID := uuid.Nil
+		if key.ForgeInstanceID != nil {
+			scopeID = *key.ForgeInstanceID
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO raw_event_actor_keys (raw_event_id, kind, forge_instance_id, normalized_value)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT DO NOTHING`,
+			rawEventID, key.IdentityKey.Kind, scopeID, normalized); err != nil {
+			return fmt.Errorf("index raw event actor identity: %w", err)
+		}
+	}
+	return nil
 }
 
 func advanceCollectionCursor(ctx context.Context, tx pgx.Tx, claim JobClaim, cursor string, scanComplete bool) error {
