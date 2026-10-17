@@ -190,6 +190,33 @@ func (s *Store) ReplaceNormalizedActions(ctx context.Context, rawEventID uuid.UU
 		}
 		return fmt.Errorf("lock raw event: %w", err)
 	}
+	var activeVersion int
+	err = tx.QueryRow(ctx, `
+		SELECT active_version FROM raw_event_normalization_state
+		WHERE raw_event_id = $1 FOR UPDATE`, rawEventID).Scan(&activeVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO raw_event_normalization_state (raw_event_id, active_version)
+			VALUES ($1, $2) ON CONFLICT (raw_event_id) DO NOTHING`, rawEventID, version); err != nil {
+			return fmt.Errorf("initialize active normalizer version: %w", err)
+		}
+		if err := tx.QueryRow(ctx, `
+			SELECT active_version FROM raw_event_normalization_state
+			WHERE raw_event_id = $1 FOR UPDATE`, rawEventID).Scan(&activeVersion); err != nil {
+			return fmt.Errorf("load initialized normalizer version: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("load active normalizer version: %w", err)
+	}
+	activate := version >= activeVersion
+	if activate && version > activeVersion {
+		if _, err := tx.Exec(ctx, `
+			UPDATE raw_event_normalization_state
+			SET active_version = $2, updated_at = now() WHERE raw_event_id = $1`,
+			rawEventID, version); err != nil {
+			return fmt.Errorf("advance active normalizer version: %w", err)
+		}
+	}
 	type personLink struct {
 		personID        uuid.UUID
 		role            string
@@ -200,9 +227,10 @@ func (s *Store) ReplaceNormalizedActions(ctx context.Context, rawEventID uuid.UU
 		SELECT ne.action_key, ep.person_id, ep.role, ep.identity_claim_id
 		FROM normalized_events ne
 		JOIN event_people ep ON ep.normalized_event_id = ne.id
-		WHERE ne.raw_event_id = $1 AND ne.is_current
+		WHERE ne.raw_event_id = $1
+		  AND (ne.is_current OR ne.normalizer_version = $2)
 		ORDER BY ne.action_key, ep.person_id, ep.role
-		FOR UPDATE OF ne`, rawEventID)
+		FOR UPDATE OF ne`, rawEventID, version)
 	if err != nil {
 		return fmt.Errorf("load current event person links: %w", err)
 	}
@@ -220,10 +248,12 @@ func (s *Store) ReplaceNormalizedActions(ctx context.Context, rawEventID uuid.UU
 		return fmt.Errorf("iterate current event person links: %w", err)
 	}
 	rows.Close()
-	if _, err := tx.Exec(ctx,
-		"UPDATE normalized_events SET is_current = false WHERE raw_event_id = $1 AND is_current",
-		rawEventID); err != nil {
-		return fmt.Errorf("mark prior normalized actions non-current: %w", err)
+	if activate {
+		if _, err := tx.Exec(ctx,
+			"UPDATE normalized_events SET is_current = false WHERE raw_event_id = $1 AND is_current",
+			rawEventID); err != nil {
+			return fmt.Errorf("mark prior normalized actions non-current: %w", err)
+		}
 	}
 	for _, action := range actions {
 		var normalizedEventID uuid.UUID
@@ -235,16 +265,16 @@ func (s *Store) ReplaceNormalizedActions(ctx context.Context, rawEventID uuid.UU
 				COALESCE((SELECT occurred_at FROM normalized_events
 				          WHERE raw_event_id = $2 AND action_key = $4
 				          ORDER BY created_at, normalizer_version LIMIT 1), $6),
-				$7, $8, $9, true)
+				$7, $8, $9, $10)
 			ON CONFLICT (raw_event_id, normalizer_version, action_key)
 			DO UPDATE SET kind = EXCLUDED.kind,
 			              project = EXCLUDED.project,
 			              title = EXCLUDED.title,
 			              url = EXCLUDED.url,
-			              is_current = true
+			              is_current = EXCLUDED.is_current
 			RETURNING id, occurred_at`,
 			uuid.New(), rawEventID, version, action.ActionKey, action.Kind, action.OccurredAt,
-			action.Project, action.Title, action.URL).Scan(&normalizedEventID, &normalizedOccurredAt)
+			action.Project, action.Title, action.URL, activate).Scan(&normalizedEventID, &normalizedOccurredAt)
 		if err != nil {
 			return fmt.Errorf("save normalized action %s: %w", action.ActionKey, err)
 		}

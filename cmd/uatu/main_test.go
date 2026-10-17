@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/project-uatu/backend/internal/config"
 	"github.com/project-uatu/backend/internal/store"
@@ -20,9 +21,9 @@ func TestRun_usageErrors(t *testing.T) {
 	}{
 		{name: "unknown command", args: []string{"migrate"}},
 		{name: "serve with arguments", args: []string{"serve", "octocat"}},
-		{name: "collect without users", args: []string{"collect"}},
 		{name: "collect invalid login", args: []string{"collect", "-octocat"}},
 		{name: "collect invalid fallback login", args: []string{"collect"}, users: []string{"bad_login"}},
+		{name: "collect loop with users", args: []string{"collect", "--loop", "octocat"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -34,6 +35,23 @@ func TestRun_usageErrors(t *testing.T) {
 				t.Fatalf("run(%q) error = %v, want usage error", tt.args, err)
 			}
 		})
+	}
+}
+
+func TestRun_collectWithoutUsersRunsTheQueueWorker(t *testing.T) {
+	cfg := config.Config{
+		DatabaseURL:            "not-a-database-url",
+		DatabaseMinConns:       0,
+		DatabaseMaxConns:       1,
+		DatabaseConnectTimeout: time.Second,
+	}
+	err := run(t.Context(), []string{"collect"}, cfg, testLogger(), io.Discard)
+	var usageErr *usageError
+	if errors.As(err, &usageErr) {
+		t.Fatalf("run(collect) error = %v, want database connection error, not usage error", err)
+	}
+	if err == nil {
+		t.Fatal("run(collect) error = nil, want database connection error")
 	}
 }
 

@@ -10,6 +10,25 @@ import (
 // Kind identifies the type of an external identity key.
 type Kind string
 
+// Key is a typed identifier observed on a source event.
+type Key struct {
+	Kind  Kind   `json:"kind"`
+	Value string `json:"value"`
+}
+
+// Validate checks that a typed identity key contains a supported kind and value.
+func (k Key) Validate() error {
+	if k.Value == "" {
+		return errors.New("identity key value is required")
+	}
+	switch k.Kind {
+	case KindEmail, KindAccountID, KindLogin:
+		return nil
+	default:
+		return fmt.Errorf("unsupported identity kind %q", k.Kind)
+	}
+}
+
 const (
 	KindEmail     Kind = "email"
 	KindAccountID Kind = "account_id"

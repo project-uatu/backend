@@ -14,13 +14,16 @@ import (
 	"github.com/project-uatu/backend/internal/collector"
 	"github.com/project-uatu/backend/internal/config"
 	"github.com/project-uatu/backend/internal/github"
+	"github.com/project-uatu/backend/internal/normalizer"
 	"github.com/project-uatu/backend/internal/server"
 	"github.com/project-uatu/backend/internal/store"
 )
 
 const usage = `Usage:
   uatu [serve]             serve stored results over HTTP (default)
-  uatu collect [user ...]  collect data for users, or UATU_USERS, and exit
+  uatu collect [user ...]  collect legacy repository snapshots for users
+  uatu collect             process due event work once when no users are configured
+  uatu collect --loop      run the event worker until interrupted
   uatu help                show this help
 `
 
@@ -71,6 +74,15 @@ func run(ctx context.Context, args []string, cfg config.Config, logger *slog.Log
 		}
 		return serve(ctx, cfg, logger)
 	case "collect":
+		if len(args) > 0 && args[0] == "--loop" {
+			if len(args) != 1 {
+				return &usageError{err: fmt.Errorf("collect --loop takes no user arguments")}
+			}
+			return collectWork(ctx, cfg, true, logger)
+		}
+		if len(args) == 0 && len(cfg.Users) == 0 {
+			return collectWork(ctx, cfg, false, logger)
+		}
 		users, err := config.ParseUsers(args, cfg.Users)
 		if err != nil {
 			return &usageError{err: err}
@@ -103,6 +115,28 @@ func collect(ctx context.Context, cfg config.Config, users []string, logger *slo
 	defer db.Close()
 	c := collector.New(db, github.NewClient(cfg.GitHubToken, nil))
 	return collectUsers(ctx, c, collector.Sources(), users, logger)
+}
+
+func collectWork(ctx context.Context, cfg config.Config, loop bool, logger *slog.Logger) error {
+	db, err := store.Open(ctx, storeOptions(cfg))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	host, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("get collector hostname: %w", err)
+	}
+	runner, err := collector.NewRunner(db, nil, normalizer.New(), logger, collector.RunnerOptions{
+		Owner: fmt.Sprintf("%s-%d", host, os.Getpid()),
+	})
+	if err != nil {
+		return fmt.Errorf("configure collection worker: %w", err)
+	}
+	if loop {
+		return runner.Run(ctx)
+	}
+	return runner.Drain(ctx)
 }
 
 func storeOptions(cfg config.Config) store.Options {
