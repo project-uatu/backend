@@ -83,12 +83,14 @@ type TimelineBucket struct {
 // CoverageInterval describes which part of a requested source history was
 // completed or known to have a gap.
 type CoverageInterval struct {
-	SourceKey  string
-	StartsAt   time.Time
-	EndsAt     time.Time
-	Status     string
-	GapReason  string
-	RecordedAt time.Time
+	ForgeInstanceID uuid.UUID
+	SourceKey       string
+	StartsAt        time.Time
+	EndsAt          time.Time
+	Status          string
+	GapReason       string
+	CoverageScope   string
+	RecordedAt      time.Time
 }
 
 // SyncRun is one attempt to collect a source for a person.
@@ -580,7 +582,8 @@ func (s *Store) Coverage(ctx context.Context, personID, forgeInstanceID uuid.UUI
 		return nil, errors.New("coverage query requires person, source, and a non-empty time range")
 	}
 	rows, err := s.db.Query(ctx, `
-		SELECT source_key, range_start, range_end, status, gap_reason, recorded_at
+		SELECT forge_instance_id, source_key, range_start, range_end, status, gap_reason,
+		       coverage_scope, recorded_at
 		FROM sync_coverage
 		WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3
 		  AND range_start < $5 AND range_end > $4
@@ -593,8 +596,9 @@ func (s *Store) Coverage(ctx context.Context, personID, forgeInstanceID uuid.UUI
 	intervals := make([]CoverageInterval, 0)
 	for rows.Next() {
 		var interval CoverageInterval
-		if err := rows.Scan(&interval.SourceKey, &interval.StartsAt, &interval.EndsAt,
-			&interval.Status, &interval.GapReason, &interval.RecordedAt); err != nil {
+		if err := rows.Scan(&interval.ForgeInstanceID, &interval.SourceKey,
+			&interval.StartsAt, &interval.EndsAt, &interval.Status, &interval.GapReason,
+			&interval.CoverageScope, &interval.RecordedAt); err != nil {
 			return nil, fmt.Errorf("scan sync coverage: %w", err)
 		}
 		interval.StartsAt = interval.StartsAt.UTC()
@@ -604,6 +608,41 @@ func (s *Store) Coverage(ctx context.Context, personID, forgeInstanceID uuid.UUI
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate sync coverage: %w", err)
+	}
+	return intervals, nil
+}
+
+// CoverageForPerson returns all source coverage intervals overlapping a range.
+func (s *Store) CoverageForPerson(ctx context.Context, personID uuid.UUID, from, to time.Time) ([]CoverageInterval, error) {
+	if personID == uuid.Nil || from.IsZero() || to.IsZero() || !from.Before(to) {
+		return nil, errors.New("coverage query requires person and a non-empty time range")
+	}
+	rows, err := s.db.Query(ctx, `
+		SELECT forge_instance_id, source_key, range_start, range_end, status, gap_reason,
+		       coverage_scope, recorded_at
+		FROM sync_coverage
+		WHERE person_id = $1 AND range_start < $3 AND range_end > $2
+		ORDER BY range_start, range_end, recorded_at`,
+		personID, from.UTC(), to.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("query person coverage: %w", err)
+	}
+	defer rows.Close()
+	intervals := make([]CoverageInterval, 0)
+	for rows.Next() {
+		var interval CoverageInterval
+		if err := rows.Scan(&interval.ForgeInstanceID, &interval.SourceKey,
+			&interval.StartsAt, &interval.EndsAt, &interval.Status, &interval.GapReason,
+			&interval.CoverageScope, &interval.RecordedAt); err != nil {
+			return nil, fmt.Errorf("scan person coverage: %w", err)
+		}
+		interval.StartsAt = interval.StartsAt.UTC()
+		interval.EndsAt = interval.EndsAt.UTC()
+		interval.RecordedAt = interval.RecordedAt.UTC()
+		intervals = append(intervals, interval)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate person coverage: %w", err)
 	}
 	return intervals, nil
 }

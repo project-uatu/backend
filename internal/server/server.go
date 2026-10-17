@@ -7,53 +7,167 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
-	"github.com/project-uatu/backend/internal/github"
+	"github.com/google/uuid"
 	"github.com/project-uatu/backend/internal/store"
 )
 
-type snapshotStore interface {
-	Get(context.Context, store.Source, string) (store.Snapshot, bool, error)
+type historyStore interface {
+	Timeline(context.Context, uuid.UUID, time.Time, time.Time, int) ([]store.TimelineEntry, error)
+	CoverageForPerson(context.Context, uuid.UUID, time.Time, time.Time) ([]store.CoverageInterval, error)
+	ContributionCounts(context.Context, uuid.UUID, time.Time, time.Time) ([]store.ContributionCount, error)
 }
 
 // NewHandler returns the HTTP API handler. Handlers only read stored data;
 // collection happens in the collector.
-func NewHandler(s snapshotStore, logger *slog.Logger) http.Handler {
+func NewHandler(s historyStore, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	mux.HandleFunc("GET /github/users/{user}/repositories", repositoriesHandler(s, logger))
+	mux.HandleFunc("GET /v1/persons/{id}/activity", activityHandler(s, logger))
+	mux.HandleFunc("GET /v1/persons/{id}/coverage", coverageHandler(s, logger))
+	mux.HandleFunc("GET /v1/persons/{id}/counts", countsHandler(s, logger))
 	return mux
 }
 
-func repositoriesHandler(s snapshotStore, logger *slog.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		user := r.PathValue("user")
-		if !github.ValidLogin(user) {
-			writeError(w, r, logger, http.StatusBadRequest, "invalid GitHub login")
-			return
-		}
-		snapshot, ok, err := s.Get(r.Context(), store.SourceGitHubRepositories, user)
-		if err != nil {
-			logger.ErrorContext(r.Context(), "read stored snapshot", "source", store.SourceGitHubRepositories, "user", user, "err", err)
-			writeError(w, r, logger, http.StatusInternalServerError, "failed to read stored data")
-			return
-		}
-		if !ok {
-			writeError(w, r, logger, http.StatusNotFound, "no stored data for user")
-			return
-		}
+type activityEntry struct {
+	EventID    uuid.UUID `json:"event_id"`
+	Kind       string    `json:"kind"`
+	Role       string    `json:"role"`
+	OccurredAt time.Time `json:"occurred_at"`
+	Project    string    `json:"project"`
+	Title      string    `json:"title"`
+	URL        string    `json:"url"`
+}
 
-		w.Header().Set("Content-Type", "application/json")
-		if !snapshot.FetchedAt.IsZero() {
-			w.Header().Set("Last-Modified", snapshot.FetchedAt.UTC().Format(http.TimeFormat))
+type coverageEntry struct {
+	ForgeInstanceID uuid.UUID `json:"forge_instance_id"`
+	Source          string    `json:"source"`
+	From            time.Time `json:"from"`
+	To              time.Time `json:"to"`
+	Status          string    `json:"status"`
+	GapReason       string    `json:"gap_reason,omitempty"`
+	Scope           string    `json:"scope"`
+	RecordedAt      time.Time `json:"recorded_at"`
+}
+
+type countEntry struct {
+	ForgeInstanceID uuid.UUID `json:"forge_instance_id"`
+	Date            time.Time `json:"date"`
+	Metric          string    `json:"metric"`
+	Kind            string    `json:"kind,omitempty"`
+	Value           int64     `json:"value"`
+	ObservedAt      time.Time `json:"observed_at"`
+}
+
+func activityHandler(s historyStore, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		personID, from, to, ok := requestedPersonRange(w, r, logger)
+		if !ok {
+			return
 		}
-		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write(snapshot.Data); err != nil {
-			logger.ErrorContext(r.Context(), "write HTTP response", "user", user, "err", err)
+		limit := 100
+		if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+			var err error
+			limit, err = strconv.Atoi(rawLimit)
+			if err != nil || limit < 1 || limit > 500 {
+				writeError(w, r, logger, http.StatusBadRequest, "limit must be between 1 and 500")
+				return
+			}
 		}
+		entries, err := s.Timeline(r.Context(), personID, from, to, limit)
+		if err != nil {
+			logger.ErrorContext(r.Context(), "read person activity", "person_id", personID, "err", err)
+			writeError(w, r, logger, http.StatusInternalServerError, "failed to read activity")
+			return
+		}
+		response := make([]activityEntry, 0, len(entries))
+		for _, entry := range entries {
+			response = append(response, activityEntry{
+				EventID: entry.EventID, Kind: entry.Kind, Role: entry.Role,
+				OccurredAt: entry.OccurredAt, Project: entry.Project,
+				Title: entry.Title, URL: entry.URL,
+			})
+		}
+		writeJSON(w, r, logger, response)
+	}
+}
+
+func coverageHandler(s historyStore, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		personID, from, to, ok := requestedPersonRange(w, r, logger)
+		if !ok {
+			return
+		}
+		intervals, err := s.CoverageForPerson(r.Context(), personID, from, to)
+		if err != nil {
+			logger.ErrorContext(r.Context(), "read person coverage", "person_id", personID, "err", err)
+			writeError(w, r, logger, http.StatusInternalServerError, "failed to read coverage")
+			return
+		}
+		response := make([]coverageEntry, 0, len(intervals))
+		for _, interval := range intervals {
+			response = append(response, coverageEntry{
+				ForgeInstanceID: interval.ForgeInstanceID, Source: interval.SourceKey,
+				From: interval.StartsAt, To: interval.EndsAt, Status: interval.Status,
+				GapReason: interval.GapReason, Scope: interval.CoverageScope,
+				RecordedAt: interval.RecordedAt,
+			})
+		}
+		writeJSON(w, r, logger, response)
+	}
+}
+
+func countsHandler(s historyStore, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		personID, from, to, ok := requestedPersonRange(w, r, logger)
+		if !ok {
+			return
+		}
+		counts, err := s.ContributionCounts(r.Context(), personID, from, to)
+		if err != nil {
+			logger.ErrorContext(r.Context(), "read person contribution counts", "person_id", personID, "err", err)
+			writeError(w, r, logger, http.StatusInternalServerError, "failed to read contribution counts")
+			return
+		}
+		response := make([]countEntry, 0, len(counts))
+		for _, count := range counts {
+			response = append(response, countEntry{
+				ForgeInstanceID: count.ForgeInstanceID, Date: count.ActivityDate,
+				Metric: count.Metric, Kind: count.Kind, Value: count.Value,
+				ObservedAt: count.ObservedAt,
+			})
+		}
+		writeJSON(w, r, logger, response)
+	}
+}
+
+func requestedPersonRange(w http.ResponseWriter, r *http.Request, logger *slog.Logger) (uuid.UUID, time.Time, time.Time, bool) {
+	personID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, r, logger, http.StatusBadRequest, "invalid person ID")
+		return uuid.Nil, time.Time{}, time.Time{}, false
+	}
+	from, err := time.Parse(time.RFC3339Nano, r.URL.Query().Get("from"))
+	if err != nil {
+		writeError(w, r, logger, http.StatusBadRequest, "from must be an RFC3339 timestamp")
+		return uuid.Nil, time.Time{}, time.Time{}, false
+	}
+	to, err := time.Parse(time.RFC3339Nano, r.URL.Query().Get("to"))
+	if err != nil || !from.Before(to) {
+		writeError(w, r, logger, http.StatusBadRequest, "to must be an RFC3339 timestamp after from")
+		return uuid.Nil, time.Time{}, time.Time{}, false
+	}
+	return personID, from, to, true
+}
+
+func writeJSON(w http.ResponseWriter, r *http.Request, logger *slog.Logger, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		logger.ErrorContext(r.Context(), "write JSON response", "err", err)
 	}
 }
 

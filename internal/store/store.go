@@ -8,23 +8,11 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Source identifies where a stored result was collected from.
-type Source string
-
-// SourceGitHubRepositories identifies GitHub repository listings.
-const SourceGitHubRepositories Source = "github_repositories"
-
-// Snapshot is a collected result for a user from a source.
-type Snapshot struct {
-	Source    Source
-	User      string
-	Data      []byte
-	FetchedAt time.Time
-}
+// SourceGitHubHistory identifies person-centric GitHub activity collection.
+const SourceGitHubHistory = "github_history"
 
 // Options configures the PostgreSQL connection pool.
 type Options struct {
@@ -98,37 +86,4 @@ func withDefaultSSLMode(databaseURL, sslMode string) (string, error) {
 // Close releases the underlying database connection pool.
 func (s *Store) Close() {
 	s.db.Close()
-}
-
-// Save stores data as the latest snapshot for user and source.
-func (s *Store) Save(ctx context.Context, source Source, user string, data []byte) error {
-	_, err := s.db.Exec(ctx, `
-		INSERT INTO snapshots (source, username, data, fetched_at)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (source, username)
-		DO UPDATE SET data = EXCLUDED.data, fetched_at = EXCLUDED.fetched_at`,
-		string(source), user, data, time.Now().UTC())
-	if err != nil {
-		return fmt.Errorf("save snapshot %s/%s: %w", source, user, err)
-	}
-	return nil
-}
-
-// Get returns the latest snapshot for user and source. The boolean is false
-// when nothing has been stored yet.
-func (s *Store) Get(ctx context.Context, source Source, user string) (Snapshot, bool, error) {
-	var snapshot Snapshot
-	snapshot.Source = source
-	snapshot.User = user
-	err := s.db.QueryRow(ctx,
-		`SELECT data, fetched_at FROM snapshots WHERE source = $1 AND username = $2`,
-		string(source), user).Scan(&snapshot.Data, &snapshot.FetchedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Snapshot{}, false, nil
-	}
-	if err != nil {
-		return Snapshot{}, false, fmt.Errorf("get snapshot %s/%s: %w", source, user, err)
-	}
-	snapshot.FetchedAt = snapshot.FetchedAt.UTC()
-	return snapshot, true, nil
 }

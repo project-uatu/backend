@@ -8,10 +8,11 @@ This repository contains the Go backend. It collects activity from public
 sources, stores it, and exposes it through an HTTP API. The frontend will live
 in a separate repository.
 
-Uatu is in early development. The current collector fetches public GitHub
-repository snapshots for configured users, stores them in PostgreSQL, and
-serves them through a read-only API. The durable collection worker is in place,
-but contribution-history connectors are not yet registered.
+Uatu collects public GitHub contribution history for tracked people, stores
+raw records and normalized timeline actions in PostgreSQL, and serves
+time-bounded history, source aggregates and collection coverage through a
+read-only API. GitHub release coverage is limited to known public repositories;
+the API does not claim complete account-wide release history.
 
 ## Getting started
 
@@ -32,18 +33,33 @@ In another terminal, configure the database URL and run the collector and API:
 export UATU_DATABASE_URL='postgres://uatu:local-only@localhost:5432/uatu?sslmode=disable'
 go run ./cmd/uatu collect octocat
 go run ./cmd/uatu serve
-curl http://localhost:3000/github/users/octocat/repositories
 ```
 
-Set `GITHUB_TOKEN` to raise GitHub API rate limits. The token is optional for
-local development. `sslmode=disable` is for this local-only database; use
-verified TLS for shared or production databases.
+`collect octocat` resolves the immutable GitHub account ID, tracks the account,
+and runs a resumable public-history backfill from the account's creation date.
+The collector records authored issues and pull requests, reviews, releases in
+known public repositories, source-reported contribution counts and search
+coverage gaps. Repeating the command reuses the person record and schedules an
+incremental scan with a seven-day overlap after a successful backfill.
+
+Set `GITHUB_TOKEN` to increase API limits. It is optional for local development.
+The collector verifies repository visibility before storing search results and
+never persists private repository activity. `sslmode=disable` is for this
+local-only database; use verified TLS for shared or production databases.
 
 `collect` with no user arguments processes due queued event work once, and
-`collect --loop` continuously polls for work. Until a source connector is
-registered, these commands provide the worker infrastructure but do not fetch
-contribution history. Passing users (or setting `UATU_USERS`) runs the existing
-GitHub repository snapshot collector.
+`collect --loop` continuously polls for work. `UATU_USERS` can provide usernames
+for a one-shot `collect`.
+
+After collection, use the logged person ID to query the timeline and source
+metadata. `from` and `to` are required RFC3339 timestamps; `limit` is optional
+for activity and defaults to 100 (maximum 500).
+
+```sh
+curl 'http://localhost:3000/v1/persons/<person-id>/activity?from=2020-01-01T00:00:00Z&to=2021-01-01T00:00:00Z'
+curl 'http://localhost:3000/v1/persons/<person-id>/coverage?from=2020-01-01T00:00:00Z&to=2021-01-01T00:00:00Z'
+curl 'http://localhost:3000/v1/persons/<person-id>/counts?from=2020-01-01T00:00:00Z&to=2021-01-01T00:00:00Z'
+```
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -53,8 +69,8 @@ GitHub repository snapshot collector.
 | `UATU_DB_MAX_CONNS` | `10` | Maximum connections in the pool |
 | `UATU_DB_CONNECT_TIMEOUT` | `5s` | Timeout when opening a database connection |
 | `UATU_ADDR` | `:3000` | HTTP listen address |
-| `UATU_USERS` | | Comma-separated GitHub users for `collect` |
-| `GITHUB_TOKEN` | | Optional GitHub API token |
+| `UATU_USERS` | | Comma-separated GitHub users to track and collect |
+| `GITHUB_TOKEN` | | Optional GitHub API token for higher public-data limits |
 
 Run `go run ./cmd/uatu help` to see the available commands.
 

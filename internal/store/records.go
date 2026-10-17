@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,6 +27,16 @@ type ForgeInstance struct {
 	Provider  string
 	BaseURL   string
 	CreatedAt time.Time
+}
+
+// GitHubAccount stores immutable and current GitHub profile identifiers.
+type GitHubAccount struct {
+	PersonID         uuid.UUID
+	ForgeInstanceID  uuid.UUID
+	AccountID        string
+	NodeID           string
+	Login            string
+	AccountCreatedAt time.Time
 }
 
 // IdentityKey is a source-specific identifier or a global email address.
@@ -126,6 +138,144 @@ func (s *Store) CreateForgeInstance(ctx context.Context, provider, baseURL strin
 		return ForgeInstance{}, fmt.Errorf("create forge instance: %w", err)
 	}
 	return instance, nil
+}
+
+// TrackGitHubAccount creates or finds a person by immutable account ID and
+// refreshes the account's current login without changing person identity.
+func (s *Store) TrackGitHubAccount(ctx context.Context, forgeInstanceID uuid.UUID, account GitHubAccount) (tracked GitHubAccount, trackErr error) {
+	accountID, parseErr := strconv.ParseInt(account.AccountID, 10, 64)
+	if forgeInstanceID == uuid.Nil || parseErr != nil || accountID <= 0 ||
+		account.NodeID == "" || account.Login == "" || account.AccountCreatedAt.IsZero() {
+		return GitHubAccount{}, errors.New("GitHub account requires forge, account ID, node ID, login and creation time")
+	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return GitHubAccount{}, fmt.Errorf("begin GitHub account tracking: %w", err)
+	}
+	defer rollbackTx(ctx, tx, "GitHub account tracking", &trackErr)
+	lockKey := fmt.Sprintf("github:%s:%s", forgeInstanceID, account.AccountID)
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", lockKey); err != nil {
+		return GitHubAccount{}, fmt.Errorf("lock GitHub account identity: %w", err)
+	}
+
+	var personID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		SELECT person_id FROM github_accounts
+		WHERE forge_instance_id = $1 AND account_id = $2 FOR UPDATE`,
+		forgeInstanceID, account.AccountID).Scan(&personID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		personID, err = assignedPersonForGitHubID(ctx, tx, forgeInstanceID, account.AccountID)
+		if err != nil {
+			return GitHubAccount{}, err
+		}
+		if personID == uuid.Nil {
+			personID = uuid.New()
+			if _, err := tx.Exec(ctx, "INSERT INTO persons (id) VALUES ($1)", personID); err != nil {
+				return GitHubAccount{}, fmt.Errorf("create tracked GitHub person: %w", err)
+			}
+		}
+	} else if err != nil {
+		return GitHubAccount{}, fmt.Errorf("find tracked GitHub account: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO github_accounts
+			(forge_instance_id, person_id, account_id, node_id, login, account_created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (forge_instance_id, account_id)
+		DO UPDATE SET node_id = EXCLUDED.node_id, login = EXCLUDED.login, updated_at = now()`,
+		forgeInstanceID, personID, account.AccountID, account.NodeID, account.Login,
+		account.AccountCreatedAt.UTC()); err != nil {
+		return GitHubAccount{}, fmt.Errorf("save GitHub account identifiers: %w", err)
+	}
+	if err := ensureGitHubIdentity(ctx, tx, forgeInstanceID, personID, "account_id", account.AccountID); err != nil {
+		return GitHubAccount{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM identity_assignments ia
+		USING identity_keys ik
+		WHERE ia.identity_key_id = ik.id AND ia.person_id = $1
+		  AND ik.forge_instance_id = $2 AND ik.kind = 'login'
+		  AND ik.normalized_value <> $3`,
+		personID, forgeInstanceID, strings.ToLower(account.Login)); err != nil {
+		return GitHubAccount{}, fmt.Errorf("retire prior GitHub login assignment: %w", err)
+	}
+	if err := ensureGitHubIdentity(ctx, tx, forgeInstanceID, personID, "login", account.Login); err != nil {
+		return GitHubAccount{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return GitHubAccount{}, fmt.Errorf("commit GitHub account tracking: %w", err)
+	}
+	account.PersonID = personID
+	account.ForgeInstanceID = forgeInstanceID
+	return account, nil
+}
+
+func assignedPersonForGitHubID(ctx context.Context, tx pgx.Tx, forgeInstanceID uuid.UUID, accountID string) (uuid.UUID, error) {
+	var personID uuid.UUID
+	err := tx.QueryRow(ctx, `
+		SELECT ia.person_id FROM identity_assignments ia
+		JOIN identity_keys ik ON ik.id = ia.identity_key_id
+		WHERE ik.forge_instance_id = $1 AND ik.kind = 'account_id'
+		  AND ik.normalized_value = $2`, forgeInstanceID, accountID).Scan(&personID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, nil
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("find person assigned to GitHub account ID: %w", err)
+	}
+	return personID, nil
+}
+
+func ensureGitHubIdentity(ctx context.Context, tx pgx.Tx, forgeInstanceID, personID uuid.UUID, kind, value string) error {
+	normalized := value
+	if kind == "login" {
+		normalized = strings.ToLower(value)
+	}
+	keyID := uuid.New()
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO identity_keys (id, forge_instance_id, kind, value, normalized_value)
+		VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`,
+		keyID, forgeInstanceID, kind, value, normalized); err != nil {
+		return fmt.Errorf("insert GitHub %s identity: %w", kind, err)
+	}
+	if err := tx.QueryRow(ctx, `
+		SELECT id FROM identity_keys
+		WHERE forge_instance_id = $1 AND kind = $2 AND normalized_value = $3 FOR UPDATE`,
+		forgeInstanceID, kind, normalized).Scan(&keyID); err != nil {
+		return fmt.Errorf("load GitHub %s identity: %w", kind, err)
+	}
+	var assignedPerson uuid.UUID
+	err := tx.QueryRow(ctx,
+		"SELECT person_id FROM identity_assignments WHERE identity_key_id = $1", keyID).Scan(&assignedPerson)
+	switch {
+	case err == nil && assignedPerson == personID:
+		return nil
+	case err == nil:
+		if kind == "login" {
+			return errors.New("GitHub login is already assigned to another person")
+		}
+		return nil
+	case !errors.Is(err, pgx.ErrNoRows):
+		return fmt.Errorf("check GitHub %s identity assignment: %w", kind, err)
+	}
+	claimID := uuid.New()
+	evidence, err := json.Marshal(map[string]string{"provider": "github", "kind": kind, "value": value})
+	if err != nil {
+		return fmt.Errorf("encode GitHub identity evidence: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO identity_claims
+			(id, identity_key_id, person_id, method, evidence, disposition)
+		VALUES ($1, $2, $3, 'github_account_resolution', $4, 'accepted')`,
+		claimID, keyID, personID, evidence); err != nil {
+		return fmt.Errorf("record GitHub %s identity claim: %w", kind, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO identity_assignments (identity_key_id, person_id, claim_id, claim_disposition)
+		VALUES ($1, $2, $3, 'accepted')`, keyID, personID, claimID); err != nil {
+		return fmt.Errorf("assign GitHub %s identity: %w", kind, err)
+	}
+	return nil
 }
 
 // ClaimIdentity stores identity evidence and updates the accepted assignment

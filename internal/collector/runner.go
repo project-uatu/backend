@@ -178,11 +178,18 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 		if err := r.store.RenewCollectionLease(ctx, claim, r.options.LeaseDuration); err != nil {
 			return fmt.Errorf("renew collection lease before page: %w", err)
 		}
-		bucket := connector.QuotaBucket()
 		request := event.PageRequest{
 			PersonID: claim.PersonID, ForgeInstanceID: claim.ForgeInstanceID,
-			Source: source, IdentityKeys: claim.IdentityKeys, Window: claim.Window,
+			Source: source, ScanMode: claim.ScanMode,
+			IdentityKeys: claim.IdentityKeys, Window: claim.Window,
 			Cursor: claim.Cursor, PageSize: r.options.PageSize,
+			AccountNodeID: claim.AccountNodeID, CurrentLogin: claim.CurrentAccountLogin,
+		}
+		bucket := connector.QuotaBucket()
+		if dynamicQuota, ok := connector.(interface {
+			QuotaBucketFor(event.PageRequest) string
+		}); ok {
+			bucket = dynamicQuota.QuotaBucketFor(request)
 		}
 		if err := request.Validate(); err != nil {
 			return r.store.FailCollectionJob(ctx, claim, "invalid collection request")

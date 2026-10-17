@@ -10,102 +10,155 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/project-uatu/backend/internal/store"
 )
 
 type testStore struct {
-	snapshot store.Snapshot
-	found    bool
+	entries  []store.TimelineEntry
+	coverage []store.CoverageInterval
+	counts   []store.ContributionCount
 	err      error
+	person   uuid.UUID
+	from     time.Time
+	to       time.Time
+	limit    int
 	calls    int
 }
 
-func (s *testStore) Get(_ context.Context, _ store.Source, _ string) (store.Snapshot, bool, error) {
+func (s *testStore) CoverageForPerson(_ context.Context, person uuid.UUID, from, to time.Time) ([]store.CoverageInterval, error) {
 	s.calls++
-	return s.snapshot, s.found, s.err
+	s.person, s.from, s.to = person, from, to
+	return s.coverage, s.err
 }
 
-func TestHandler_repositories(t *testing.T) {
-	fetchedAt := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
-	stored := store.Snapshot{
-		Source: store.SourceGitHubRepositories, User: "octocat",
-		Data: []byte(`{"repositories":["repo-one"]}`), FetchedAt: fetchedAt,
+func (s *testStore) ContributionCounts(_ context.Context, person uuid.UUID, from, to time.Time) ([]store.ContributionCount, error) {
+	s.calls++
+	s.person, s.from, s.to = person, from, to
+	return s.counts, s.err
+}
+
+func (s *testStore) Timeline(_ context.Context, person uuid.UUID, from, to time.Time, limit int) ([]store.TimelineEntry, error) {
+	s.calls++
+	s.person, s.from, s.to, s.limit = person, from, to, limit
+	return s.entries, s.err
+}
+
+func TestHandler_activity(t *testing.T) {
+	personID := uuid.New()
+	entry := store.TimelineEntry{
+		EventID: uuid.New(), Kind: "issue_opened", Role: "author",
+		OccurredAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		Project:    "owner/repo", Title: "A contribution", URL: "https://github.com/owner/repo/issues/1",
 	}
 	tests := []struct {
-		name         string
-		path         string
-		store        *testStore
-		wantStatus   int
-		wantBody     string
-		wantModified string
-		wantGets     int
+		name      string
+		path      string
+		store     *testStore
+		status    int
+		body      string
+		wantCalls int
+		wantLimit int
 	}{
 		{
-			name:         "stored",
-			path:         "/github/users/octocat/repositories",
-			store:        &testStore{snapshot: stored, found: true},
-			wantStatus:   http.StatusOK,
-			wantBody:     `{"repositories":["repo-one"]}`,
-			wantModified: fetchedAt.Format(http.TimeFormat),
-			wantGets:     1,
+			name:      "stored activity",
+			path:      "/v1/persons/" + personID.String() + "/activity?from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z",
+			store:     &testStore{entries: []store.TimelineEntry{entry}},
+			status:    http.StatusOK,
+			body:      `[{"event_id":"` + entry.EventID.String() + `","kind":"issue_opened","role":"author","occurred_at":"2026-01-02T03:04:05Z","project":"owner/repo","title":"A contribution","url":"https://github.com/owner/repo/issues/1"}]` + "\n",
+			wantCalls: 1, wantLimit: 100,
 		},
 		{
-			name:       "missing",
-			path:       "/github/users/octocat/repositories",
-			store:      &testStore{},
-			wantStatus: http.StatusNotFound,
-			wantBody:   "{\"error\":\"no stored data for user\"}\n",
-			wantGets:   1,
+			name:  "invalid person",
+			path:  "/v1/persons/nope/activity?from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z",
+			store: &testStore{}, status: http.StatusBadRequest,
+			body: "{\"error\":\"invalid person ID\"}\n",
 		},
 		{
-			name:       "invalid login",
-			path:       "/github/users/-octocat/repositories",
-			store:      &testStore{},
-			wantStatus: http.StatusBadRequest,
-			wantBody:   "{\"error\":\"invalid GitHub login\"}\n",
+			name:  "missing range",
+			path:  "/v1/persons/" + personID.String() + "/activity",
+			store: &testStore{}, status: http.StatusBadRequest,
+			body: "{\"error\":\"from must be an RFC3339 timestamp\"}\n",
 		},
 		{
-			name:       "store failure",
-			path:       "/github/users/octocat/repositories",
-			store:      &testStore{err: errors.New("database failed")},
-			wantStatus: http.StatusInternalServerError,
-			wantBody:   "{\"error\":\"failed to read stored data\"}\n",
-			wantGets:   1,
+			name:  "invalid limit",
+			path:  "/v1/persons/" + personID.String() + "/activity?from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z&limit=501",
+			store: &testStore{}, status: http.StatusBadRequest,
+			body: "{\"error\":\"limit must be between 1 and 500\"}\n",
+		},
+		{
+			name:  "store failure",
+			path:  "/v1/persons/" + personID.String() + "/activity?from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z",
+			store: &testStore{err: errors.New("database failed")}, status: http.StatusInternalServerError,
+			body: "{\"error\":\"failed to read activity\"}\n", wantCalls: 1, wantLimit: 100,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			res := serve(t, NewHandler(tt.store, testLogger()), tt.path)
-
-			if res.Code != tt.wantStatus {
-				t.Errorf("GET %s status = %d, want %d", tt.path, res.Code, tt.wantStatus)
+			if res.Code != tt.status {
+				t.Errorf("GET %s status = %d, want %d", tt.path, res.Code, tt.status)
 			}
-			if got := res.Body.String(); got != tt.wantBody {
-				t.Errorf("GET %s body = %q, want %q", tt.path, got, tt.wantBody)
+			if got := res.Body.String(); got != tt.body {
+				t.Errorf("GET %s body = %q, want %q", tt.path, got, tt.body)
 			}
-			if got := res.Header().Get("Content-Type"); got != "application/json" {
-				t.Errorf("GET %s Content-Type = %q, want application/json", tt.path, got)
+			if got := tt.store.calls; got != tt.wantCalls {
+				t.Errorf("GET %s store calls = %d, want %d", tt.path, got, tt.wantCalls)
 			}
-			if got := res.Header().Get("Last-Modified"); got != tt.wantModified {
-				t.Errorf("GET %s Last-Modified = %q, want %q", tt.path, got, tt.wantModified)
-			}
-			if tt.store.calls != tt.wantGets {
-				t.Errorf("GET %s store reads = %d, want %d", tt.path, tt.store.calls, tt.wantGets)
+			if tt.wantCalls > 0 && tt.store.limit != tt.wantLimit {
+				t.Errorf("Timeline limit = %d, want %d", tt.store.limit, tt.wantLimit)
 			}
 		})
 	}
 }
 
-func TestHandler_removedRoutes(t *testing.T) {
-	for _, path := range []string{"/", "/gh/users/octocat/contributions"} {
-		t.Run(path, func(t *testing.T) {
-			s := &testStore{found: true}
-			res := serve(t, NewHandler(s, testLogger()), path)
-			if res.Code != http.StatusNotFound {
-				t.Errorf("GET %s status = %d, want %d", path, res.Code, http.StatusNotFound)
+func TestHandler_removedSnapshotRoute(t *testing.T) {
+	s := &testStore{}
+	res := serve(t, NewHandler(s, testLogger()), "/github/users/octocat/repositories")
+	if res.Code != http.StatusNotFound || s.calls != 0 {
+		t.Errorf("legacy snapshot route status/calls = %d/%d, want 404/0", res.Code, s.calls)
+	}
+}
+
+func TestHandler_coverageAndCounts(t *testing.T) {
+	personID, forgeID := uuid.New(), uuid.New()
+	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	path := "/v1/persons/" + personID.String()
+	tests := []struct {
+		name string
+		path string
+		data *testStore
+		want string
+	}{
+		{
+			name: "coverage",
+			path: path + "/coverage?from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z",
+			data: &testStore{coverage: []store.CoverageInterval{{
+				ForgeInstanceID: forgeID, SourceKey: "github_history", StartsAt: from,
+				EndsAt: to, Status: "complete", CoverageScope: "known public repositories",
+				RecordedAt: from,
+			}}},
+			want: `[{"forge_instance_id":"` + forgeID.String() + `","source":"github_history","from":"2026-01-01T00:00:00Z","to":"2026-02-01T00:00:00Z","status":"complete","scope":"known public repositories","recorded_at":"2026-01-01T00:00:00Z"}]` + "\n",
+		},
+		{
+			name: "aggregate counts",
+			path: path + "/counts?from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z",
+			data: &testStore{counts: []store.ContributionCount{{
+				ForgeInstanceID: forgeID, ActivityDate: from, Metric: "daily_total",
+				Value: 7, ObservedAt: from,
+			}}},
+			want: `[{"forge_instance_id":"` + forgeID.String() + `","date":"2026-01-01T00:00:00Z","metric":"daily_total","value":7,"observed_at":"2026-01-01T00:00:00Z"}]` + "\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := serve(t, NewHandler(tt.data, testLogger()), tt.path)
+			if res.Code != http.StatusOK || res.Body.String() != tt.want {
+				t.Errorf("GET %s = %d %q, want 200 %q", tt.path, res.Code, res.Body.String(), tt.want)
 			}
-			if s.calls != 0 {
-				t.Errorf("GET %s store reads = %d, want 0", path, s.calls)
+			if tt.data.calls != 1 || tt.data.person != personID {
+				t.Errorf("coverage/count store calls = %d for %s, want one call for %s", tt.data.calls, tt.data.person, personID)
 			}
 		})
 	}

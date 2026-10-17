@@ -25,39 +25,6 @@ func TestOpen_requiresPostgreSQLURL(t *testing.T) {
 	}
 }
 
-func TestStore_persistsSnapshots(t *testing.T) {
-	store := testStore(t)
-	if _, ok, err := store.Get(t.Context(), SourceGitHubRepositories, "octocat"); err != nil || ok {
-		t.Fatalf("Get on empty store = ok %v, err %v; want false, nil", ok, err)
-	}
-	for _, data := range [][]byte{[]byte(`{"repositories":["first"]}`), []byte(`{"repositories":["second"]}`)} {
-		if err := store.Save(t.Context(), SourceGitHubRepositories, "octocat", data); err != nil {
-			t.Fatalf("Save: %v", err)
-		}
-	}
-	snapshot, ok, err := store.Get(t.Context(), SourceGitHubRepositories, "octocat")
-	if err != nil || !ok {
-		t.Fatalf("Get saved snapshot = ok %v, err %v; want true, nil", ok, err)
-	}
-	var saved struct {
-		Repositories []string `json:"repositories"`
-	}
-	if err := json.Unmarshal(snapshot.Data, &saved); err != nil {
-		t.Fatalf("decode saved snapshot: %v", err)
-	}
-	if len(saved.Repositories) != 1 || saved.Repositories[0] != "second" {
-		t.Errorf("snapshot repositories = %v, want [second]", saved.Repositories)
-	}
-	if snapshot.FetchedAt.IsZero() || snapshot.FetchedAt.Location() != time.UTC {
-		t.Errorf("snapshot FetchedAt = %v, want non-zero UTC time", snapshot.FetchedAt)
-	}
-	if _, ok, err := store.Get(t.Context(), Source("other"), "octocat"); err != nil {
-		t.Fatalf("Get other source: %v", err)
-	} else if ok {
-		t.Error("snapshot leaked across sources")
-	}
-}
-
 func TestOpen_serializesConcurrentMigrations(t *testing.T) {
 	options, cleanup := testDatabase(t)
 	defer cleanup()
@@ -208,6 +175,7 @@ func TestStore_personTimelineAndIdentityConflicts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreatePerson one: %v", err)
 	}
+
 	personTwo, err := store.CreatePerson(ctx, &nameTwo)
 	if err != nil {
 		t.Fatalf("CreatePerson two: %v", err)
@@ -907,6 +875,7 @@ func TestMigrations_loadSequentialVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadMigrations: %v", err)
 	}
+
 	if len(migrations) == 0 {
 		t.Fatal("loadMigrations returned no migrations")
 	}
@@ -914,5 +883,53 @@ func TestMigrations_loadSequentialVersions(t *testing.T) {
 		if migration.version != i+1 || migration.checksum == "" {
 			t.Errorf("migration at %d = %+v, want sequential version and checksum", i, migration)
 		}
+	}
+}
+
+func TestStore_tracksGitHubAccountAcrossRename(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	forge, err := s.CreateForgeInstance(ctx, "github", "https://github.com")
+	if err != nil {
+		t.Fatalf("CreateForgeInstance: %v", err)
+	}
+	accountCreatedAt := time.Date(2011, 1, 25, 18, 44, 36, 0, time.UTC)
+	first, err := s.TrackGitHubAccount(ctx, forge.ID, GitHubAccount{
+		AccountID: "42", NodeID: "MDQ6VXNlcjQy", Login: "octocat",
+		AccountCreatedAt: accountCreatedAt,
+	})
+	if err != nil {
+		t.Fatalf("TrackGitHubAccount(initial): %v", err)
+	}
+	renamed, err := s.TrackGitHubAccount(ctx, forge.ID, GitHubAccount{
+		AccountID: "42", NodeID: "MDQ6VXNlcjQy", Login: "octo-cat",
+		AccountCreatedAt: accountCreatedAt,
+	})
+	if err != nil {
+		t.Fatalf("TrackGitHubAccount(renamed): %v", err)
+	}
+	if renamed.PersonID != first.PersonID {
+		t.Errorf("person after rename = %s, want stable person %s", renamed.PersonID, first.PersonID)
+	}
+	var assignedLogin string
+	if err := s.db.QueryRow(ctx, `
+		SELECT ik.normalized_value FROM identity_assignments ia
+		JOIN identity_keys ik ON ik.id = ia.identity_key_id
+		WHERE ia.person_id = $1 AND ik.forge_instance_id = $2 AND ik.kind = 'login'`,
+		first.PersonID, forge.ID).Scan(&assignedLogin); err != nil {
+		t.Fatalf("load current GitHub login assignment: %v", err)
+	}
+	if assignedLogin != "octo-cat" {
+		t.Errorf("assigned GitHub login = %q, want updated login", assignedLogin)
+	}
+	var accountID, login string
+	if err := s.db.QueryRow(ctx, `
+		SELECT account_id, login FROM github_accounts
+		WHERE forge_instance_id = $1 AND person_id = $2`,
+		forge.ID, first.PersonID).Scan(&accountID, &login); err != nil {
+		t.Fatalf("load GitHub account identity: %v", err)
+	}
+	if accountID != "42" || login != "octo-cat" {
+		t.Errorf("stored GitHub identifiers = %q/%q, want 42/octo-cat", accountID, login)
 	}
 }

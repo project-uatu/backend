@@ -48,6 +48,10 @@ func TestStore_collectionPagesPreserveDataAndAdvanceCoverage(t *testing.T) {
 		}},
 	}
 	report := event.FetchReport{RateLimitBucket: "forge:shared"}
+	report.CoverageScope = "public repository activity"
+	report.ContributionCounts = []event.ContributionCount{{
+		Date: windowEnd.Add(-24 * time.Hour), Metric: "daily_total", Value: 7,
+	}}
 	report.RateLimitRemaining = intValue(3)
 	rateLimitReset := time.Now().UTC().Add(time.Hour)
 	report.RateLimitResetAt = &rateLimitReset
@@ -109,6 +113,13 @@ func TestStore_collectionPagesPreserveDataAndAdvanceCoverage(t *testing.T) {
 	if normalizationCount != 1 {
 		t.Errorf("normalization jobs = %d, want 1 despite duplicate partial event", normalizationCount)
 	}
+	counts, err := s.ContributionCounts(ctx, person.ID, windowEnd.Add(-24*time.Hour), windowEnd)
+	if err != nil {
+		t.Fatalf("ContributionCounts after collection page: %v", err)
+	}
+	if len(counts) != 1 || counts[0].Value != 7 || counts[0].Metric != "daily_total" {
+		t.Errorf("persisted contribution counts = %+v, want separate daily aggregate", counts)
+	}
 
 	if err := s.RetryCollectionJob(ctx, claim, errors.New("temporary fetch failure"), time.Now().Add(-time.Second)); err != nil {
 		t.Fatalf("RetryCollectionJob: %v", err)
@@ -127,7 +138,7 @@ func TestStore_collectionPagesPreserveDataAndAdvanceCoverage(t *testing.T) {
 		t.Errorf("retried job cursor = %q, want page-2", claim.Cursor)
 	}
 	if done, err := s.PersistCollectionPage(ctx, claim, event.Page{Done: true},
-		event.FetchReport{}, true, 1, uuid.Nil); err != nil || !done {
+		event.FetchReport{CoverageScope: "public repository activity"}, true, 1, uuid.Nil); err != nil || !done {
 		t.Fatalf("PersistCollectionPage(final) = done %t, err %v; want true, nil", done, err)
 	}
 	coverage, err := s.Coverage(ctx, person.ID, forge.ID, "forge",
@@ -137,6 +148,9 @@ func TestStore_collectionPagesPreserveDataAndAdvanceCoverage(t *testing.T) {
 	}
 	if len(coverage) != 1 || coverage[0].Status != "complete" {
 		t.Errorf("Coverage = %+v, want one complete interval", coverage)
+	}
+	if coverage[0].CoverageScope != "public repository activity" {
+		t.Errorf("coverage scope = %q, want public repository activity", coverage[0].CoverageScope)
 	}
 	var jobStatus string
 	if err := s.db.QueryRow(ctx, "SELECT status FROM jobs WHERE id = $1", job.ID).Scan(&jobStatus); err != nil {
@@ -163,6 +177,7 @@ func TestStore_scanGapsSurviveRetriesAndPreventCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreatePerson: %v", err)
 	}
+
 	forge, err := s.CreateForgeInstance(ctx, "forge", "https://forge.example")
 	if err != nil {
 		t.Fatalf("CreateForgeInstance: %v", err)
@@ -745,3 +760,48 @@ func countRows(t *testing.T, s *Store, query string, args ...any) int {
 }
 
 func intValue(value int) *int { return &value }
+
+func TestStore_EnqueueGitHubHistoryUsesBackfillThenOverlap(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	forge, err := s.CreateForgeInstance(ctx, "github", "https://github.com")
+	if err != nil {
+		t.Fatalf("CreateForgeInstance: %v", err)
+	}
+	createdAt := time.Date(2011, 1, 25, 18, 44, 36, 0, time.UTC)
+	tracked, err := s.TrackGitHubAccount(ctx, forge.ID, GitHubAccount{
+		AccountID: "42", NodeID: "MDQ6VXNlcjQy", Login: "octocat",
+		AccountCreatedAt: createdAt,
+	})
+	if err != nil {
+		t.Fatalf("TrackGitHubAccount: %v", err)
+	}
+	initial, err := s.EnqueueGitHubHistory(ctx, tracked.PersonID, forge.ID)
+	if err != nil {
+		t.Fatalf("EnqueueGitHubHistory(initial): %v", err)
+	}
+	if initial.ScanMode != "backfill" || !initial.Window.From.Equal(createdAt) {
+		t.Errorf("initial GitHub scan = mode %q, from %s; want backfill from account creation %s",
+			initial.ScanMode, initial.Window.From, createdAt)
+	}
+	if _, err := s.db.Exec(ctx, "UPDATE jobs SET status = 'succeeded' WHERE id = $1", initial.ID); err != nil {
+		t.Fatalf("complete initial job: %v", err)
+	}
+	completedThrough := time.Date(2025, 1, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := s.db.Exec(ctx, `
+		INSERT INTO checkpoints
+			(person_id, forge_instance_id, source_key, backfill_complete, completed_through)
+		VALUES ($1, $2, $3, true, $4)`,
+		tracked.PersonID, forge.ID, SourceGitHubHistory, completedThrough); err != nil {
+		t.Fatalf("save completed checkpoint: %v", err)
+	}
+	incremental, err := s.EnqueueGitHubHistory(ctx, tracked.PersonID, forge.ID)
+	if err != nil {
+		t.Fatalf("EnqueueGitHubHistory(incremental): %v", err)
+	}
+	wantFrom := completedThrough.Add(-7 * 24 * time.Hour)
+	if incremental.ScanMode != "incremental" || !incremental.Window.From.Equal(wantFrom) {
+		t.Errorf("incremental scan = mode %q, from %s; want from %s with seven-day overlap",
+			incremental.ScanMode, incremental.Window.From, wantFrom)
+	}
+}

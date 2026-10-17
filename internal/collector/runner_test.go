@@ -179,6 +179,9 @@ func TestRunner_RunOnce_persistsBoundedPages(t *testing.T) {
 	if len(connector.requests) != 2 || connector.requests[1].Cursor != "next" {
 		t.Errorf("connector requests = %+v, want second cursor next", connector.requests)
 	}
+	if len(connector.requests) > 0 && connector.requests[0].ScanMode != "backfill" {
+		t.Errorf("first request scan mode = %q, want backfill", connector.requests[0].ScanMode)
+	}
 	if len(storeStub.pages) != 2 || !storeStub.pages[0].successful || !storeStub.pages[1].successful {
 		t.Errorf("persisted pages = %+v, want two successful pages", storeStub.pages)
 	}
