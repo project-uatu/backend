@@ -22,12 +22,15 @@ on every push to `main`. It maintains a release PR updating `CHANGELOG.md` and
 creates a `vX.Y.Z` tag and GitHub Release, then publishes the container image
 (see below). It does not change the Go toolchain version in `go.mod`.
 
-The initial manifest baseline is `0.0.0` (not an existing release). Conventional
-Commits determine the first and subsequent versions: `feat:` bumps the minor
+The initial manifest baseline is `0.0.0` (not an existing release). Without a
+previous release, Release Please would default to `1.0.0`, so
+`release-please-config.json` sets `initial-version` to `0.1.0`. The first
+release is therefore `v0.1.0` regardless of breaking changes in the history.
+Conventional Commits determine subsequent versions: `feat:` bumps the minor
 version, `fix:` bumps the patch, and `feat!:` or a `BREAKING CHANGE:` footer
 marks a breaking change. Before 1.0, breaking changes bump the minor version;
-after 1.0, they bump the major version. For example, the first feature release
-is `v0.1.0`. `docs:`, `chore:`, and `ci:` alone do not request a release. Use
+after 1.0, they bump the major version. Release 1.0.0 only when deliberately
+promoted, for example with a `Release-As: 1.0.0` commit footer. `docs:`, `chore:`, and `ci:` alone do not request a release. Use
 Conventional Commit PR titles when squash-merging, and preserve breaking-change
 footers in the resulting commit message.
 
