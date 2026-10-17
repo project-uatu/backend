@@ -18,10 +18,9 @@ import (
 	"github.com/project-uatu/backend/internal/identity"
 )
 
-const (
-	historySource        event.Source = "github_history"
-	historyCoverageScope              = "authored issues, pull requests and reviews: public search; releases: known public repositories only"
-)
+const historySource event.Source = "github_history"
+
+const historyCoverageScope = "authored issues, pull requests and reviews: public search; releases: known public repositories only"
 
 type githubUser struct {
 	ID        int64     `json:"id"`
