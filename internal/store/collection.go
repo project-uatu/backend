@@ -816,6 +816,10 @@ func recordRateLimitTx(ctx context.Context, tx pgx.Tx, bucket string, remaining 
 	if bucket == "" || remaining != nil && *remaining < 0 {
 		return errors.New("rate-limit report has invalid bucket or counters")
 	}
+	if resetAt != nil {
+		normalizedReset := resetAt.UTC().Truncate(time.Microsecond)
+		resetAt = &normalizedReset
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO rate_limit_buckets (bucket_key) VALUES ($1)
 		ON CONFLICT (bucket_key) DO NOTHING`, bucket); err != nil {
