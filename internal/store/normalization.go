@@ -14,9 +14,9 @@ import (
 )
 
 // ClaimNormalizationJob claims one due normalization item and loads its raw event.
-func (s *Store) ClaimNormalizationJob(ctx context.Context, owner string, lease time.Duration) (claim NormalizationClaim, found bool, claimErr error) {
-	if owner == "" || lease <= 0 {
-		return NormalizationClaim{}, false, errors.New("normalization claim requires owner and positive lease")
+func (s *Store) ClaimNormalizationJob(ctx context.Context, owner string, version int, lease time.Duration) (claim NormalizationClaim, found bool, claimErr error) {
+	if owner == "" || version < 1 || lease <= 0 {
+		return NormalizationClaim{}, false, errors.New("normalization claim requires owner, positive version and positive lease")
 	}
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -34,12 +34,13 @@ func (s *Store) ClaimNormalizationJob(ctx context.Context, owner string, lease t
 	err = tx.QueryRow(ctx, `
 		SELECT raw_event_id, normalizer_version, attempts, max_attempts
 		FROM normalization_jobs
-		WHERE (status = 'queued' AND GREATEST(due_at, COALESCE(retry_at, due_at)) <= now()
+		WHERE normalizer_version = $1 AND
+		      ((status = 'queued' AND GREATEST(due_at, COALESCE(retry_at, due_at)) <= now()
 		       AND attempts < max_attempts)
-		   OR (status = 'running' AND lease_expires_at <= now() AND attempts < max_attempts)
+		   OR (status = 'running' AND lease_expires_at <= now() AND attempts < max_attempts))
 		ORDER BY GREATEST(due_at, COALESCE(retry_at, due_at)), created_at
 		LIMIT 1
-		FOR UPDATE SKIP LOCKED`).Scan(&claim.RawEventID, &claim.NormalizerVersion, &claim.Attempts, &claim.MaxAttempts)
+		FOR UPDATE SKIP LOCKED`, version).Scan(&claim.RawEventID, &claim.NormalizerVersion, &claim.Attempts, &claim.MaxAttempts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {
 			return NormalizationClaim{}, false, fmt.Errorf("commit empty normalization claim: %w", err)
@@ -116,6 +117,35 @@ func (s *Store) CompleteNormalization(ctx context.Context, claim NormalizationCl
 	if err := lockEventIdentityChanges(ctx, tx); err != nil {
 		return err
 	}
+	var activeVersion int
+	err = tx.QueryRow(ctx, `
+		SELECT active_version FROM raw_event_normalization_state
+		WHERE raw_event_id = $1 FOR UPDATE`, claim.RawEventID).Scan(&activeVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO raw_event_normalization_state (raw_event_id, active_version)
+			VALUES ($1, $2) ON CONFLICT (raw_event_id) DO NOTHING`,
+			claim.RawEventID, claim.NormalizerVersion); err != nil {
+			return fmt.Errorf("initialize active normalizer version: %w", err)
+		}
+		if err := tx.QueryRow(ctx, `
+			SELECT active_version FROM raw_event_normalization_state
+			WHERE raw_event_id = $1 FOR UPDATE`, claim.RawEventID).Scan(&activeVersion); err != nil {
+			return fmt.Errorf("load initialized normalizer version: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("load active normalizer version: %w", err)
+	}
+	activate := claim.NormalizerVersion >= activeVersion
+	if activate && claim.NormalizerVersion > activeVersion {
+		if _, err := tx.Exec(ctx, `
+			UPDATE raw_event_normalization_state
+			SET active_version = $2, updated_at = now()
+			WHERE raw_event_id = $1`,
+			claim.RawEventID, claim.NormalizerVersion); err != nil {
+			return fmt.Errorf("advance active normalizer version: %w", err)
+		}
+	}
 	var lockedEventID uuid.UUID
 	err = tx.QueryRow(ctx, `
 		SELECT raw_event_id FROM normalization_jobs
@@ -153,10 +183,12 @@ func (s *Store) CompleteNormalization(ctx context.Context, claim NormalizationCl
 		return fmt.Errorf("iterate prior normalization links: %w", err)
 	}
 	rows.Close()
-	if _, err := tx.Exec(ctx, `
-		UPDATE normalized_events SET is_current = false
-		WHERE raw_event_id = $1 AND is_current`, claim.RawEventID); err != nil {
-		return fmt.Errorf("mark prior actions non-current: %w", err)
+	if activate {
+		if _, err := tx.Exec(ctx, `
+			UPDATE normalized_events SET is_current = false
+			WHERE raw_event_id = $1 AND is_current`, claim.RawEventID); err != nil {
+			return fmt.Errorf("mark prior actions non-current: %w", err)
+		}
 	}
 	for _, action := range actions {
 		var normalizedID uuid.UUID
@@ -169,13 +201,13 @@ func (s *Store) CompleteNormalization(ctx context.Context, claim NormalizationCl
 				COALESCE((SELECT occurred_at FROM normalized_events
 				          WHERE raw_event_id = $2 AND action_key = $4
 				          ORDER BY created_at, normalizer_version LIMIT 1), $6),
-				$7, $8, $9, true)
+				$7, $8, $9, $10)
 			ON CONFLICT (raw_event_id, normalizer_version, action_key)
 			DO UPDATE SET kind = EXCLUDED.kind, project = EXCLUDED.project,
-			              title = EXCLUDED.title, url = EXCLUDED.url, is_current = true
+			              title = EXCLUDED.title, url = EXCLUDED.url, is_current = EXCLUDED.is_current
 			RETURNING id, occurred_at`,
 			uuid.New(), claim.RawEventID, claim.NormalizerVersion, action.Key,
-			string(action.Kind), action.OccurredAt.UTC(), action.Project, action.Title, action.URL).
+			string(action.Kind), action.OccurredAt.UTC(), action.Project, action.Title, action.URL, activate).
 			Scan(&normalizedID, &occurredAt)
 		if err != nil {
 			return fmt.Errorf("save normalized action %s: %w", action.Key, err)
@@ -193,6 +225,9 @@ func (s *Store) CompleteNormalization(ctx context.Context, claim NormalizationCl
 					links = append(links, link)
 				}
 			}
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM event_people WHERE normalized_event_id = $1", normalizedID); err != nil {
+			return fmt.Errorf("replace normalized event person links: %w", err)
 		}
 		for _, link := range links {
 			if _, err := tx.Exec(ctx, `

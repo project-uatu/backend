@@ -89,6 +89,89 @@ func TestOpen_serializesConcurrentMigrations(t *testing.T) {
 	}
 }
 
+func TestOpen_migrationConsolidatesActiveCollectionJobs(t *testing.T) {
+	options, cleanup := testDatabase(t)
+	defer cleanup()
+	conn, err := pgx.Connect(t.Context(), options.URL)
+	if err != nil {
+		t.Fatalf("connect to migration test schema: %v", err)
+	}
+	defer func() {
+		if err := conn.Close(context.Background()); err != nil {
+			t.Errorf("close migration test connection: %v", err)
+		}
+	}()
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+	}
+	if len(migrations) < 3 {
+		t.Fatalf("migration count = %d, want at least 3", len(migrations))
+	}
+	if _, err := conn.Exec(t.Context(), `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
+		t.Fatalf("create schema migration history: %v", err)
+	}
+	for _, migration := range migrations[:2] {
+		if _, err := conn.Exec(t.Context(), migration.sql, pgx.QueryExecModeSimpleProtocol); err != nil {
+			t.Fatalf("apply migration %s: %v", migration.name, err)
+		}
+		if _, err := conn.Exec(t.Context(), `
+			INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)`,
+			migration.version, migration.name, migration.checksum); err != nil {
+			t.Fatalf("record migration %s: %v", migration.name, err)
+		}
+	}
+	personID, forgeID, runID := uuid.New(), uuid.New(), uuid.New()
+	runningJobID, queuedJobID := uuid.New(), uuid.New()
+	if _, err := conn.Exec(t.Context(), "INSERT INTO persons (id) VALUES ($1)", personID); err != nil {
+		t.Fatalf("create migration test person: %v", err)
+	}
+	if _, err := conn.Exec(t.Context(), `
+		INSERT INTO forge_instances (id, provider, base_url) VALUES ($1, 'forgejo', 'https://forge.example')`,
+		forgeID); err != nil {
+		t.Fatalf("create migration test forge: %v", err)
+	}
+	if _, err := conn.Exec(t.Context(), `
+		INSERT INTO sync_runs (id, person_id, forge_instance_id, source_key, status)
+		VALUES ($1, $2, $3, 'forge', 'running')`, runID, personID, forgeID); err != nil {
+		t.Fatalf("create running sync run: %v", err)
+	}
+	if _, err := conn.Exec(t.Context(), `
+		INSERT INTO jobs
+			(id, person_id, forge_instance_id, source_key, status, lease_owner,
+			 lease_expires_at, fencing_token, sync_run_id, idempotency_key)
+		VALUES ($1, $2, $3, 'forge', 'running', 'worker', now() + interval '1 minute', $4, $5, 'running-key'),
+		       ($6, $2, $3, 'forge', 'queued', '', NULL, NULL, NULL, 'queued-key')`,
+		runningJobID, personID, forgeID, uuid.New(), runID, queuedJobID); err != nil {
+		t.Fatalf("create duplicate active jobs: %v", err)
+	}
+
+	s := openTestStore(t, options)
+	var queuedStatus, runStatus string
+	if err := s.db.QueryRow(t.Context(), "SELECT status FROM jobs WHERE id = $1", queuedJobID).Scan(&queuedStatus); err != nil {
+		t.Fatalf("load superseded queued job: %v", err)
+	}
+	if err := s.db.QueryRow(t.Context(), "SELECT status FROM sync_runs WHERE id = $1", runID).Scan(&runStatus); err != nil {
+		t.Fatalf("load winning sync run: %v", err)
+	}
+	if queuedStatus != "canceled" || runStatus != "running" {
+		t.Errorf("migration statuses = job %q, run %q; want canceled queued job and live running job", queuedStatus, runStatus)
+	}
+	var queuedKeyJob uuid.UUID
+	if err := s.db.QueryRow(t.Context(), `
+		SELECT job_id FROM job_idempotency_keys
+		WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = 'forge'
+		  AND idempotency_key = 'queued-key'`, personID, forgeID).Scan(&queuedKeyJob); err != nil {
+		t.Fatalf("load consolidated idempotency association: %v", err)
+	}
+	if queuedKeyJob != runningJobID {
+		t.Errorf("queued idempotency key points to %s, want winning job %s", queuedKeyJob, runningJobID)
+	}
+}
+
 func TestOpen_rejectsMigrationChecksumChange(t *testing.T) {
 	options, cleanup := testDatabase(t)
 	defer cleanup()

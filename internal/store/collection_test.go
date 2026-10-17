@@ -52,7 +52,7 @@ func TestStore_collectionPagesPreserveDataAndAdvanceCoverage(t *testing.T) {
 	rateLimitReset := time.Now().UTC().Add(time.Hour)
 	report.RateLimitResetAt = &rateLimitReset
 	firstPage := event.Page{Events: []event.RawEvent{raw}, NextCursor: "page-2"}
-	if done, err := s.PersistCollectionPage(ctx, claim, firstPage, report, true, 1); err != nil || done {
+	if done, err := s.PersistCollectionPage(ctx, claim, firstPage, report, true, 1, uuid.Nil); err != nil || done {
 		t.Fatalf("PersistCollectionPage(first) = done %t, err %v; want false, nil", done, err)
 	}
 	claim.Cursor = "page-2"
@@ -61,7 +61,7 @@ func TestStore_collectionPagesPreserveDataAndAdvanceCoverage(t *testing.T) {
 	changedPayload.Payload = json.RawMessage(`{"value":"from-failed-response"}`)
 	partialReport := event.FetchReport{Errors: []string{"upstream request failed"}}
 	if done, err := s.PersistCollectionPage(ctx, claim,
-		event.Page{Events: []event.RawEvent{changedPayload}}, partialReport, false, 1); err != nil || done {
+		event.Page{Events: []event.RawEvent{changedPayload}}, partialReport, false, 1, uuid.Nil); err != nil || done {
 		t.Fatalf("PersistCollectionPage(partial) = done %t, err %v; want false, nil", done, err)
 	}
 	var payload string
@@ -83,6 +83,16 @@ func TestStore_collectionPagesPreserveDataAndAdvanceCoverage(t *testing.T) {
 	if cursor != "page-2" {
 		t.Errorf("checkpoint after partial response = %q, want page-2", cursor)
 	}
+	var backfillComplete bool
+	if err := s.db.QueryRow(ctx, `
+		SELECT backfill_complete FROM checkpoints WHERE person_id = $1
+		  AND forge_instance_id = $2 AND source_key = $3`,
+		person.ID, forge.ID, "forge").Scan(&backfillComplete); err != nil {
+		t.Fatalf("load incomplete checkpoint: %v", err)
+	}
+	if backfillComplete {
+		t.Error("backfill_complete after incomplete page = true, want false")
+	}
 	var jobRateLimitReset *time.Time
 	if err := s.db.QueryRow(ctx, "SELECT rate_limit_reset_at FROM jobs WHERE id = $1", job.ID).
 		Scan(&jobRateLimitReset); err != nil {
@@ -103,6 +113,12 @@ func TestStore_collectionPagesPreserveDataAndAdvanceCoverage(t *testing.T) {
 	if err := s.RetryCollectionJob(ctx, claim, errors.New("temporary fetch failure"), time.Now().Add(-time.Second)); err != nil {
 		t.Fatalf("RetryCollectionJob: %v", err)
 	}
+	if _, err := s.EnqueueCollectionJob(ctx, CollectionJobInput{
+		PersonID: person.ID, ForgeInstanceID: forge.ID, SourceKey: "forge",
+		ScanMode: "backfill", Window: event.Window{To: windowEnd.Add(time.Hour)},
+	}); !errors.Is(err, ErrCollectionJobActive) {
+		t.Errorf("EnqueueCollectionJob(changed retry window) error = %v, want ErrCollectionJobActive", err)
+	}
 	claim, found, err = s.ClaimCollectionJob(ctx, "worker-two", time.Minute)
 	if err != nil || !found {
 		t.Fatalf("ClaimCollectionJob(retry) = found %t, err %v; want true, nil", found, err)
@@ -111,7 +127,7 @@ func TestStore_collectionPagesPreserveDataAndAdvanceCoverage(t *testing.T) {
 		t.Errorf("retried job cursor = %q, want page-2", claim.Cursor)
 	}
 	if done, err := s.PersistCollectionPage(ctx, claim, event.Page{Done: true},
-		event.FetchReport{}, true, 1); err != nil || !done {
+		event.FetchReport{}, true, 1, uuid.Nil); err != nil || !done {
 		t.Fatalf("PersistCollectionPage(final) = done %t, err %v; want true, nil", done, err)
 	}
 	coverage, err := s.Coverage(ctx, person.ID, forge.ID, "forge",
@@ -128,6 +144,85 @@ func TestStore_collectionPagesPreserveDataAndAdvanceCoverage(t *testing.T) {
 	}
 	if jobStatus != "succeeded" {
 		t.Errorf("job status = %q, want succeeded", jobStatus)
+	}
+	if err := s.db.QueryRow(ctx, `
+		SELECT backfill_complete FROM checkpoints WHERE person_id = $1
+		  AND forge_instance_id = $2 AND source_key = $3`,
+		person.ID, forge.ID, "forge").Scan(&backfillComplete); err != nil {
+		t.Fatalf("load completed checkpoint: %v", err)
+	}
+	if !backfillComplete {
+		t.Error("backfill_complete after complete scan = false, want true")
+	}
+}
+
+func TestStore_scanGapsSurviveRetriesAndPreventCompletion(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	person, err := s.CreatePerson(ctx, nil)
+	if err != nil {
+		t.Fatalf("CreatePerson: %v", err)
+	}
+	forge, err := s.CreateForgeInstance(ctx, "forge", "https://forge.example")
+	if err != nil {
+		t.Fatalf("CreateForgeInstance: %v", err)
+	}
+	windowEnd := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	job, err := s.EnqueueCollectionJob(ctx, CollectionJobInput{
+		PersonID: person.ID, ForgeInstanceID: forge.ID, SourceKey: "forge",
+		Window: event.Window{To: windowEnd},
+	})
+	if err != nil {
+		t.Fatalf("EnqueueCollectionJob: %v", err)
+	}
+	claim, found, err := s.ClaimCollectionJob(ctx, "worker-one", time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimCollectionJob = found %t, err %v; want true, nil", found, err)
+	}
+	gap := event.Gap{
+		From: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		To:   time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC), Reason: "source limit",
+	}
+	if _, err := s.PersistCollectionPage(ctx, claim, event.Page{NextCursor: "next"},
+		event.FetchReport{Gaps: []event.Gap{gap}}, true, 1, uuid.Nil); err != nil {
+		t.Fatalf("PersistCollectionPage(first): %v", err)
+	}
+	if err := s.RetryCollectionJob(ctx, claim, errors.New("temporary failure"), time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("RetryCollectionJob: %v", err)
+	}
+	claim, found, err = s.ClaimCollectionJob(ctx, "worker-two", time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimCollectionJob(retry) = found %t, err %v; want true, nil", found, err)
+	}
+	if _, err := s.PersistCollectionPage(ctx, claim, event.Page{Done: true},
+		event.FetchReport{}, true, 1, uuid.Nil); err != nil {
+		t.Fatalf("PersistCollectionPage(final): %v", err)
+	}
+	var backfillComplete bool
+	if err := s.db.QueryRow(ctx, `
+		SELECT backfill_complete FROM checkpoints
+		WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3`,
+		person.ID, forge.ID, "forge").Scan(&backfillComplete); err != nil {
+		t.Fatalf("load checkpoint: %v", err)
+	}
+	if backfillComplete {
+		t.Error("backfill_complete after scan with a prior gap = true, want false")
+	}
+	if count := countRows(t, s, `
+		SELECT count(*) FROM sync_coverage
+		WHERE person_id = $1 AND forge_instance_id = $2 AND status = 'complete'`,
+		person.ID, forge.ID); count != 0 {
+		t.Errorf("complete coverage rows after scan with gap = %d, want 0", count)
+	}
+	var status string
+	if err := s.db.QueryRow(ctx, `
+		SELECT status FROM sync_runs WHERE id = (
+			SELECT sync_run_id FROM jobs WHERE id = $1
+		)`, job.ID).Scan(&status); err != nil {
+		t.Fatalf("load final sync-run status: %v", err)
+	}
+	if status != "partial" {
+		t.Errorf("final sync-run status = %q, want partial", status)
 	}
 }
 
@@ -169,15 +264,68 @@ func TestStore_collectionJobsCoalesceAndHonorIdempotency(t *testing.T) {
 	if count := countRows(t, s, "SELECT count(*) FROM jobs WHERE person_id = $1", person.ID); count != 1 {
 		t.Errorf("pending jobs = %d, want 1", count)
 	}
+	if _, err := s.EnqueueCollectionJob(ctx, CollectionJobInput{
+		PersonID: person.ID, ForgeInstanceID: forge.ID, SourceKey: "forge",
+		ScanMode: "incremental",
+		Window: event.Window{
+			From: time.Date(2023, 12, 1, 0, 0, 0, 0, time.UTC),
+			To:   time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC),
+		},
+	}); !errors.Is(err, ErrCollectionJobActive) {
+		t.Errorf("EnqueueCollectionJob(changed scan) error = %v, want ErrCollectionJobActive", err)
+	}
 	input.IdempotencyKey = ""
+	input.Window = second.Window
 	coalesced, err := s.EnqueueCollectionJob(ctx, input)
 	if err != nil {
 		t.Fatalf("EnqueueCollectionJob(coalesce without idempotency key): %v", err)
 	}
-	if coalesced.ID != first.ID || !coalesced.Window.From.Equal(input.Window.From) ||
-		!coalesced.Window.To.Equal(input.Window.To) {
-		t.Errorf("active job coalescing = %+v, want existing job %s with merged window %+v",
-			coalesced, first.ID, input.Window)
+	if coalesced.ID != first.ID || !coalesced.Window.From.Equal(first.Window.From) ||
+		!coalesced.Window.To.Equal(first.Window.To) {
+		t.Errorf("active job coalescing = %+v, want existing job %s with original window %+v",
+			coalesced, first.ID, first.Window)
+	}
+	input.IdempotencyKey = "sync-2"
+	coalesced, err = s.EnqueueCollectionJob(ctx, input)
+	if err != nil || coalesced.ID != first.ID {
+		t.Fatalf("EnqueueCollectionJob(second key) = %+v, %v; want same coalesced job", coalesced, err)
+	}
+	var associations int
+	if err := s.db.QueryRow(ctx, `
+		SELECT count(*) FROM job_idempotency_keys WHERE job_id = $1`, first.ID).Scan(&associations); err != nil {
+		t.Fatalf("count job idempotency associations: %v", err)
+	}
+	if associations != 2 {
+		t.Errorf("job idempotency associations = %d, want both accepted keys", associations)
+	}
+	claim, found, err := s.ClaimCollectionJob(ctx, "worker", time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimCollectionJob = found %t, err %v; want true, nil", found, err)
+	}
+	runningRequest := input
+	runningRequest.IdempotencyKey = ""
+	runningJob, err := s.EnqueueCollectionJob(ctx, runningRequest)
+	if err != nil || runningJob.ID != claim.ID {
+		t.Fatalf("EnqueueCollectionJob(same running scan) = %+v, %v; want claimed job %s", runningJob, err, claim.ID)
+	}
+	if count := countRows(t, s, `
+		SELECT count(*) FROM jobs WHERE person_id = $1 AND forge_instance_id = $2
+		  AND source_key = $3 AND status IN ('queued', 'running')`,
+		person.ID, forge.ID, "forge"); count != 1 {
+		t.Errorf("active source jobs after coalescing = %d, want 1", count)
+	}
+	runningRequest.Window.To = runningRequest.Window.To.Add(time.Hour)
+	if _, err := s.EnqueueCollectionJob(ctx, runningRequest); !errors.Is(err, ErrCollectionJobActive) {
+		t.Errorf("EnqueueCollectionJob(changed running scan) error = %v, want ErrCollectionJobActive", err)
+	}
+	if _, err := s.PersistCollectionPage(ctx, claim, event.Page{Done: true},
+		event.FetchReport{}, true, 1, uuid.Nil); err != nil {
+		t.Fatalf("PersistCollectionPage: %v", err)
+	}
+	repeated, err := s.EnqueueCollectionJob(ctx, input)
+	if err != nil || repeated.ID != first.ID {
+		t.Errorf("EnqueueCollectionJob(repeated accepted key) = %+v, %v; want completed job %s",
+			repeated, err, first.ID)
 	}
 }
 
@@ -226,7 +374,7 @@ func TestStore_collectionPageRollsBackWhenNormalizationEnqueueFails(t *testing.T
 	}
 	if _, err := s.PersistCollectionPage(ctx, claim,
 		event.Page{Events: []event.RawEvent{raw}, NextCursor: "next"},
-		event.FetchReport{}, true, 1); err == nil {
+		event.FetchReport{}, true, 1, uuid.Nil); err == nil {
 		t.Fatal("PersistCollectionPage error = nil, want normalization enqueue failure")
 	}
 	if count := countRows(t, s, `
@@ -304,7 +452,7 @@ func TestStore_collectionJobClaimsAreExclusiveAndFenceStaleWorkers(t *testing.T)
 	if err := s.RenewCollectionLease(ctx, claims[0], time.Minute); !errors.Is(err, ErrLeaseLost) {
 		t.Errorf("RenewCollectionLease(stale) error = %v, want ErrLeaseLost", err)
 	}
-	_, err = s.PersistCollectionPage(ctx, claims[0], event.Page{Done: true}, event.FetchReport{}, true, 1)
+	_, err = s.PersistCollectionPage(ctx, claims[0], event.Page{Done: true}, event.FetchReport{}, true, 1, uuid.Nil)
 	if !errors.Is(err, ErrLeaseLost) {
 		t.Errorf("PersistCollectionPage(stale) error = %v, want ErrLeaseLost", err)
 	}
@@ -363,10 +511,10 @@ func TestStore_normalizationIsReplayableAndVersioned(t *testing.T) {
 	}
 	if _, err := s.PersistCollectionPage(ctx, collection,
 		event.Page{Events: []event.RawEvent{raw}, Done: true},
-		event.FetchReport{}, true, 1); err != nil {
+		event.FetchReport{}, true, 1, uuid.Nil); err != nil {
 		t.Fatalf("PersistCollectionPage: %v", err)
 	}
-	normalization, found, err := s.ClaimNormalizationJob(ctx, "normalizer", time.Minute)
+	normalization, found, err := s.ClaimNormalizationJob(ctx, "normalizer", 1, time.Minute)
 	if err != nil || !found {
 		t.Fatalf("ClaimNormalizationJob = found %t, err %v", found, err)
 	}
@@ -390,12 +538,21 @@ func TestStore_normalizationIsReplayableAndVersioned(t *testing.T) {
 	if err != nil || !done || last == uuid.Nil {
 		t.Fatalf("QueueRenormalization = %s, done %t, err %v; want one queued record", last, done, err)
 	}
-	staleNormalization, found, err := s.ClaimNormalizationJob(ctx, "expired-normalizer", 20*time.Millisecond)
+	if _, err := s.db.Exec(ctx, `
+		UPDATE normalization_jobs SET status = 'queued', attempts = 0, retry_at = NULL,
+		                              fencing_token = NULL, lease_owner = '', lease_expires_at = NULL
+		WHERE raw_event_id = $1 AND normalizer_version = 1`, normalization.RawEventID); err != nil {
+		t.Fatalf("queue version-1 work alongside replay: %v", err)
+	}
+	staleNormalization, found, err := s.ClaimNormalizationJob(ctx, "expired-normalizer", 2, 20*time.Millisecond)
 	if err != nil || !found {
 		t.Fatalf("ClaimNormalizationJob(expiring) = found %t, err %v; want true, nil", found, err)
 	}
+	if staleNormalization.NormalizerVersion != 2 {
+		t.Fatalf("claimed normalization version = %d, want requested version 2", staleNormalization.NormalizerVersion)
+	}
 	time.Sleep(35 * time.Millisecond)
-	normalization, found, err = s.ClaimNormalizationJob(ctx, "normalizer-v2", time.Minute)
+	normalization, found, err = s.ClaimNormalizationJob(ctx, "normalizer-v2", 2, time.Minute)
 	if err != nil || !found || normalization.NormalizerVersion != 2 {
 		t.Fatalf("ClaimNormalizationJob(v2) = %+v, found %t, err %v", normalization, found, err)
 	}
@@ -412,6 +569,71 @@ func TestStore_normalizationIsReplayableAndVersioned(t *testing.T) {
 	if err != nil || len(entries) != 1 || !entries[0].OccurredAt.Equal(wantOccurredAt) {
 		t.Errorf("Timeline after normalization replay = %+v, %v; want one action at %v", entries, err, wantOccurredAt)
 	}
+	if _, err := s.db.Exec(ctx, `
+		UPDATE normalization_jobs SET status = 'queued', attempts = 0, retry_at = NULL,
+		                              fencing_token = NULL, lease_owner = '', lease_expires_at = NULL
+		WHERE raw_event_id = $1 AND normalizer_version = 1`, normalization.RawEventID); err != nil {
+		t.Fatalf("requeue older normalizer version: %v", err)
+	}
+	older, found, err := s.ClaimNormalizationJob(ctx, "normalizer-v1", 1, time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimNormalizationJob(v1 replay) = found %t, err %v; want true, nil", found, err)
+	}
+	if err := s.CompleteNormalization(ctx, older, []event.Action{action}); err != nil {
+		t.Fatalf("CompleteNormalization(v1 replay): %v", err)
+	}
+	entries, err = s.Timeline(ctx, person.ID,
+		time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), end, 10)
+	if err != nil || len(entries) != 1 || !entries[0].OccurredAt.Equal(wantOccurredAt) {
+		t.Errorf("Timeline after old-version replay = %+v, %v; want the newer action at %v", entries, err, wantOccurredAt)
+	}
+	if _, err := s.db.Exec(ctx, `
+		UPDATE normalization_jobs SET status = 'queued', attempts = 0, retry_at = NULL,
+		                              fencing_token = NULL, lease_owner = '', lease_expires_at = NULL
+		WHERE raw_event_id = $1 AND normalizer_version = 2`, normalization.RawEventID); err != nil {
+		t.Fatalf("requeue current normalizer version: %v", err)
+	}
+	current, found, err := s.ClaimNormalizationJob(ctx, "normalizer-v2-replay", 2, time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimNormalizationJob(v2 replay) = found %t, err %v; want true, nil", found, err)
+	}
+	action.Actors = []event.Actor{}
+	if err := s.CompleteNormalization(ctx, current, []event.Action{action}); err != nil {
+		t.Fatalf("CompleteNormalization(v2 actor replacement): %v", err)
+	}
+	entries, err = s.Timeline(ctx, person.ID,
+		time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), end, 10)
+	if err != nil || len(entries) != 0 {
+		t.Errorf("Timeline after actor removal = %+v, %v; want no stale person link", entries, err)
+	}
+	if _, done, err := s.QueueRenormalization(ctx, 3, uuid.Nil, 10); err != nil || !done {
+		t.Fatalf("QueueRenormalization(v3) = done %t, err %v; want complete batch", done, err)
+	}
+	emptyVersion, found, err := s.ClaimNormalizationJob(ctx, "normalizer-v3", 3, time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimNormalizationJob(v3) = found %t, err %v; want true, nil", found, err)
+	}
+	if err := s.CompleteNormalization(ctx, emptyVersion, nil); err != nil {
+		t.Fatalf("CompleteNormalization(empty v3): %v", err)
+	}
+	if _, err := s.db.Exec(ctx, `
+		UPDATE normalization_jobs SET status = 'queued', attempts = 0, retry_at = NULL,
+		                              fencing_token = NULL, lease_owner = '', lease_expires_at = NULL
+		WHERE raw_event_id = $1 AND normalizer_version = 1`, normalization.RawEventID); err != nil {
+		t.Fatalf("requeue old normalizer after empty output: %v", err)
+	}
+	oldAfterEmpty, found, err := s.ClaimNormalizationJob(ctx, "normalizer-v1-again", 1, time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimNormalizationJob(old after empty output) = found %t, err %v; want true, nil", found, err)
+	}
+	if err := s.CompleteNormalization(ctx, oldAfterEmpty, []event.Action{action}); err != nil {
+		t.Fatalf("CompleteNormalization(old after empty output): %v", err)
+	}
+	entries, err = s.Timeline(ctx, person.ID,
+		time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), end, 10)
+	if err != nil || len(entries) != 0 {
+		t.Errorf("Timeline after old replay behind empty newer output = %+v, %v; want no current action", entries, err)
+	}
 	if job.ID != collection.ID || claim.ID == uuid.Nil {
 		t.Errorf("test fixtures job %s / claim %s were not assigned", job.ID, claim.ID)
 	}
@@ -420,39 +642,99 @@ func TestStore_normalizationIsReplayableAndVersioned(t *testing.T) {
 func TestStore_rateLimitReservationsCoordinateWorkers(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()
+	forge, err := s.CreateForgeInstance(ctx, "forge", "https://forge.example")
+	if err != nil {
+		t.Fatalf("CreateForgeInstance: %v", err)
+	}
+	claims := make([]JobClaim, 3)
+	for i := range claims {
+		person, err := s.CreatePerson(ctx, nil)
+		if err != nil {
+			t.Fatalf("CreatePerson(%d): %v", i, err)
+		}
+		if _, err := s.EnqueueCollectionJob(ctx, CollectionJobInput{
+			PersonID: person.ID, ForgeInstanceID: forge.ID, SourceKey: "forge",
+			Window: event.Window{To: time.Now().UTC()},
+		}); err != nil {
+			t.Fatalf("EnqueueCollectionJob(%d): %v", i, err)
+		}
+		claim, found, err := s.ClaimCollectionJob(ctx, "worker", time.Minute)
+		if err != nil || !found {
+			t.Fatalf("ClaimCollectionJob(%d) = found %t, err %v", i, found, err)
+		}
+		claims[i] = claim
+	}
+
 	const bucket = "forge:shared"
-	first, err := s.ReserveRateLimit(ctx, bucket)
-	if err != nil || !first.Granted {
-		t.Fatalf("ReserveRateLimit(first) = %+v, %v; want granted", first, err)
-	}
-	second, err := s.ReserveRateLimit(ctx, bucket)
-	if err != nil || second.Granted {
-		t.Fatalf("ReserveRateLimit(concurrent) = %+v, %v; want blocked while budget unknown", second, err)
-	}
-	if err := s.ReleaseRateLimit(ctx, bucket); err != nil {
-		t.Fatalf("ReleaseRateLimit: %v", err)
-	}
-	first, err = s.ReserveRateLimit(ctx, bucket)
-	if err != nil || !first.Granted {
-		t.Fatalf("ReserveRateLimit(after release) = %+v, %v; want granted", first, err)
-	}
-	remaining := 1
 	reset := time.Now().UTC().Add(time.Hour)
 	if _, err := s.db.Exec(ctx, `
-		UPDATE rate_limit_buckets SET remaining = $2, reset_at = $3, in_flight = 0
-		WHERE bucket_key = $1`, bucket, remaining, reset); err != nil {
-		t.Fatalf("record rate limit: %v", err)
+		INSERT INTO rate_limit_buckets (bucket_key, remaining, reset_at)
+		VALUES ($1, 2, $2)`, bucket, reset); err != nil {
+		t.Fatalf("initialize rate-limit bucket: %v", err)
 	}
-	reserved, err := s.ReserveRateLimit(ctx, bucket)
-	if err != nil || !reserved.Granted {
-		t.Fatalf("ReserveRateLimit(remaining request) = %+v, %v; want granted", reserved, err)
+	first, err := s.ReserveRateLimit(ctx, bucket, claims[0], time.Minute)
+	if err != nil || !first.Granted || first.ID == uuid.Nil {
+		t.Fatalf("ReserveRateLimit(first) = %+v, %v; want identified reservation", first, err)
 	}
-	blocked, err := s.ReserveRateLimit(ctx, bucket)
+	second, err := s.ReserveRateLimit(ctx, bucket, claims[1], time.Minute)
+	if err != nil || !second.Granted || second.ID == uuid.Nil {
+		t.Fatalf("ReserveRateLimit(second) = %+v, %v; want identified reservation", second, err)
+	}
+	reportedOne := 1
+	if _, err := s.PersistCollectionPage(ctx, claims[0], event.Page{Done: true},
+		event.FetchReport{
+			RateLimitBucket: bucket, RateLimitRemaining: &reportedOne, RateLimitResetAt: &reset,
+		}, true, 1, first.ID); err != nil {
+		t.Fatalf("PersistCollectionPage(first quota report): %v", err)
+	}
+	staleHigherReport := 1
+	if _, err := s.PersistCollectionPage(ctx, claims[1], event.Page{Done: true},
+		event.FetchReport{
+			RateLimitBucket: bucket, RateLimitRemaining: &staleHigherReport, RateLimitResetAt: &reset,
+		}, true, 1, second.ID); err != nil {
+		t.Fatalf("PersistCollectionPage(second quota report): %v", err)
+	}
+	blocked, err := s.ReserveRateLimit(ctx, bucket, claims[2], time.Minute)
 	if err != nil || blocked.Granted || blocked.ResetAt == nil {
 		t.Fatalf("ReserveRateLimit(exhausted) = %+v, %v; want reset-delayed", blocked, err)
 	}
 }
 
+func TestStore_rateLimitReservationsAreReclaimedAfterWorkerExpiry(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	person, err := s.CreatePerson(ctx, nil)
+	if err != nil {
+		t.Fatalf("CreatePerson: %v", err)
+	}
+	forge, err := s.CreateForgeInstance(ctx, "forge", "https://forge.example")
+	if err != nil {
+		t.Fatalf("CreateForgeInstance: %v", err)
+	}
+	if _, err := s.EnqueueCollectionJob(ctx, CollectionJobInput{
+		PersonID: person.ID, ForgeInstanceID: forge.ID, SourceKey: "forge",
+		Window: event.Window{To: time.Now().UTC()},
+	}); err != nil {
+		t.Fatalf("EnqueueCollectionJob: %v", err)
+	}
+	claim, found, err := s.ClaimCollectionJob(ctx, "worker", time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimCollectionJob = found %t, err %v; want true, nil", found, err)
+	}
+	first, err := s.ReserveRateLimit(ctx, "forge:unknown", claim, time.Minute)
+	if err != nil || !first.Granted {
+		t.Fatalf("ReserveRateLimit(first) = %+v, %v; want granted", first, err)
+	}
+	if _, err := s.db.Exec(ctx, `
+		UPDATE rate_limit_reservations SET expires_at = now() - interval '1 second'
+		WHERE id = $1`, first.ID); err != nil {
+		t.Fatalf("expire abandoned reservation: %v", err)
+	}
+	reclaimed, err := s.ReserveRateLimit(ctx, "forge:unknown", claim, time.Minute)
+	if err != nil || !reclaimed.Granted || reclaimed.ID == first.ID {
+		t.Fatalf("ReserveRateLimit(reclaimed) = %+v, %v; want a new granted reservation", reclaimed, err)
+	}
+}
 func countRows(t *testing.T, s *Store, query string, args ...any) int {
 	t.Helper()
 	var count int

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -15,18 +16,21 @@ import (
 )
 
 type runnerStore struct {
-	collectionClaim *store.JobClaim
-	normalization   *store.NormalizationClaim
-	pages           []persistedPage
-	retryCause      error
-	retryAt         time.Time
-	deferredAt      time.Time
-	failedReason    string
-	released        bool
-	quota           store.QuotaReservation
-	quotaBucket     string
-	completed       int
-	normalizedRetry int
+	collectionClaim       *store.JobClaim
+	normalization         *store.NormalizationClaim
+	pages                 []persistedPage
+	retryCause            error
+	retryAt               time.Time
+	deferredAt            time.Time
+	failedReason          string
+	released              bool
+	quota                 store.QuotaReservation
+	quotaBucket           string
+	completed             int
+	normalizedRetry       int
+	collectionRenewals    int
+	normalizationRenewals int
+	releasedQuota         int
 }
 
 type persistedPage struct {
@@ -45,11 +49,12 @@ func (s *runnerStore) ClaimCollectionJob(context.Context, string, time.Duration)
 	return claim, true, nil
 }
 
-func (*runnerStore) RenewCollectionLease(context.Context, store.JobClaim, time.Duration) error {
+func (s *runnerStore) RenewCollectionLease(context.Context, store.JobClaim, time.Duration) error {
+	s.collectionRenewals++
 	return nil
 }
 
-func (s *runnerStore) PersistCollectionPage(_ context.Context, claim store.JobClaim, page event.Page, report event.FetchReport, successful bool, _ int) (bool, error) {
+func (s *runnerStore) PersistCollectionPage(_ context.Context, claim store.JobClaim, page event.Page, report event.FetchReport, successful bool, _ int, _ uuid.UUID) (bool, error) {
 	s.pages = append(s.pages, persistedPage{page: page, report: report, successful: successful, cursor: claim.Cursor})
 	return successful && page.Done, nil
 }
@@ -74,8 +79,8 @@ func (s *runnerStore) ReleaseCollectionJob(context.Context, store.JobClaim) erro
 	return nil
 }
 
-func (s *runnerStore) ClaimNormalizationJob(context.Context, string, time.Duration) (store.NormalizationClaim, bool, error) {
-	if s.normalization == nil {
+func (s *runnerStore) ClaimNormalizationJob(_ context.Context, _ string, version int, _ time.Duration) (store.NormalizationClaim, bool, error) {
+	if s.normalization == nil || s.normalization.NormalizerVersion != version {
 		return store.NormalizationClaim{}, false, nil
 	}
 	claim := *s.normalization
@@ -83,7 +88,8 @@ func (s *runnerStore) ClaimNormalizationJob(context.Context, string, time.Durati
 	return claim, true, nil
 }
 
-func (*runnerStore) RenewNormalizationLease(context.Context, store.NormalizationClaim, time.Duration) error {
+func (s *runnerStore) RenewNormalizationLease(context.Context, store.NormalizationClaim, time.Duration) error {
+	s.normalizationRenewals++
 	return nil
 }
 
@@ -101,12 +107,15 @@ func (*runnerStore) FailNormalizationJob(context.Context, store.NormalizationCla
 	return nil
 }
 
-func (s *runnerStore) ReserveRateLimit(_ context.Context, bucket string) (store.QuotaReservation, error) {
+func (s *runnerStore) ReserveRateLimit(_ context.Context, bucket string, _ store.JobClaim, _ time.Duration) (store.QuotaReservation, error) {
 	s.quotaBucket = bucket
 	return s.quota, nil
 }
 
-func (*runnerStore) ReleaseRateLimit(context.Context, string) error { return nil }
+func (s *runnerStore) ReleaseRateLimit(context.Context, uuid.UUID) error {
+	s.releasedQuota++
+	return nil
+}
 
 type pageConnector struct {
 	source   event.Source
@@ -142,7 +151,7 @@ func TestRunner_RunOnce_persistsBoundedPages(t *testing.T) {
 			SourceKey: "test", ScanMode: "backfill", Window: window,
 		},
 		Token: uuid.New(), SyncRunID: uuid.New(),
-	}, quota: store.QuotaReservation{Granted: true}}
+	}, quota: store.QuotaReservation{Granted: true, ID: uuid.New()}}
 	connector := &pageConnector{
 		source: "test", bucket: "test:shared",
 		fetch: func(_ context.Context, request event.PageRequest) (event.Page, event.FetchReport, error) {
@@ -227,6 +236,52 @@ func TestRunner_RunOnce_persistsPartialReportAndRetriesWithoutAdvancingCursor(t 
 	}
 }
 
+func TestRunner_RunOnce_boundsEventsOnFetchError(t *testing.T) {
+	instanceID := uuid.New()
+	storeStub := &runnerStore{
+		collectionClaim: &store.JobClaim{
+			CollectionJob: store.CollectionJob{
+				ID: uuid.New(), PersonID: uuid.New(), ForgeInstanceID: instanceID,
+				SourceKey: "test", Window: event.Window{To: time.Now().UTC()},
+			},
+			Token: uuid.New(), SyncRunID: uuid.New(),
+		},
+		quota: store.QuotaReservation{Granted: true, ID: uuid.New()},
+	}
+	events := make([]event.RawEvent, 501)
+	for i := range events {
+		events[i] = event.RawEvent{
+			ForgeInstanceID: instanceID, Source: "test", ExternalID: fmt.Sprintf("event-%d", i),
+			Kind: "change", Payload: json.RawMessage(`{"id":1}`), PayloadSchemaVersion: 1,
+		}
+	}
+	connector := &pageConnector{
+		source: "test", bucket: "test:shared",
+		fetch: func(context.Context, event.PageRequest) (event.Page, event.FetchReport, error) {
+			return event.Page{Events: events, Done: true}, event.FetchReport{}, errors.New("partial fetch failure")
+		},
+	}
+	runner := newTestRunner(t, storeStub, []Connector{connector}, normalizerFunc(func(event.RawEvent) ([]event.Action, error) {
+		return nil, nil
+	}))
+	worked, err := runner.RunOnce(t.Context())
+	if !worked || !errors.Is(err, ErrInvalidConnectorPage) {
+		t.Fatalf("RunOnce(oversized failed page) = %t, %v; want true, invalid page", worked, err)
+	}
+	if len(storeStub.pages) != 1 {
+		t.Fatalf("persisted pages = %d, want 1", len(storeStub.pages))
+	}
+	if got := len(storeStub.pages[0].page.Events); got != defaultPageSize {
+		t.Errorf("persisted invalid events = %d, want bounded page size %d", got, defaultPageSize)
+	}
+	if storeStub.failedReason == "" || storeStub.retryCause != nil {
+		t.Errorf("invalid page failure = %q, retry = %v; want permanent failure without retry", storeStub.failedReason, storeStub.retryCause)
+	}
+	if storeStub.releasedQuota != 0 {
+		t.Errorf("settled quota reservations = %d, want 0 after successful partial-page persistence", storeStub.releasedQuota)
+	}
+}
+
 func TestRunner_RunOnce_defersWhenQuotaIsEmpty(t *testing.T) {
 	resetAt := time.Now().UTC().Add(time.Hour)
 	storeStub := &runnerStore{
@@ -298,6 +353,49 @@ func TestRunner_RunOnce_normalizesStoredEvent(t *testing.T) {
 	worked, err := runner.RunOnce(t.Context())
 	if err != nil || !worked {
 		t.Fatalf("RunOnce() = %t, %v; want true, nil", worked, err)
+	}
+	if storeStub.completed != 1 {
+		t.Errorf("completed normalizations = %d, want 1", storeStub.completed)
+	}
+}
+
+func TestRunner_RunOnce_onlyClaimsSupportedNormalizerVersion(t *testing.T) {
+	storeStub := &runnerStore{normalization: &store.NormalizationClaim{
+		RawEventID: uuid.New(), NormalizerVersion: 2,
+		Event: event.RawEvent{Source: "test", Kind: "change", ExternalID: "stored"},
+	}}
+	runner := newTestRunner(t, storeStub, nil, normalizerFunc(func(event.RawEvent) ([]event.Action, error) {
+		return nil, nil
+	}))
+	worked, err := runner.RunOnce(t.Context())
+	if worked || err != nil {
+		t.Fatalf("RunOnce(unsupported version) = %t, %v; want no work and no error", worked, err)
+	}
+	if storeStub.completed != 0 || storeStub.normalization == nil {
+		t.Errorf("unsupported normalization claim consumed: completed=%d claim=%+v", storeStub.completed, storeStub.normalization)
+	}
+}
+
+func TestRunner_RunOnce_renewsLongNormalizationLease(t *testing.T) {
+	storeStub := &runnerStore{normalization: &store.NormalizationClaim{
+		RawEventID: uuid.New(), NormalizerVersion: 1,
+		Event: event.RawEvent{Source: "test", Kind: "change", ExternalID: "slow"},
+	}}
+	runner, err := NewRunner(storeStub, nil, normalizerFunc(func(event.RawEvent) ([]event.Action, error) {
+		time.Sleep(100 * time.Millisecond)
+		return nil, nil
+	}), slog.New(slog.NewTextHandler(io.Discard, nil)), RunnerOptions{
+		Owner: "slow-normalizer", LeaseDuration: 30 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	worked, err := runner.RunOnce(t.Context())
+	if !worked || err != nil {
+		t.Fatalf("RunOnce(slow normalization) = %t, %v; want true, nil", worked, err)
+	}
+	if storeStub.normalizationRenewals < 1 {
+		t.Errorf("normalization lease renewals = %d, want at least 1", storeStub.normalizationRenewals)
 	}
 	if storeStub.completed != 1 {
 		t.Errorf("completed normalizations = %d, want 1", storeStub.completed)

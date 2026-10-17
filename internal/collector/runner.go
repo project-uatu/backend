@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/project-uatu/backend/internal/event"
 	"github.com/project-uatu/backend/internal/store"
 )
@@ -18,18 +19,18 @@ const defaultPageSize = 100
 type durableWork interface {
 	ClaimCollectionJob(context.Context, string, time.Duration) (store.JobClaim, bool, error)
 	RenewCollectionLease(context.Context, store.JobClaim, time.Duration) error
-	PersistCollectionPage(context.Context, store.JobClaim, event.Page, event.FetchReport, bool, int) (bool, error)
+	PersistCollectionPage(context.Context, store.JobClaim, event.Page, event.FetchReport, bool, int, uuid.UUID) (bool, error)
 	DeferCollectionJob(context.Context, store.JobClaim, time.Time) error
 	RetryCollectionJob(context.Context, store.JobClaim, error, time.Time) error
 	FailCollectionJob(context.Context, store.JobClaim, string) error
 	ReleaseCollectionJob(context.Context, store.JobClaim) error
-	ClaimNormalizationJob(context.Context, string, time.Duration) (store.NormalizationClaim, bool, error)
+	ClaimNormalizationJob(context.Context, string, int, time.Duration) (store.NormalizationClaim, bool, error)
 	RenewNormalizationLease(context.Context, store.NormalizationClaim, time.Duration) error
 	CompleteNormalization(context.Context, store.NormalizationClaim, []event.Action) error
 	RetryNormalizationJob(context.Context, store.NormalizationClaim, error, time.Time) error
 	FailNormalizationJob(context.Context, store.NormalizationClaim, string) error
-	ReserveRateLimit(context.Context, string) (store.QuotaReservation, error)
-	ReleaseRateLimit(context.Context, string) error
+	ReserveRateLimit(context.Context, string, store.JobClaim, time.Duration) (store.QuotaReservation, error)
+	ReleaseRateLimit(context.Context, uuid.UUID) error
 }
 
 // Connector fetches one bounded page for a source.
@@ -85,7 +86,7 @@ func NewRunner(s durableWork, connectors []Connector, transformer Normalizer, lo
 	if options.NormalizerVersion == 0 {
 		options.NormalizerVersion = 1
 	}
-	if options.LeaseDuration <= 0 || options.PollInterval <= 0 ||
+	if options.LeaseDuration < 3*time.Millisecond || options.PollInterval <= 0 ||
 		options.PageSize < 1 || options.PageSize > 500 || options.NormalizerVersion < 1 {
 		return nil, errors.New("collector runner options must be positive and page size must not exceed 500")
 	}
@@ -110,7 +111,8 @@ func NewRunner(s durableWork, connectors []Connector, transformer Normalizer, lo
 
 // RunOnce processes one normalization item or one complete source scan.
 func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
-	normalization, found, err := r.store.ClaimNormalizationJob(ctx, r.options.Owner, r.options.LeaseDuration)
+	normalization, found, err := r.store.ClaimNormalizationJob(
+		ctx, r.options.Owner, r.options.NormalizerVersion, r.options.LeaseDuration)
 	if err != nil {
 		return false, fmt.Errorf("claim normalization work: %w", err)
 	}
@@ -173,6 +175,9 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 		if err := ctx.Err(); err != nil {
 			return r.releaseCanceledJob(ctx, claim, err)
 		}
+		if err := r.store.RenewCollectionLease(ctx, claim, r.options.LeaseDuration); err != nil {
+			return fmt.Errorf("renew collection lease before page: %w", err)
+		}
 		bucket := connector.QuotaBucket()
 		request := event.PageRequest{
 			PersonID: claim.PersonID, ForgeInstanceID: claim.ForgeInstanceID,
@@ -182,8 +187,9 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 		if err := request.Validate(); err != nil {
 			return r.store.FailCollectionJob(ctx, claim, "invalid collection request")
 		}
+		var reservationID uuid.UUID
 		if bucket != "" {
-			reservation, err := r.store.ReserveRateLimit(ctx, bucket)
+			reservation, err := r.store.ReserveRateLimit(ctx, bucket, claim, r.options.LeaseDuration)
 			if err != nil {
 				return fmt.Errorf("reserve upstream quota: %w", err)
 			}
@@ -194,6 +200,7 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 				}
 				return r.store.DeferCollectionJob(ctx, claim, retryAt)
 			}
+			reservationID = reservation.ID
 		}
 		page, report, fetchErr := r.fetchPage(ctx, connector, request, claim)
 		report = sanitizeFetchReport(report)
@@ -211,17 +218,17 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 				report.Errors = append(report.Errors, "connector returned an invalid page")
 				persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 				_, persistErr := r.store.PersistCollectionPage(
-					persistCtx, claim, page, report, false, r.options.NormalizerVersion)
+					persistCtx, claim, page, report, false, r.options.NormalizerVersion, reservationID)
 				cancel()
 				if persistErr != nil {
 					fetchErr = errors.Join(fetchErr, fmt.Errorf("persist invalid page report: %w", persistErr))
-				}
-				if bucket != "" {
-					releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-					err := r.store.ReleaseRateLimit(releaseCtx, bucket)
-					releaseCancel()
-					if err != nil {
-						return errors.Join(fetchErr, fmt.Errorf("release quota after invalid page: %w", err))
+					if reservationID != uuid.Nil {
+						releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+						err := r.store.ReleaseRateLimit(releaseCtx, reservationID)
+						releaseCancel()
+						if err != nil {
+							return errors.Join(fetchErr, fmt.Errorf("settle quota after invalid page: %w", err))
+						}
 					}
 				}
 				failCtx, failCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -235,14 +242,14 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 				persistCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			}
 			_, persistErr := r.store.PersistCollectionPage(
-				persistCtx, claim, page, report, false, r.options.NormalizerVersion)
+				persistCtx, claim, page, report, false, r.options.NormalizerVersion, reservationID)
 			cancel()
-			if persistErr != nil && bucket != "" {
+			if persistErr != nil && reservationID != uuid.Nil {
 				releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-				releaseErr := r.store.ReleaseRateLimit(releaseCtx, bucket)
+				releaseErr := r.store.ReleaseRateLimit(releaseCtx, reservationID)
 				releaseCancel()
 				if releaseErr != nil {
-					persistErr = errors.Join(persistErr, fmt.Errorf("release quota reservation: %w", releaseErr))
+					persistErr = errors.Join(persistErr, fmt.Errorf("settle quota reservation: %w", releaseErr))
 				}
 			}
 			if errors.Is(fetchErr, context.Canceled) && ctx.Err() != nil {
@@ -259,15 +266,15 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 			return r.store.RetryCollectionJob(ctx, claim, errors.New(safeFetchFailure(fetchErr)), retryAt)
 		}
 		done, err := r.store.PersistCollectionPage(
-			ctx, claim, page, report, true, r.options.NormalizerVersion)
+			ctx, claim, page, report, true, r.options.NormalizerVersion, reservationID)
 		if err != nil {
-			if bucket != "" {
+			if reservationID != uuid.Nil {
 				releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-				releaseErr := r.store.ReleaseRateLimit(releaseCtx, bucket)
+				releaseErr := r.store.ReleaseRateLimit(releaseCtx, reservationID)
 				cancel()
 				if releaseErr != nil {
 					return errors.Join(fmt.Errorf("persist collection page: %w", err),
-						fmt.Errorf("release quota reservation: %w", releaseErr))
+						fmt.Errorf("settle quota reservation: %w", releaseErr))
 				}
 			}
 			return fmt.Errorf("persist collection page: %w", err)
@@ -288,11 +295,7 @@ func (r *Runner) fetchPage(ctx context.Context, connector Connector, request eve
 	heartbeatErrors := make(chan error, 1)
 	var heartbeat sync.WaitGroup
 	heartbeat.Go(func() {
-		interval := r.options.LeaseDuration / 3
-		if interval < time.Second {
-			interval = time.Second
-		}
-		ticker := time.NewTicker(interval)
+		ticker := time.NewTicker(leaseHeartbeatInterval(r.options.LeaseDuration))
 		defer ticker.Stop()
 		for {
 			select {
@@ -300,6 +303,9 @@ func (r *Runner) fetchPage(ctx context.Context, connector Connector, request eve
 				return
 			case <-ticker.C:
 				if err := r.store.RenewCollectionLease(fetchCtx, claim, r.options.LeaseDuration); err != nil {
+					if errors.Is(err, context.Canceled) && fetchCtx.Err() != nil {
+						return
+					}
 					select {
 					case heartbeatErrors <- err:
 					default:
@@ -318,13 +324,13 @@ func (r *Runner) fetchPage(ctx context.Context, connector Connector, request eve
 		return page, report, fmt.Errorf("maintain collection lease: %w", heartbeatErr)
 	default:
 	}
-	if err != nil {
-		page.Events = validatedEvents(page.Events, request)
-		return page, report, err
-	}
 	if len(page.Events) > request.PageSize {
 		page.Events = validatedEvents(page.Events[:request.PageSize], request)
 		return page, report, fmt.Errorf("%w: connector returned more events than the requested page size", ErrInvalidConnectorPage)
+	}
+	if err != nil {
+		page.Events = validatedEvents(page.Events, request)
+		return page, report, err
 	}
 	if !page.Done && (page.NextCursor == "" || page.NextCursor == request.Cursor) {
 		page.Events = validatedEvents(page.Events, request)
@@ -349,14 +355,46 @@ func validatedEvents(events []event.RawEvent, request event.PageRequest) []event
 }
 
 func (r *Runner) processNormalization(ctx context.Context, claim store.NormalizationClaim) error {
-	actions, err := r.normalizer.Normalize(claim.Event)
-	if err != nil {
+	normalizationCtx, cancel := context.WithCancel(ctx)
+	heartbeatErrors := make(chan error, 1)
+	var heartbeat sync.WaitGroup
+	heartbeat.Go(func() {
+		ticker := time.NewTicker(leaseHeartbeatInterval(r.options.LeaseDuration))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-normalizationCtx.Done():
+				return
+			case <-ticker.C:
+				if err := r.store.RenewNormalizationLease(normalizationCtx, claim, r.options.LeaseDuration); err != nil {
+					if errors.Is(err, context.Canceled) && normalizationCtx.Err() != nil {
+						return
+					}
+					select {
+					case heartbeatErrors <- err:
+					default:
+					}
+					cancel()
+					return
+				}
+			}
+		}
+	})
+	actions, normalizeErr := r.normalizer.Normalize(claim.Event)
+	cancel()
+	heartbeat.Wait()
+	select {
+	case heartbeatErr := <-heartbeatErrors:
+		return fmt.Errorf("maintain normalization lease: %w", heartbeatErr)
+	default:
+	}
+	if normalizeErr != nil {
 		retryAt := nextRetry(claim.Attempts)
 		if retryErr := r.store.RetryNormalizationJob(ctx, claim, errors.New("normalization failed"), retryAt); retryErr != nil {
-			return errors.Join(fmt.Errorf("normalize raw event: %w", err), retryErr)
+			return errors.Join(fmt.Errorf("normalize raw event: %w", normalizeErr), retryErr)
 		}
 		r.logger.ErrorContext(ctx, "normalization will retry", "raw_event_id", claim.RawEventID,
-			"normalizer_version", claim.NormalizerVersion, "err", safeFetchFailure(err))
+			"normalizer_version", claim.NormalizerVersion, "err", safeFetchFailure(normalizeErr))
 		return nil
 	}
 	if err := r.store.CompleteNormalization(ctx, claim, actions); err != nil {
@@ -391,6 +429,10 @@ func nextRetry(attempt int) time.Time {
 	delay = min(delay, time.Hour)
 	jitter := time.Duration(rand.Int64N(delay.Microseconds())) * time.Microsecond
 	return time.Now().UTC().Add(delay/2 + jitter)
+}
+
+func leaseHeartbeatInterval(lease time.Duration) time.Duration {
+	return max(lease/3, time.Millisecond)
 }
 
 func safeFetchFailure(err error) string {

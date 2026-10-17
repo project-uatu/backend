@@ -16,6 +16,9 @@ import (
 // ErrLeaseLost indicates that a job was reclaimed or its lease expired.
 var ErrLeaseLost = errors.New("work lease lost")
 
+// ErrCollectionJobActive indicates a conflicting scan is already queued or running.
+var ErrCollectionJobActive = errors.New("collection scan already active")
+
 // CollectionJob describes durable work for one person and source.
 type CollectionJob struct {
 	ID              uuid.UUID
@@ -68,6 +71,7 @@ type NormalizationClaim struct {
 type QuotaReservation struct {
 	Granted bool
 	ResetAt *time.Time
+	ID      uuid.UUID
 }
 
 // EnqueueCollectionJob creates or coalesces pending work for a source.
@@ -105,75 +109,78 @@ func (s *Store) EnqueueCollectionJob(ctx context.Context, input CollectionJobInp
 		return CollectionJob{}, fmt.Errorf("begin collection enqueue: %w", err)
 	}
 	defer rollbackTx(ctx, tx, "collection enqueue", &enqueueErr)
-	var checkpointCursor string
-	if input.ScanMode == "incremental" {
-		err = tx.QueryRow(ctx, `
-			SELECT incremental_cursor FROM checkpoints
-			WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3`,
-			input.PersonID, input.ForgeInstanceID, input.SourceKey).Scan(&checkpointCursor)
-	} else {
-		err = tx.QueryRow(ctx, `
-			SELECT cursor FROM checkpoints
-			WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3`,
-			input.PersonID, input.ForgeInstanceID, input.SourceKey).Scan(&checkpointCursor)
-	}
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return CollectionJob{}, fmt.Errorf("load collection checkpoint: %w", err)
-	}
 	if input.IdempotencyKey != "" {
-		var existing CollectionJob
-		var existingWindowStart *time.Time
-		err := tx.QueryRow(ctx, `
-			SELECT id, person_id, forge_instance_id, source_key, scan_mode,
-			       window_start, window_end, cursor, due_at, attempts, max_attempts
-			FROM jobs
-			WHERE person_id = $1 AND forge_instance_id = $2
-			  AND source_key = $3 AND idempotency_key = $4`,
-			input.PersonID, input.ForgeInstanceID, input.SourceKey, input.IdempotencyKey).
-			Scan(&existing.ID, &existing.PersonID, &existing.ForgeInstanceID, &existing.SourceKey,
-				&existing.ScanMode, &existingWindowStart, &existing.Window.To, &existing.Cursor,
-				&existing.DueAt, &existing.Attempts, &existing.MaxAttempts)
-		if err == nil {
+		lockKey := fmt.Sprintf("%s:%s:%d:%s:%d:%s",
+			input.PersonID, input.ForgeInstanceID, len(input.SourceKey), input.SourceKey,
+			len(input.IdempotencyKey), input.IdempotencyKey)
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", lockKey); err != nil {
+			return CollectionJob{}, fmt.Errorf("lock collection idempotency key: %w", err)
+		}
+		existing, found, err := collectionJobForIdempotencyKey(ctx, tx, input)
+		if err != nil {
+			return CollectionJob{}, err
+		}
+		if found {
 			if err := tx.Commit(ctx); err != nil {
 				return CollectionJob{}, fmt.Errorf("commit idempotent collection enqueue: %w", err)
 			}
-			existing.DueAt = existing.DueAt.UTC()
-			if existingWindowStart != nil {
-				existing.Window.From = existingWindowStart.UTC()
-			}
-			existing.Window.To = existing.Window.To.UTC()
 			return existing, nil
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return CollectionJob{}, fmt.Errorf("find idempotent collection job: %w", err)
 		}
 	}
 	job = CollectionJob{
 		ID: uuid.New(), PersonID: input.PersonID, ForgeInstanceID: input.ForgeInstanceID,
 		SourceKey: input.SourceKey, ScanMode: input.ScanMode, Window: input.Window,
-		Cursor: checkpointCursor, DueAt: input.DueAt, MaxAttempts: input.MaxAttempts,
+		Cursor: "", DueAt: input.DueAt, MaxAttempts: input.MaxAttempts,
 	}
 	var windowStart *time.Time
 	err = tx.QueryRow(ctx, `
 		INSERT INTO jobs
 			(id, person_id, forge_instance_id, source_key, status, due_at, max_attempts, cursor,
 			 idempotency_key, scan_mode, window_start, window_end)
-		VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, NULLIF($8, ''), $9, $10, $11)
+		VALUES ($1, $2, $3, $4, 'queued', $5, $6, '', NULLIF($7, ''), $8, $9, $10)
 		ON CONFLICT (person_id, forge_instance_id, source_key)
-			WHERE status = 'queued'
+			WHERE status IN ('queued', 'running')
 		DO UPDATE SET due_at = LEAST(jobs.due_at, EXCLUDED.due_at),
 		              idempotency_key = COALESCE(jobs.idempotency_key, EXCLUDED.idempotency_key),
-		              scan_mode = CASE WHEN jobs.scan_mode = 'backfill' OR EXCLUDED.scan_mode = 'backfill' THEN 'backfill' ELSE 'incremental' END,
-		              window_start = CASE WHEN jobs.window_start IS NULL OR EXCLUDED.window_start IS NULL THEN NULL ELSE LEAST(jobs.window_start, EXCLUDED.window_start) END,
-		              window_end = GREATEST(jobs.window_end, EXCLUDED.window_end),
 		              updated_at = now()
+		WHERE jobs.scan_mode = EXCLUDED.scan_mode
+		  AND jobs.window_start IS NOT DISTINCT FROM EXCLUDED.window_start
+		  AND jobs.window_end = EXCLUDED.window_end
 		RETURNING id, scan_mode, window_start, window_end, cursor, due_at, attempts, max_attempts`,
 		job.ID, input.PersonID, input.ForgeInstanceID, input.SourceKey, input.DueAt,
-		input.MaxAttempts, checkpointCursor, input.IdempotencyKey, input.ScanMode, nullableTime(input.Window.From),
+		input.MaxAttempts, input.IdempotencyKey, input.ScanMode, nullableTime(input.Window.From),
 		input.Window.To.UTC()).Scan(&job.ID, &job.ScanMode, &windowStart, &job.Window.To,
 		&job.Cursor, &job.DueAt, &job.Attempts, &job.MaxAttempts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CollectionJob{}, fmt.Errorf("%w: requested scan window or mode differs from active work", ErrCollectionJobActive)
+	}
 	if err != nil {
 		return CollectionJob{}, fmt.Errorf("enqueue collection job: %w", err)
+	}
+	if input.IdempotencyKey != "" {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO job_idempotency_keys
+				(person_id, forge_instance_id, source_key, idempotency_key, job_id)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (person_id, forge_instance_id, source_key, idempotency_key)
+			DO NOTHING`,
+			input.PersonID, input.ForgeInstanceID, input.SourceKey, input.IdempotencyKey, job.ID)
+		if err != nil {
+			return CollectionJob{}, fmt.Errorf("associate collection idempotency key: %w", err)
+		}
+		var associatedJobID uuid.UUID
+		err := tx.QueryRow(ctx, `
+			SELECT job_id FROM job_idempotency_keys
+			WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3
+			  AND idempotency_key = $4`,
+			input.PersonID, input.ForgeInstanceID, input.SourceKey, input.IdempotencyKey).
+			Scan(&associatedJobID)
+		if err != nil {
+			return CollectionJob{}, fmt.Errorf("load collection idempotency association: %w", err)
+		}
+		if associatedJobID != job.ID {
+			return CollectionJob{}, fmt.Errorf("%w: idempotency key is associated with another job", ErrCollectionJobActive)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return CollectionJob{}, fmt.Errorf("commit collection enqueue: %w", err)
@@ -184,6 +191,34 @@ func (s *Store) EnqueueCollectionJob(ctx context.Context, input CollectionJobInp
 	job.Window.To = job.Window.To.UTC()
 	job.DueAt = job.DueAt.UTC()
 	return job, nil
+}
+
+func collectionJobForIdempotencyKey(ctx context.Context, tx pgx.Tx, input CollectionJobInput) (CollectionJob, bool, error) {
+	var job CollectionJob
+	var windowStart *time.Time
+	err := tx.QueryRow(ctx, `
+		SELECT j.id, j.person_id, j.forge_instance_id, j.source_key, j.scan_mode,
+		       j.window_start, j.window_end, j.cursor, j.due_at, j.attempts, j.max_attempts
+		FROM job_idempotency_keys k
+		JOIN jobs j ON j.id = k.job_id
+		WHERE k.person_id = $1 AND k.forge_instance_id = $2
+		  AND k.source_key = $3 AND k.idempotency_key = $4`,
+		input.PersonID, input.ForgeInstanceID, input.SourceKey, input.IdempotencyKey).
+		Scan(&job.ID, &job.PersonID, &job.ForgeInstanceID, &job.SourceKey,
+			&job.ScanMode, &windowStart, &job.Window.To, &job.Cursor,
+			&job.DueAt, &job.Attempts, &job.MaxAttempts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CollectionJob{}, false, nil
+	}
+	if err != nil {
+		return CollectionJob{}, false, fmt.Errorf("find idempotent collection job: %w", err)
+	}
+	if windowStart != nil {
+		job.Window.From = windowStart.UTC()
+	}
+	job.Window.To = job.Window.To.UTC()
+	job.DueAt = job.DueAt.UTC()
+	return job, true, nil
 }
 
 // ClaimCollectionJob claims one due job and starts a sync run.
@@ -288,11 +323,16 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 
 // RenewCollectionLease extends a live claim without allowing a stale worker to
 // renew work that has already been reclaimed.
-func (s *Store) RenewCollectionLease(ctx context.Context, claim JobClaim, lease time.Duration) error {
+func (s *Store) RenewCollectionLease(ctx context.Context, claim JobClaim, lease time.Duration) (renewErr error) {
 	if lease <= 0 {
 		return errors.New("collection lease duration must be positive")
 	}
-	tag, err := s.db.Exec(ctx, `
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin collection lease renewal: %w", err)
+	}
+	defer rollbackTx(ctx, tx, "collection lease renewal", &renewErr)
+	tag, err := tx.Exec(ctx, `
 		UPDATE jobs SET lease_expires_at = now() + ($3 * interval '1 microsecond'), updated_at = now()
 		WHERE id = $1 AND status = 'running' AND fencing_token = $2
 		  AND lease_expires_at > now()`, claim.ID, claim.Token, lease.Microseconds())
@@ -302,14 +342,27 @@ func (s *Store) RenewCollectionLease(ctx context.Context, claim JobClaim, lease 
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("renew collection lease: %w", ErrLeaseLost)
 	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE rate_limit_reservations
+		SET expires_at = now() + ($3 * interval '1 microsecond')
+		WHERE job_id = $1 AND fencing_token = $2`,
+		claim.ID, claim.Token, lease.Microseconds()); err != nil {
+		return fmt.Errorf("renew collection quota reservation: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit collection lease renewal: %w", err)
+	}
 	return nil
 }
 
 // PersistCollectionPage stores a page and advances its cursor only when the
 // connector completed the page successfully.
-func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page event.Page, report event.FetchReport, successful bool, normalizerVersion int) (done bool, persistErr error) {
+func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page event.Page, report event.FetchReport, successful bool, normalizerVersion int, reservationID uuid.UUID) (done bool, persistErr error) {
 	if normalizerVersion < 1 {
 		return false, errors.New("normalizer version must be positive")
+	}
+	if reservationID != uuid.Nil && report.RateLimitBucket == "" {
+		return false, errors.New("quota reservation requires a reported bucket")
 	}
 	if len(page.Events) > 500 {
 		return false, errors.New("connector page exceeds maximum size")
@@ -400,10 +453,17 @@ func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page 
 			gap.From.UTC(), gap.To.UTC(), gap.Reason, claim.SyncRunID); err != nil {
 			return false, fmt.Errorf("record collection coverage gap: %w", err)
 		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO collection_scan_gaps (job_id, range_start, range_end, gap_reason)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (job_id, range_start, range_end, gap_reason) DO NOTHING`,
+			claim.ID, gap.From.UTC(), gap.To.UTC(), gap.Reason); err != nil {
+			return false, fmt.Errorf("record logical scan gap: %w", err)
+		}
 	}
 	if report.RateLimitBucket != "" {
 		if err := recordRateLimitTx(ctx, tx, report.RateLimitBucket,
-			report.RateLimitRemaining, report.RateLimitResetAt); err != nil {
+			report.RateLimitRemaining, report.RateLimitResetAt, reservationID); err != nil {
 			return false, err
 		}
 		if report.RateLimitResetAt != nil {
@@ -418,26 +478,27 @@ func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page 
 			}
 		}
 	}
-	if successful {
-		if err := advanceCollectionCursor(ctx, tx, claim, page.NextCursor, page.Done); err != nil {
-			return false, err
-		}
-	}
 	if !successful {
 		if err := tx.Commit(ctx); err != nil {
 			return false, fmt.Errorf("commit partial collection page: %w", err)
 		}
 		return false, nil
 	}
+	scanComplete := false
 	if page.Done {
 		var gapCount int
 		if err := tx.QueryRow(ctx, `
-			SELECT count(*) FROM sync_coverage
-			WHERE sync_run_id = $1 AND status = 'gap'`, claim.SyncRunID).Scan(&gapCount); err != nil {
-			return false, fmt.Errorf("count collection coverage gaps: %w", err)
+			SELECT count(*) FROM collection_scan_gaps WHERE job_id = $1`, claim.ID).Scan(&gapCount); err != nil {
+			return false, fmt.Errorf("count scan coverage gaps: %w", err)
 		}
+		scanComplete = gapCount == 0
+	}
+	if err := advanceCollectionCursor(ctx, tx, claim, page.NextCursor, scanComplete); err != nil {
+		return false, err
+	}
+	if page.Done {
 		runStatus := "succeeded"
-		if gapCount > 0 {
+		if !scanComplete {
 			runStatus = "partial"
 		} else {
 			start := claim.Window.From
@@ -719,19 +780,28 @@ func upsertRawEvent(ctx context.Context, tx pgx.Tx, raw event.RawEvent, actorJSO
 	return eventID, true, nil
 }
 
-func advanceCollectionCursor(ctx context.Context, tx pgx.Tx, claim JobClaim, cursor string, done bool) error {
+func advanceCollectionCursor(ctx context.Context, tx pgx.Tx, claim JobClaim, cursor string, scanComplete bool) error {
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO checkpoints (person_id, forge_instance_id, source_key, cursor, incremental_cursor)
+		INSERT INTO checkpoints
+			(person_id, forge_instance_id, source_key, cursor, incremental_cursor,
+			 backfill_complete, completed_through)
 		VALUES ($1, $2, $3, CASE WHEN $4 = 'backfill' THEN $5 ELSE '' END,
-		                   CASE WHEN $4 = 'incremental' THEN $5 ELSE '' END)
+		                   CASE WHEN $4 = 'incremental' THEN $5 ELSE '' END,
+		                   ($4 = 'backfill' AND $6),
+		                   CASE WHEN $4 = 'incremental' AND $6 THEN $7::timestamptz ELSE NULL::timestamptz END)
 		ON CONFLICT (person_id, forge_instance_id, source_key)
 		DO UPDATE SET cursor = CASE WHEN $4 = 'backfill' THEN EXCLUDED.cursor ELSE checkpoints.cursor END,
 		              incremental_cursor = CASE WHEN $4 = 'incremental' THEN EXCLUDED.incremental_cursor ELSE checkpoints.incremental_cursor END,
 		              backfill_complete = CASE WHEN $4 = 'backfill' AND $6 THEN true ELSE checkpoints.backfill_complete END,
-		              completed_through = CASE WHEN $4 = 'incremental' AND $6 THEN $7 ELSE checkpoints.completed_through END,
+		              completed_through = CASE
+		                  WHEN $4 = 'incremental' AND $6
+		                  THEN GREATEST(COALESCE(checkpoints.completed_through, EXCLUDED.completed_through),
+		                                EXCLUDED.completed_through)
+		                  ELSE checkpoints.completed_through
+		              END,
 		              updated_at = now()`,
-		claim.PersonID, claim.ForgeInstanceID, claim.SourceKey, claim.ScanMode, cursor, done,
-		claim.Window.To.UTC()); err != nil {
+		claim.PersonID, claim.ForgeInstanceID, claim.SourceKey, claim.ScanMode, cursor,
+		scanComplete, claim.Window.To.UTC()); err != nil {
 		return fmt.Errorf("advance collection checkpoint: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
@@ -742,35 +812,87 @@ func advanceCollectionCursor(ctx context.Context, tx pgx.Tx, claim JobClaim, cur
 	return nil
 }
 
-func recordRateLimitTx(ctx context.Context, tx pgx.Tx, bucket string, remaining *int, resetAt *time.Time) error {
+func recordRateLimitTx(ctx context.Context, tx pgx.Tx, bucket string, remaining *int, resetAt *time.Time, reservationID uuid.UUID) error {
 	if bucket == "" || remaining != nil && *remaining < 0 {
 		return errors.New("rate-limit report has invalid bucket or counters")
 	}
-	_, err := tx.Exec(ctx, `
-		INSERT INTO rate_limit_buckets (bucket_key, remaining, reset_at)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (bucket_key)
-		DO UPDATE SET remaining = COALESCE(EXCLUDED.remaining, rate_limit_buckets.remaining),
-		              reset_at = COALESCE(EXCLUDED.reset_at, rate_limit_buckets.reset_at),
-		              in_flight = GREATEST(rate_limit_buckets.in_flight - 1, 0),
-		              updated_at = now()`,
-		bucket, remaining, resetAt)
-	if err != nil {
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO rate_limit_buckets (bucket_key) VALUES ($1)
+		ON CONFLICT (bucket_key) DO NOTHING`, bucket); err != nil {
 		return fmt.Errorf("record upstream rate limit: %w", err)
+	}
+	var currentRemaining *int
+	var currentReset *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT remaining, reset_at FROM rate_limit_buckets
+		WHERE bucket_key = $1 FOR UPDATE`, bucket).Scan(&currentRemaining, &currentReset); err != nil {
+		return fmt.Errorf("lock upstream rate-limit bucket: %w", err)
+	}
+	if reservationID != uuid.Nil {
+		tag, err := tx.Exec(ctx, `
+			DELETE FROM rate_limit_reservations
+			WHERE id = $1 AND bucket_key = $2`, reservationID, bucket)
+		if err != nil {
+			return fmt.Errorf("settle upstream quota reservation: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return fmt.Errorf("settle upstream quota reservation: %w", ErrLeaseLost)
+		}
+	}
+	var inFlight int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*) FROM rate_limit_reservations WHERE bucket_key = $1`, bucket).Scan(&inFlight); err != nil {
+		return fmt.Errorf("count outstanding quota reservations: %w", err)
+	}
+
+	now := time.Now().UTC()
+	newWindow := resetAt != nil && (currentReset == nil || resetAt.After(*currentReset))
+	if currentReset != nil && !currentReset.After(now) {
+		currentRemaining = nil
+		currentReset = nil
+		newWindow = resetAt != nil
+	}
+	var nextRemaining *int
+	if remaining != nil {
+		reportedAvailable := max(0, *remaining-inFlight)
+		switch {
+		case newWindow || currentRemaining == nil:
+			nextRemaining = &reportedAvailable
+		case reportedAvailable < *currentRemaining:
+			nextRemaining = &reportedAvailable
+		default:
+			nextRemaining = currentRemaining
+		}
+	} else {
+		nextRemaining = currentRemaining
+	}
+	nextReset := currentReset
+	if resetAt != nil && (nextReset == nil || resetAt.After(*nextReset)) {
+		nextReset = resetAt
+	}
+	_, err := tx.Exec(ctx, `
+		UPDATE rate_limit_buckets
+		SET remaining = $2, reset_at = $3, in_flight = $4, updated_at = now()
+		WHERE bucket_key = $1`, bucket, nextRemaining, nextReset, inFlight)
+	if err != nil {
+		return fmt.Errorf("update upstream rate-limit bucket: %w", err)
 	}
 	return nil
 }
 
 // ReserveRateLimit reserves one request from a provider quota bucket.
-func (s *Store) ReserveRateLimit(ctx context.Context, bucket string) (reservation QuotaReservation, reserveErr error) {
-	if bucket == "" {
-		return QuotaReservation{}, errors.New("rate-limit bucket is required")
+func (s *Store) ReserveRateLimit(ctx context.Context, bucket string, claim JobClaim, lease time.Duration) (reservation QuotaReservation, reserveErr error) {
+	if bucket == "" || lease <= 0 {
+		return QuotaReservation{}, errors.New("rate-limit reservation requires bucket and positive lease")
 	}
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return QuotaReservation{}, fmt.Errorf("begin rate-limit reservation: %w", err)
 	}
 	defer rollbackTx(ctx, tx, "rate-limit reservation", &reserveErr)
+	if err := lockJobClaim(ctx, tx, claim.ID, claim.Token); err != nil {
+		return QuotaReservation{}, err
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO rate_limit_buckets (bucket_key)
 		VALUES ($1) ON CONFLICT (bucket_key) DO NOTHING`, bucket); err != nil {
@@ -786,6 +908,12 @@ func (s *Store) ReserveRateLimit(ctx context.Context, bucket string) (reservatio
 	if err != nil {
 		return QuotaReservation{}, fmt.Errorf("load rate-limit bucket: %w", err)
 	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM rate_limit_reservations
+		WHERE bucket_key = $1 AND expires_at <= now()`, bucket); err != nil {
+		return QuotaReservation{}, fmt.Errorf("reclaim expired quota reservations: %w", err)
+	}
+	var remainingReservations int
 	if resetAt != nil && !resetAt.After(time.Now().UTC()) {
 		remaining = nil
 		resetAt = nil
@@ -796,6 +924,12 @@ func (s *Store) ReserveRateLimit(ctx context.Context, bucket string) (reservatio
 			return QuotaReservation{}, fmt.Errorf("reset expired rate-limit bucket: %w", err)
 		}
 	}
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*) FROM rate_limit_reservations WHERE bucket_key = $1`, bucket).
+		Scan(&remainingReservations); err != nil {
+		return QuotaReservation{}, fmt.Errorf("count live quota reservations: %w", err)
+	}
+	inFlight = remainingReservations
 	reservation = QuotaReservation{Granted: true}
 	switch {
 	case remaining != nil && *remaining == 0:
@@ -808,11 +942,17 @@ func (s *Store) ReserveRateLimit(ctx context.Context, bucket string) (reservatio
 		if remaining != nil {
 			*remaining--
 		}
-
+		reservation.ID = uuid.New()
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO rate_limit_reservations (id, bucket_key, job_id, fencing_token, expires_at)
+			VALUES ($1, $2, $3, $4, now() + ($5 * interval '1 microsecond'))`,
+			reservation.ID, bucket, claim.ID, claim.Token, lease.Microseconds()); err != nil {
+			return QuotaReservation{}, fmt.Errorf("create provider quota reservation: %w", err)
+		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE rate_limit_buckets
-			SET remaining = $2, in_flight = in_flight + 1, updated_at = now()
-			WHERE bucket_key = $1`, bucket, remaining); err != nil {
+			SET remaining = $2, in_flight = $3 + 1, updated_at = now()
+			WHERE bucket_key = $1`, bucket, remaining, inFlight); err != nil {
 			return QuotaReservation{}, fmt.Errorf("reserve provider quota: %w", err)
 		}
 	}
@@ -832,18 +972,48 @@ func rollbackTx(ctx context.Context, tx pgx.Tx, operation string, resultErr *err
 	}
 }
 
-// ReleaseRateLimit returns an unreported reservation to its provider bucket.
-func (s *Store) ReleaseRateLimit(ctx context.Context, bucket string) error {
-	if bucket == "" {
-		return errors.New("rate-limit bucket is required")
+// ReleaseRateLimit settles an attempted request whose response could not be persisted.
+func (s *Store) ReleaseRateLimit(ctx context.Context, reservationID uuid.UUID) (releaseErr error) {
+	if reservationID == uuid.Nil {
+		return errors.New("quota reservation ID is required")
 	}
-	_, err := s.db.Exec(ctx, `
-		UPDATE rate_limit_buckets
-		SET remaining = CASE WHEN remaining IS NULL THEN NULL ELSE remaining + 1 END,
-		    in_flight = GREATEST(in_flight - 1, 0), updated_at = now()
-		WHERE bucket_key = $1`, bucket)
+	tx, err := s.db.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("release provider quota reservation: %w", err)
+		return fmt.Errorf("begin quota reservation settlement: %w", err)
+	}
+	defer rollbackTx(ctx, tx, "quota reservation settlement", &releaseErr)
+	var bucket string
+	err = tx.QueryRow(ctx, `
+		SELECT bucket_key FROM rate_limit_reservations WHERE id = $1`, reservationID).Scan(&bucket)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit already settled quota reservation: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("find quota reservation: %w", err)
+	}
+	var lockedBucket string
+	if err := tx.QueryRow(ctx, `
+		SELECT bucket_key FROM rate_limit_buckets WHERE bucket_key = $1 FOR UPDATE`, bucket).Scan(&lockedBucket); err != nil {
+		return fmt.Errorf("lock quota reservation bucket: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM rate_limit_reservations WHERE id = $1", reservationID); err != nil {
+		return fmt.Errorf("settle quota reservation: %w", err)
+	}
+	var inFlight int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*) FROM rate_limit_reservations WHERE bucket_key = $1`, bucket).Scan(&inFlight); err != nil {
+		return fmt.Errorf("count outstanding quota reservations: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE rate_limit_buckets SET in_flight = $2, updated_at = now()
+		WHERE bucket_key = $1`, bucket, inFlight); err != nil {
+		return fmt.Errorf("update settled quota reservations: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit quota reservation settlement: %w", err)
 	}
 	return nil
 }
