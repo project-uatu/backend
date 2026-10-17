@@ -8,10 +8,10 @@ This repository contains the Go backend. It collects activity from public
 sources, stores it, and exposes it through an HTTP API. The frontend will live
 in a separate repository.
 
-Uatu is in early development. The current version is a small scaffold: it
-collects public GitHub repository data for configured users, stores it in
-PostgreSQL, and serves it through a read-only API. Broader contribution
-history and the versioned API are in progress.
+Uatu is in early development. The current collector fetches public GitHub
+repository snapshots for configured users, stores them in PostgreSQL, and
+serves them through a read-only API. The durable collection worker is in place,
+but contribution-history connectors are not yet registered.
 
 ## Getting started
 
@@ -38,6 +38,12 @@ curl http://localhost:3000/github/users/octocat/repositories
 Set `GITHUB_TOKEN` to raise GitHub API rate limits. The token is optional for
 local development. `sslmode=disable` is for this local-only database; use
 verified TLS for shared or production databases.
+
+`collect` with no user arguments processes due queued event work once, and
+`collect --loop` continuously polls for work. Until a source connector is
+registered, these commands provide the worker infrastructure but do not fetch
+contribution history. Passing users (or setting `UATU_USERS`) runs the existing
+GitHub repository snapshot collector.
 
 | Variable | Default | Purpose |
 |---|---|---|
