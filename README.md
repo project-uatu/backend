@@ -17,7 +17,7 @@ the API does not claim complete account-wide release history.
 ## Getting started
 
 Use the released container image,
-`ghcr.io/project-uatu/backend:0.1.0`, to try Uatu without installing Go or
+`ghcr.io/project-uatu/backend:latest`, to try Uatu without installing Go or
 building the backend. Follow [Running with Docker](#running-with-docker) below.
 
 `collect octocat` resolves the immutable GitHub account ID, tracks the account,
@@ -72,15 +72,15 @@ curl 'http://localhost:3000/v1/persons/<person-id>/counts?from=2020-01-01T00:00:
 | `UATU_USERS` | | Comma-separated GitHub users to track and collect |
 | `GITHUB_TOKEN` | Required for `collect` | GitHub API token for identity refresh and public contribution counts |
 
-Run `docker run --rm ghcr.io/project-uatu/backend:0.1.0 help` to see the
+Run `docker run --rm ghcr.io/project-uatu/backend:latest help` to see the
 available commands.
 
 ## Running with Docker
 
 Each release publishes an image for `linux/amd64` and `linux/arm64` to
 `ghcr.io/project-uatu/backend`, tagged with the version (for example `0.1.0`),
-the minor version (`0.1`) and `latest`. The examples pin the released `0.1.0`
-image for reproducible testing. You need Docker and a GitHub token; no source
+the minor version (`0.1`) and `latest`. The examples use `latest` to run the
+most recent release. You need Docker and a GitHub token; no source
 checkout, Go installation or local image build is required.
 
 Anonymous pulls require the container package to be public. If `docker pull`
@@ -90,7 +90,7 @@ or you must authenticate to GHCR with an account that has package access.
 
 ```sh
 export GITHUB_TOKEN='<your-token>'
-export UATU_IMAGE=ghcr.io/project-uatu/backend:0.1.0
+export UATU_IMAGE=ghcr.io/project-uatu/backend:latest
 docker pull "$UATU_IMAGE"
 docker network create uatu
 docker run -d --name uatu-postgres --network uatu \
