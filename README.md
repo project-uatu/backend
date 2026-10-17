@@ -16,25 +16,9 @@ the API does not claim complete account-wide release history.
 
 ## Getting started
 
-You need Go 1.26 or later and a PostgreSQL database. For a local database,
-start PostgreSQL with Docker:
-
-```sh
-docker run --rm --name uatu-postgres \
-  -e POSTGRES_USER=uatu \
-  -e POSTGRES_PASSWORD=local-only \
-  -e POSTGRES_DB=uatu \
-  -p 5432:5432 postgres:17
-```
-
-In another terminal, configure the database URL and run the collector and API:
-
-```sh
-export UATU_DATABASE_URL='postgres://uatu:local-only@localhost:5432/uatu?sslmode=disable'
-export GITHUB_TOKEN='<your-token>'
-go run ./cmd/uatu collect octocat
-go run ./cmd/uatu serve
-```
+Use the released container image,
+`ghcr.io/project-uatu/backend:latest`, to try Uatu without installing Go or
+building the backend. Follow [Running with Docker](#running-with-docker) below.
 
 `collect octocat` resolves the immutable GitHub account ID, tracks the account,
 and runs a resumable public-history backfill from the account's creation date.
@@ -88,25 +72,34 @@ curl 'http://localhost:3000/v1/persons/<person-id>/counts?from=2020-01-01T00:00:
 | `UATU_USERS` | | Comma-separated GitHub users to track and collect |
 | `GITHUB_TOKEN` | Required for `collect` | GitHub API token for identity refresh and public contribution counts |
 
-Run `go run ./cmd/uatu help` to see the available commands.
+Run `docker run --rm ghcr.io/project-uatu/backend:latest help` to see the
+available commands.
 
 ## Running with Docker
 
 Each release publishes an image for `linux/amd64` and `linux/arm64` to
 `ghcr.io/project-uatu/backend`, tagged with the version (for example `0.1.0`),
-the minor version (`0.1`) and `latest`. Use that image in place of `uatu`
-below, or build it locally:
+the minor version (`0.1`) and `latest`. The examples use `latest` to run the
+most recent release. You need Docker and a GitHub token; no source
+checkout, Go installation or local image build is required.
+
+Anonymous pulls require the container package to be public. If `docker pull`
+returns `unauthorized` or `denied`, the repository owner must make the package
+public as described in [the release process](docs/release-process.md#container-image),
+or you must authenticate to GHCR with an account that has package access.
 
 ```sh
-docker build -t uatu .
+export GITHUB_TOKEN='<your-token>'
+export UATU_IMAGE=ghcr.io/project-uatu/backend:latest
+docker pull "$UATU_IMAGE"
 docker network create uatu
 docker run -d --name uatu-postgres --network uatu \
   -e POSTGRES_USER=uatu -e POSTGRES_PASSWORD=local-only -e POSTGRES_DB=uatu \
   postgres:17
 docker run --rm --network uatu -e UATU_DATABASE_URL='postgres://uatu:local-only@uatu-postgres:5432/uatu?sslmode=disable' \
-  -e GITHUB_TOKEN -e UATU_USERS=octocat uatu collect
+  -e GITHUB_TOKEN "$UATU_IMAGE" collect octocat
 docker run --rm --network uatu -p 3000:3000 \
-  -e UATU_DATABASE_URL='postgres://uatu:local-only@uatu-postgres:5432/uatu?sslmode=disable' uatu
+  -e UATU_DATABASE_URL='postgres://uatu:local-only@uatu-postgres:5432/uatu?sslmode=disable' "$UATU_IMAGE" serve
 ```
 
 The image contains a static binary and runs as a non-root user. PostgreSQL is
@@ -114,6 +107,33 @@ separate from the application container; configure a durable database for
 anything beyond local testing.
 
 ## Development
+
+Running from source requires Go 1.26 or later and a PostgreSQL database.
+For a local development database:
+
+```sh
+docker run --rm --name uatu-postgres \
+  -e POSTGRES_USER=uatu \
+  -e POSTGRES_PASSWORD=local-only \
+  -e POSTGRES_DB=uatu \
+  -p 5432:5432 postgres:17
+```
+
+In another terminal, configure the database URL and run the collector and API
+from your source checkout:
+
+```sh
+export UATU_DATABASE_URL='postgres://uatu:local-only@localhost:5432/uatu?sslmode=disable'
+export GITHUB_TOKEN='<your-token>'
+go run ./cmd/uatu collect octocat
+go run ./cmd/uatu serve
+```
+
+For local image development, build with `docker build -t uatu:dev .` and use
+`uatu:dev` instead of the released image. Local builds are not needed to test a
+release.
+
+Before submitting code changes, run:
 
 ```sh
 gofmt -l .
