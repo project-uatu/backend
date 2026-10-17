@@ -26,3 +26,4 @@ an ADR unless they change an architectural contract.
 | [0003: Read-only scaffold API](0003-read-only-scaffold-api.md) | Accepted |
 | [0004: Person, identity and event data model](0004-person-identity-event-model.md) | Accepted |
 | [0005: Resumable bounded collection and normalization](0005-resumable-collection.md) | Accepted |
+| [0006: GitHub event enumeration and coverage strategy](0006-github-event-enumeration.md) | Accepted |
