@@ -1,6 +1,6 @@
 # 0006: GitHub event enumeration and coverage strategy
 
-Status: Proposed
+Status: Accepted
 
 Date: 2026-10-17
 
@@ -10,7 +10,7 @@ Prerequisites: accepted ADRs [0001](0001-postgresql-backend-scope.md),
 [0004](0004-person-identity-event-model.md) and
 [0005](0005-resumable-collection.md).
 
-Decision authority: Maintainer acceptance is required before implementation.
+Decision authority: Accepted by the maintainer on 2026-10-17.
 
 ## Context
 

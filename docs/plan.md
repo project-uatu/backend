@@ -217,14 +217,13 @@ Acceptance:
 
 Dependencies: step 4.
 
-[Proposed ADR 0006](adr/0006-github-event-enumeration.md) defines bounded
+[Accepted ADR 0006](adr/0006-github-event-enumeration.md) defines bounded
 REST Search for authored issues, pull requests and review discovery, with
 separate paginated review and known-repository release enumeration. Its
-account-wide release-coverage limitation requires maintainer acceptance before
-implementation. The proposal uses GraphQL contribution data only for separate
-aggregate counts.
+account-wide release-coverage limitation was accepted by the maintainer.
+The decision uses GraphQL contribution data only for separate aggregate counts.
 
-After acceptance, replace owned-repository names with person-centric
+Replace owned-repository names with person-centric
 contribution records.
 
 Acceptance:
