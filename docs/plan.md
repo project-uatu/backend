@@ -1,6 +1,6 @@
 # Uatu backend: status and implementation plan
 
-Updated: 2026-10-16
+Updated: 2026-10-17
 
 ## Confirmed scope
 
@@ -217,8 +217,15 @@ Acceptance:
 
 Dependencies: step 4.
 
-Accept a source-strategy ADR after checking actual upstream endpoint limits.
-Replace owned-repository names with person-centric contribution records.
+[Proposed ADR 0006](adr/0006-github-event-enumeration.md) defines bounded
+REST Search for authored issues, pull requests and review discovery, with
+separate paginated review and known-repository release enumeration. Its
+account-wide release-coverage limitation requires maintainer acceptance before
+implementation. The proposal uses GraphQL contribution data only for separate
+aggregate counts.
+
+After acceptance, replace owned-repository names with person-centric
+contribution records.
 
 Acceptance:
 - Resolve immutable account IDs and collect authored PRs/issues, reviews and
