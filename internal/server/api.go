@@ -316,6 +316,9 @@ func patchPersonHandler(s apiStore, logger apiLogger) http.HandlerFunc {
 		if err := s.UpdatePersonIdentifiers(r.Context(), personID, forge.ID, add, remove); errors.Is(err, store.ErrNotFound) {
 			writeError(w, r, logger, http.StatusNotFound, "person not found")
 			return
+		} else if errors.Is(err, store.ErrOnboardingResolutionPending) {
+			writeError(w, r, logger, http.StatusConflict, "GitHub account resolution is still pending")
+			return
 		} else if errors.Is(err, store.ErrIdentityConflict) {
 			writeError(w, r, logger, http.StatusConflict, "identifier is assigned to another person")
 			return
@@ -384,6 +387,10 @@ func syncPersonHandler(s apiStore, logger apiLogger) http.HandlerFunc {
 		}
 		if errors.Is(err, store.ErrCollectionJobActive) {
 			writeError(w, r, logger, http.StatusConflict, "collection work is already active")
+			return
+		}
+		if errors.Is(err, store.ErrOnboardingTargetUnavailable) {
+			writeError(w, r, logger, http.StatusConflict, "GitHub account resolution target is unavailable")
 			return
 		}
 		if err != nil {

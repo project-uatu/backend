@@ -95,6 +95,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PersonResponse"
+        "409":
+          description: Identifier conflict or account resolution is still pending
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         default:
           $ref: "#/components/responses/Error"
   /v1/persons/{id}/sync:
@@ -121,6 +127,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/JobResponse"
+        "409":
+          description: Conflicting active work or unavailable account resolution target
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         default:
           $ref: "#/components/responses/Error"
   /v1/jobs/{id}:

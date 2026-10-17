@@ -17,12 +17,15 @@ import (
 
 type runnerStore struct {
 	collectionClaim       *store.JobClaim
+	collectionClaims      []store.JobClaim
 	normalization         *store.NormalizationClaim
 	pages                 []persistedPage
+	persistErrors         []error
 	retryCause            error
 	retryAt               time.Time
 	deferredAt            time.Time
 	failedReason          string
+	failCalls             int
 	released              bool
 	quota                 store.QuotaReservation
 	quotaBucket           string
@@ -42,11 +45,16 @@ type persistedPage struct {
 }
 
 func (s *runnerStore) ClaimCollectionJob(context.Context, string, time.Duration) (store.JobClaim, bool, error) {
-	if s.collectionClaim == nil {
+	if s.collectionClaim != nil {
+		claim := *s.collectionClaim
+		s.collectionClaim = nil
+		return claim, true, nil
+	}
+	if len(s.collectionClaims) == 0 {
 		return store.JobClaim{}, false, nil
 	}
-	claim := *s.collectionClaim
-	s.collectionClaim = nil
+	claim := s.collectionClaims[0]
+	s.collectionClaims = s.collectionClaims[1:]
 	return claim, true, nil
 }
 
@@ -60,6 +68,13 @@ func (s *runnerStore) PersistCollectionPage(_ context.Context, claim store.JobCl
 		page: page, report: report, successful: successful, cursor: claim.Cursor,
 		windowFrom: claim.Window.From,
 	})
+	if len(s.persistErrors) > 0 {
+		err := s.persistErrors[0]
+		s.persistErrors = s.persistErrors[1:]
+		if err != nil {
+			return false, err
+		}
+	}
 	return successful && page.Done, nil
 }
 
@@ -75,6 +90,7 @@ func (s *runnerStore) DeferCollectionJob(_ context.Context, _ store.JobClaim, re
 
 func (s *runnerStore) FailCollectionJob(_ context.Context, _ store.JobClaim, reason string) error {
 	s.failedReason = reason
+	s.failCalls++
 	return nil
 }
 
@@ -285,6 +301,61 @@ func TestRunner_RunOnce_persistsPartialReportAndRetriesWithoutAdvancingCursor(t 
 		got[0] != "source reported an error" ||
 		got[1] != "upstream or normalization operation failed" {
 		t.Errorf("persisted errors = %q, want sanitized source and fetch failures", got)
+	}
+}
+
+func TestRunner_DrainFailsConflictingOnboardingAndContinues(t *testing.T) {
+	now := time.Now().UTC()
+	claims := []store.JobClaim{
+		{
+			CollectionJob: store.CollectionJob{
+				ID: uuid.New(), PersonID: uuid.New(), ForgeInstanceID: uuid.New(),
+				SourceKey: "github_history", ScanMode: "backfill",
+				Window: event.Window{To: now},
+			},
+			Token: uuid.New(), SyncRunID: uuid.New(),
+		},
+		{
+			CollectionJob: store.CollectionJob{
+				ID: uuid.New(), PersonID: uuid.New(), ForgeInstanceID: uuid.New(),
+				SourceKey: "github_history", ScanMode: "backfill",
+				Window: event.Window{To: now},
+			},
+			Token: uuid.New(), SyncRunID: uuid.New(),
+		},
+	}
+	storeStub := &runnerStore{
+		collectionClaims: claims,
+		persistErrors:    []error{store.ErrIdentityConflict, nil},
+		quota:            store.QuotaReservation{Granted: true, ID: uuid.New()},
+	}
+	connector := &pageConnector{
+		source: "github_history", bucket: "github/core",
+		fetch: func(_ context.Context, request event.PageRequest) (event.Page, event.FetchReport, error) {
+			page := event.Page{Done: true}
+			if request.PersonID == claims[0].PersonID {
+				page.ResolvedAccount = &event.ResolvedAccount{
+					AccountID: "42", NodeID: "MDQ6VXNlcjQy", Login: "octocat",
+					CreatedAt: time.Date(2011, 1, 25, 18, 44, 36, 0, time.UTC),
+				}
+			}
+			return page, event.FetchReport{RateLimitBucket: "github/core"}, nil
+		},
+	}
+	runner := newTestRunner(t, storeStub, []Connector{connector}, normalizerFunc(func(event.RawEvent) ([]event.Action, error) {
+		return nil, nil
+	}))
+
+	if err := runner.Drain(t.Context()); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(storeStub.pages) != 2 || storeStub.failCalls != 1 ||
+		storeStub.failedReason != "resolved GitHub account is assigned to another person" {
+		t.Errorf("Drain persistence/failure = %d pages, %d failures (%q); want both jobs processed and first failed",
+			len(storeStub.pages), storeStub.failCalls, storeStub.failedReason)
+	}
+	if storeStub.releasedQuota != 1 {
+		t.Errorf("released quota reservations = %d, want 1 after persistence conflict", storeStub.releasedQuota)
 	}
 }
 

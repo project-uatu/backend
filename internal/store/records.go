@@ -250,7 +250,12 @@ func trackGitHubAccountTx(ctx context.Context, tx pgx.Tx, expectedPersonID, forg
 		USING identity_keys ik
 		WHERE ia.identity_key_id = ik.id AND ia.person_id = $1
 		  AND ik.forge_instance_id = $2 AND ik.kind = 'login'
-		  AND ik.normalized_value <> $3`,
+		  AND ik.normalized_value <> $3
+		  AND NOT EXISTS (
+		      SELECT 1 FROM identity_claims ic
+		      WHERE ic.id = ia.claim_id AND ic.method = 'api_onboarding'
+		        AND ic.disposition = 'accepted'
+		  )`,
 		personID, forgeInstanceID, strings.ToLower(account.Login)); err != nil {
 		return GitHubAccount{}, fmt.Errorf("retire prior GitHub login assignment: %w", err)
 	}

@@ -22,6 +22,9 @@ var ErrCollectionJobActive = errors.New("collection scan already active")
 // ErrIdempotencyConflict indicates an idempotency key is bound to different work.
 var ErrIdempotencyConflict = errors.New("idempotency key is already assigned to another job")
 
+// ErrOnboardingTargetUnavailable indicates account resolution has no assigned target login.
+var ErrOnboardingTargetUnavailable = errors.New("GitHub account resolution target is unavailable")
+
 // CollectionJob describes durable work for one person and source.
 type CollectionJob struct {
 	ID              uuid.UUID
@@ -44,6 +47,7 @@ type CollectionJobInput struct {
 	ForgeInstanceID uuid.UUID
 	SourceKey       string
 	ScanMode        string
+	OnboardingLogin string
 	Window          event.Window
 	DueAt           time.Time
 	MaxAttempts     int
@@ -116,6 +120,35 @@ func (s *Store) EnqueueCollectionJob(ctx context.Context, input CollectionJobInp
 		return CollectionJob{}, fmt.Errorf("begin collection enqueue: %w", err)
 	}
 	defer rollbackTx(ctx, tx, "collection enqueue", &enqueueErr)
+	if input.SourceKey == SourceGitHubHistory {
+		var accountExists bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM github_accounts
+				WHERE forge_instance_id = $1 AND person_id = $2
+			)`, input.ForgeInstanceID, input.PersonID).Scan(&accountExists); err != nil {
+			return CollectionJob{}, fmt.Errorf("check GitHub account before enqueue: %w", err)
+		}
+		if !accountExists {
+			if input.OnboardingLogin == "" {
+				return CollectionJob{}, ErrOnboardingTargetUnavailable
+			}
+			var targetKeyID uuid.UUID
+			err := tx.QueryRow(ctx, `
+				SELECT ia.identity_key_id FROM identity_assignments ia
+				JOIN identity_keys ik ON ik.id = ia.identity_key_id
+				WHERE ia.person_id = $1 AND ik.forge_instance_id = $2
+				  AND ik.kind = 'login' AND ik.normalized_value = $3
+				FOR UPDATE OF ia, ik`,
+				input.PersonID, input.ForgeInstanceID, input.OnboardingLogin).Scan(&targetKeyID)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return CollectionJob{}, ErrOnboardingTargetUnavailable
+			}
+			if err != nil {
+				return CollectionJob{}, fmt.Errorf("validate GitHub onboarding target: %w", err)
+			}
+		}
+	}
 	if input.IdempotencyKey != "" {
 		lockKey := fmt.Sprintf("%s:%s:%d:%s:%d:%s",
 			input.PersonID, input.ForgeInstanceID, len(input.SourceKey), input.SourceKey,
@@ -136,28 +169,31 @@ func (s *Store) EnqueueCollectionJob(ctx context.Context, input CollectionJobInp
 	}
 	job = CollectionJob{
 		ID: uuid.New(), PersonID: input.PersonID, ForgeInstanceID: input.ForgeInstanceID,
-		SourceKey: input.SourceKey, ScanMode: input.ScanMode, Window: input.Window,
+		SourceKey: input.SourceKey, ScanMode: input.ScanMode,
+		OnboardingLogin: input.OnboardingLogin, Window: input.Window,
 		Cursor: "", DueAt: input.DueAt, MaxAttempts: input.MaxAttempts,
 	}
 	var windowStart *time.Time
 	err = tx.QueryRow(ctx, `
 		INSERT INTO jobs
 			(id, person_id, forge_instance_id, source_key, status, due_at, max_attempts, cursor,
-			 idempotency_key, scan_mode, window_start, window_end)
-		VALUES ($1, $2, $3, $4, 'queued', $5, $6, '', NULLIF($7, ''), $8, $9, $10)
+			 idempotency_key, scan_mode, onboarding_login, window_start, window_end)
+		VALUES ($1, $2, $3, $4, 'queued', $5, $6, '', NULLIF($7, ''), $8, $9, $10, $11)
 		ON CONFLICT (person_id, forge_instance_id, source_key)
 			WHERE status IN ('queued', 'running')
 		DO UPDATE SET due_at = LEAST(jobs.due_at, EXCLUDED.due_at),
 		              idempotency_key = COALESCE(jobs.idempotency_key, EXCLUDED.idempotency_key),
+		              onboarding_login = COALESCE(NULLIF(jobs.onboarding_login, ''), EXCLUDED.onboarding_login),
 		              updated_at = now()
 		WHERE jobs.scan_mode = EXCLUDED.scan_mode
 		  AND jobs.window_start IS NOT DISTINCT FROM EXCLUDED.window_start
 		  AND jobs.window_end = EXCLUDED.window_end
-		RETURNING id, scan_mode, window_start, window_end, cursor, due_at, attempts, max_attempts`,
+		RETURNING id, scan_mode, onboarding_login, window_start, window_end, cursor, due_at, attempts, max_attempts`,
 		job.ID, input.PersonID, input.ForgeInstanceID, input.SourceKey, input.DueAt,
-		input.MaxAttempts, input.IdempotencyKey, input.ScanMode, nullableTime(input.Window.From),
-		input.Window.To.UTC()).Scan(&job.ID, &job.ScanMode, &windowStart, &job.Window.To,
-		&job.Cursor, &job.DueAt, &job.Attempts, &job.MaxAttempts)
+		input.MaxAttempts, input.IdempotencyKey, input.ScanMode, input.OnboardingLogin,
+		nullableTime(input.Window.From),
+		input.Window.To.UTC()).Scan(&job.ID, &job.ScanMode, &job.OnboardingLogin,
+		&windowStart, &job.Window.To, &job.Cursor, &job.DueAt, &job.Attempts, &job.MaxAttempts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CollectionJob{}, fmt.Errorf("%w: requested scan window or mode differs from active work", ErrCollectionJobActive)
 	}
@@ -247,6 +283,21 @@ func (s *Store) githubHistoryInput(ctx context.Context, personID, forgeInstanceI
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return CollectionJobInput{}, fmt.Errorf("load GitHub account creation time: %w", err)
 	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = s.db.QueryRow(ctx, `
+			SELECT onboarding_login FROM jobs
+			WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3
+			  AND onboarding_login <> ''
+			ORDER BY created_at, id
+			LIMIT 1`,
+			personID, forgeInstanceID, SourceGitHubHistory).Scan(&input.OnboardingLogin)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return CollectionJobInput{}, ErrOnboardingTargetUnavailable
+		}
+		if err != nil {
+			return CollectionJobInput{}, fmt.Errorf("load GitHub onboarding target: %w", err)
+		}
+	}
 	if !accountCreatedAt.IsZero() {
 		input.Window.From = accountCreatedAt.UTC()
 	}
@@ -328,13 +379,14 @@ func activeCollectionJob(ctx context.Context, tx pgx.Tx, personID, forgeInstance
 	var job CollectionJob
 	var windowStart *time.Time
 	err := tx.QueryRow(ctx, `
-		SELECT id, person_id, forge_instance_id, source_key, scan_mode, window_start,
+		SELECT id, person_id, forge_instance_id, source_key, scan_mode, onboarding_login, window_start,
 		       window_end, cursor, due_at, attempts, max_attempts
 		FROM jobs WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3
 		  AND status IN ('queued', 'running')
 		FOR UPDATE`, personID, forgeInstanceID, source).Scan(
 		&job.ID, &job.PersonID, &job.ForgeInstanceID, &job.SourceKey, &job.ScanMode,
-		&windowStart, &job.Window.To, &job.Cursor, &job.DueAt, &job.Attempts, &job.MaxAttempts)
+		&job.OnboardingLogin, &windowStart, &job.Window.To, &job.Cursor, &job.DueAt,
+		&job.Attempts, &job.MaxAttempts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CollectionJob{}, fmt.Errorf("%w: no active GitHub history job", ErrCollectionJobActive)
 	}
@@ -352,11 +404,12 @@ func collectionJobByID(ctx context.Context, tx pgx.Tx, jobID uuid.UUID) (Collect
 	var job CollectionJob
 	var windowStart *time.Time
 	err := tx.QueryRow(ctx, `
-		SELECT id, person_id, forge_instance_id, source_key, scan_mode, window_start,
+		SELECT id, person_id, forge_instance_id, source_key, scan_mode, onboarding_login, window_start,
 		       window_end, cursor, due_at, attempts, max_attempts
 		FROM jobs WHERE id = $1`, jobID).Scan(
 		&job.ID, &job.PersonID, &job.ForgeInstanceID, &job.SourceKey, &job.ScanMode,
-		&windowStart, &job.Window.To, &job.Cursor, &job.DueAt, &job.Attempts, &job.MaxAttempts)
+		&job.OnboardingLogin, &windowStart, &job.Window.To, &job.Cursor, &job.DueAt,
+		&job.Attempts, &job.MaxAttempts)
 	if err != nil {
 		return CollectionJob{}, fmt.Errorf("load collection job %s: %w", jobID, err)
 	}
@@ -372,14 +425,15 @@ func collectionJobForIdempotencyKey(ctx context.Context, tx pgx.Tx, input Collec
 	var windowStart *time.Time
 	err := tx.QueryRow(ctx, `
 		SELECT j.id, j.person_id, j.forge_instance_id, j.source_key, j.scan_mode,
-		       j.window_start, j.window_end, j.cursor, j.due_at, j.attempts, j.max_attempts
+		       j.onboarding_login, j.window_start, j.window_end, j.cursor, j.due_at,
+		       j.attempts, j.max_attempts
 		FROM job_idempotency_keys k
 		JOIN jobs j ON j.id = k.job_id
 		WHERE k.person_id = $1 AND k.forge_instance_id = $2
 		  AND k.source_key = $3 AND k.idempotency_key = $4`,
 		input.PersonID, input.ForgeInstanceID, input.SourceKey, input.IdempotencyKey).
 		Scan(&job.ID, &job.PersonID, &job.ForgeInstanceID, &job.SourceKey,
-			&job.ScanMode, &windowStart, &job.Window.To, &job.Cursor,
+			&job.ScanMode, &job.OnboardingLogin, &windowStart, &job.Window.To, &job.Cursor,
 			&job.DueAt, &job.Attempts, &job.MaxAttempts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CollectionJob{}, false, nil
@@ -405,6 +459,23 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 		return JobClaim{}, false, fmt.Errorf("begin collection claim: %w", err)
 	}
 	defer rollbackTx(ctx, tx, "collection claim", &claimErr)
+	if _, err := tx.Exec(ctx, `
+		UPDATE jobs j
+		SET status = 'failed', last_error = 'GitHub account resolution target is unavailable',
+		    updated_at = now()
+		WHERE j.status = 'queued' AND j.source_key = $1
+		  AND NOT EXISTS (
+		      SELECT 1 FROM github_accounts ga
+		      WHERE ga.forge_instance_id = j.forge_instance_id AND ga.person_id = j.person_id
+		  )
+		  AND (j.onboarding_login = '' OR NOT EXISTS (
+		      SELECT 1 FROM identity_assignments ia
+		      JOIN identity_keys ik ON ik.id = ia.identity_key_id
+		      WHERE ia.person_id = j.person_id AND ik.forge_instance_id = j.forge_instance_id
+		        AND ik.kind = 'login' AND ik.normalized_value = j.onboarding_login
+		  ))`, SourceGitHubHistory); err != nil {
+		return JobClaim{}, false, fmt.Errorf("fail collection jobs without a GitHub onboarding target: %w", err)
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE sync_runs sr SET status = 'failed', finished_at = now()
 		FROM jobs j
@@ -463,15 +534,9 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 			WHERE forge_instance_id = $1 AND person_id = $2`,
 			job.ForgeInstanceID, job.PersonID).Scan(&accountNodeID, &currentLogin, &accountCreatedAt)
 		if errors.Is(err, pgx.ErrNoRows) {
-			for _, key := range keys {
-				if key.IdentityKey.Kind == "login" && key.ForgeInstanceID != nil &&
-					*key.ForgeInstanceID == job.ForgeInstanceID {
-					currentLogin = key.IdentityKey.Value
-					break
-				}
-			}
+			currentLogin = job.OnboardingLogin
 			if currentLogin == "" {
-				return JobClaim{}, false, errors.New("GitHub history job has no account or assigned login")
+				return JobClaim{}, false, ErrOnboardingTargetUnavailable
 			}
 		} else if err != nil {
 			return JobClaim{}, false, fmt.Errorf("load GitHub account identifiers: %w", err)

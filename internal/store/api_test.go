@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -176,8 +177,8 @@ func TestStore_APIOnboardingProtectsPendingLoginAndLeavesJobsClaimable(t *testin
 		t.Fatalf("CreateGitHubPerson(zebra): %v", err)
 	}
 	if err := s.UpdatePersonIdentifiers(ctx, firstPerson.ID, firstJob.ForgeInstanceID, nil,
-		[]APIIdentity{{Kind: identity.KindLogin, Value: "octocat"}}); err == nil {
-		t.Fatal("UpdatePersonIdentifiers(remove pending login) error = nil; want rejection")
+		[]APIIdentity{{Kind: identity.KindLogin, Value: "octocat"}}); !errors.Is(err, ErrOnboardingResolutionPending) {
+		t.Fatalf("UpdatePersonIdentifiers(remove pending login) error = %v, want ErrOnboardingResolutionPending", err)
 	}
 	firstClaim, found, err := s.ClaimCollectionJob(ctx, "worker-one", time.Minute)
 	if err != nil || !found || firstClaim.ID != firstJob.ID {
@@ -234,9 +235,13 @@ func TestStore_APIOnboardingRetainsTargetLoginAndIndexesActorIdentities(t *testi
 	}, event.FetchReport{}, true, 1, uuid.Nil); err != nil {
 		t.Fatalf("PersistCollectionPage: %v", err)
 	}
+	matches, hasMore, err := s.ListAPIPersons(ctx, "zebra", uuid.Nil, 10)
+	if err != nil || hasMore || len(matches) != 1 || matches[0].ID != person.ID {
+		t.Errorf("ListAPIPersons after account resolution = %v, %t, %v; want preserved alias for person %s",
+			matches, hasMore, err, person.ID)
+	}
 	if err := s.UpdatePersonIdentifiers(ctx, person.ID, job.ForgeInstanceID,
 		[]APIIdentity{
-			{Kind: identity.KindLogin, Value: "zebra"},
 			{Kind: identity.KindEmail, Value: "octo@example.com"},
 		}, nil); err != nil {
 		t.Fatalf("UpdatePersonIdentifiers(add indexed actors): %v", err)
@@ -253,6 +258,135 @@ func TestStore_APIOnboardingRetainsTargetLoginAndIndexesActorIdentities(t *testi
 		  AND ((kind = 'login' AND normalized_value = 'zebra')
 		       OR (kind = 'email' AND normalized_value = 'octo@example.com'))`); got != 2 {
 		t.Errorf("indexed normalized actor identities = %d, want login and email entries", got)
+	}
+}
+
+func TestStore_ResolveAccountConflictRollsBackCollectionPage(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	forge, err := s.GitHubForge(ctx)
+	if err != nil {
+		t.Fatalf("GitHubForge: %v", err)
+	}
+	_, err = s.TrackGitHubAccount(ctx, forge.ID, GitHubAccount{
+		AccountID: "42", NodeID: "MDQ6VXNlcjQy", Login: "octocat",
+		AccountCreatedAt: time.Date(2011, 1, 25, 18, 44, 36, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("TrackGitHubAccount: %v", err)
+	}
+	person, job, err := s.CreateGitHubPerson(ctx, "", "zebra", nil)
+	if err != nil {
+		t.Fatalf("CreateGitHubPerson: %v", err)
+	}
+	claim, found, err := s.ClaimCollectionJob(ctx, "worker", time.Minute)
+	if err != nil || !found || claim.ID != job.ID {
+		t.Fatalf("ClaimCollectionJob = %+v, %t, %v; want onboarding job", claim, found, err)
+	}
+
+	raw := event.RawEvent{
+		ForgeInstanceID:      forge.ID,
+		Source:               event.Source(SourceGitHubHistory),
+		ExternalID:           "conflicting-account",
+		Kind:                 "activity",
+		Payload:              json.RawMessage(`{}`),
+		PayloadSchemaVersion: 1,
+	}
+	_, err = s.PersistCollectionPage(ctx, claim, event.Page{
+		Events: []event.RawEvent{raw}, Done: true,
+		ResolvedAccount: &event.ResolvedAccount{
+			AccountID: "42", NodeID: "MDQ6VXNlcjQy", Login: "octocat",
+			CreatedAt: time.Date(2011, 1, 25, 18, 44, 36, 0, time.UTC),
+		},
+	}, event.FetchReport{}, true, 1, uuid.Nil)
+	if !errors.Is(err, ErrIdentityConflict) {
+		t.Fatalf("PersistCollectionPage(conflicting account) error = %v, want ErrIdentityConflict", err)
+	}
+	if got := countRows(t, s, "SELECT count(*) FROM raw_events WHERE external_id = 'conflicting-account'"); got != 0 {
+		t.Errorf("raw events after conflicting account = %d, want transaction rollback", got)
+	}
+	var accountCount int
+	if err := s.db.QueryRow(ctx, "SELECT count(*) FROM github_accounts WHERE person_id = $1", person.ID).Scan(&accountCount); err != nil {
+		t.Fatalf("count accounts attached to onboarding person: %v", err)
+	}
+	if accountCount != 0 {
+		t.Errorf("GitHub accounts attached to onboarding person = %d, want 0", accountCount)
+	}
+	if err := s.FailCollectionJob(ctx, claim, "resolved GitHub account is assigned to another person"); err != nil {
+		t.Fatalf("FailCollectionJob after conflict: %v", err)
+	}
+	var status string
+	if err := s.db.QueryRow(ctx, "SELECT status FROM jobs WHERE id = $1", job.ID).Scan(&status); err != nil {
+		t.Fatalf("load failed conflict job: %v", err)
+	}
+	if status != "failed" {
+		t.Errorf("conflict job status = %q, want failed", status)
+	}
+}
+
+func TestStore_EnqueueGitHubHistoryPreservesFailedOnboardingTarget(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	person, originalJob, err := s.CreateGitHubPerson(ctx, "", "octocat", nil)
+	if err != nil {
+		t.Fatalf("CreateGitHubPerson: %v", err)
+	}
+	if err := s.UpdatePersonIdentifiers(ctx, person.ID, originalJob.ForgeInstanceID,
+		[]APIIdentity{{Kind: identity.KindLogin, Value: "zebra"}}, nil); err != nil {
+		t.Fatalf("UpdatePersonIdentifiers(add alias): %v", err)
+	}
+	if _, err := s.db.Exec(ctx, "UPDATE jobs SET status = 'failed' WHERE id = $1", originalJob.ID); err != nil {
+		t.Fatalf("fail original onboarding job: %v", err)
+	}
+
+	replacement, err := s.EnqueueGitHubHistoryWithKey(ctx, person.ID, originalJob.ForgeInstanceID, "replacement-sync")
+	if err != nil {
+		t.Fatalf("EnqueueGitHubHistoryWithKey: %v", err)
+	}
+	if replacement.OnboardingLogin != "octocat" {
+		t.Errorf("replacement onboarding login = %q, want original target octocat", replacement.OnboardingLogin)
+	}
+	claim, found, err := s.ClaimCollectionJob(ctx, "worker", time.Minute)
+	if err != nil || !found || claim.ID != replacement.ID || claim.OnboardingLogin != "octocat" {
+		t.Fatalf("ClaimCollectionJob = %+v, %t, %v; want replacement targeting octocat", claim, found, err)
+	}
+}
+
+func TestStore_EnqueueWithoutOnboardingTargetFailsAndInvalidJobDoesNotBlockQueue(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	invalidPerson, invalidJob, err := s.CreateGitHubPerson(ctx, "", "octocat", nil)
+	if err != nil {
+		t.Fatalf("CreateGitHubPerson(octocat): %v", err)
+	}
+	if _, err := s.db.Exec(ctx, "UPDATE jobs SET status = 'failed' WHERE id = $1", invalidJob.ID); err != nil {
+		t.Fatalf("fail onboarding job: %v", err)
+	}
+	if err := s.UpdatePersonIdentifiers(ctx, invalidPerson.ID, invalidJob.ForgeInstanceID, nil,
+		[]APIIdentity{{Kind: identity.KindLogin, Value: "octocat"}}); err != nil {
+		t.Fatalf("UpdatePersonIdentifiers(remove failed target): %v", err)
+	}
+	if _, err := s.EnqueueGitHubHistoryWithKey(ctx, invalidPerson.ID, invalidJob.ForgeInstanceID, "no-target"); !errors.Is(err, ErrOnboardingTargetUnavailable) {
+		t.Errorf("EnqueueGitHubHistoryWithKey without target error = %v, want ErrOnboardingTargetUnavailable", err)
+	}
+	if _, err := s.db.Exec(ctx, "UPDATE jobs SET status = 'queued' WHERE id = $1", invalidJob.ID); err != nil {
+		t.Fatalf("requeue invalid legacy job: %v", err)
+	}
+
+	_, validJob, err := s.CreateGitHubPerson(ctx, "", "zebra", nil)
+	if err != nil {
+		t.Fatalf("CreateGitHubPerson(zebra): %v", err)
+	}
+	claim, found, err := s.ClaimCollectionJob(ctx, "worker", time.Minute)
+	if err != nil || !found || claim.ID != validJob.ID {
+		t.Fatalf("ClaimCollectionJob = %+v, %t, %v; want valid queued job after invalid job is failed", claim, found, err)
+	}
+	var status string
+	if err := s.db.QueryRow(ctx, "SELECT status FROM jobs WHERE id = $1", invalidJob.ID).Scan(&status); err != nil {
+		t.Fatalf("load invalid job status: %v", err)
+	}
+	if status != "failed" {
+		t.Errorf("invalid queued job status = %q, want failed", status)
 	}
 }
 

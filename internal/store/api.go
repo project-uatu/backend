@@ -87,6 +87,9 @@ type APIIdentity struct {
 	Value string
 }
 
+// ErrOnboardingResolutionPending indicates the required login cannot be removed yet.
+var ErrOnboardingResolutionPending = errors.New("GitHub account resolution is pending")
+
 // GitHubForge returns the canonical GitHub.com forge instance.
 func (s *Store) GitHubForge(ctx context.Context) (ForgeInstance, error) {
 	forge, err := s.CreateForgeInstance(ctx, "github", "https://github.com")
@@ -293,7 +296,7 @@ func (s *Store) UpdatePersonIdentifiers(ctx context.Context, personID, forgeID u
 				return fmt.Errorf("check pending onboarding login: %w", err)
 			}
 			if err == nil {
-				return errors.New("cannot remove the GitHub login while account resolution is pending")
+				return ErrOnboardingResolutionPending
 			}
 		}
 		keyID, claimID, assigned, err := lockAssignedAPIIdentity(ctx, tx, forgeID, personID, item)

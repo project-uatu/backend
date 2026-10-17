@@ -49,6 +49,8 @@ SELECT DISTINCT re.id,
            ELSE actor->'key'->'identity_key'->>'value'
        END
 FROM raw_events re
-CROSS JOIN LATERAL jsonb_array_elements(re.actor_keys) AS actor
+CROSS JOIN LATERAL jsonb_array_elements(
+    CASE WHEN jsonb_typeof(re.actor_keys) = 'array' THEN re.actor_keys ELSE '[]'::jsonb END
+) AS actor
 WHERE COALESCE(actor->'key'->'identity_key'->>'kind', '') <> ''
   AND COALESCE(actor->'key'->'identity_key'->>'value', '') <> '';

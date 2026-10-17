@@ -18,24 +18,26 @@ import (
 
 type testStore struct {
 	apiStore
-	entries       []store.TimelineEntry
-	coverage      []store.CoverageInterval
-	counts        []store.ContributionCount
-	err           error
-	apiPersonErr  error
-	createErr     error
-	jobErr        error
-	forge         store.ForgeInstance
-	createdPerson store.Person
-	createdJob    store.CollectionJob
-	apiJob        store.APIJob
-	createCalls   int
-	queuedKey     string
-	person        uuid.UUID
-	from          time.Time
-	to            time.Time
-	limit         int
-	calls         int
+	entries        []store.TimelineEntry
+	coverage       []store.CoverageInterval
+	counts         []store.ContributionCount
+	err            error
+	apiPersonErr   error
+	createErr      error
+	identifiersErr error
+	enqueueErr     error
+	jobErr         error
+	forge          store.ForgeInstance
+	createdPerson  store.Person
+	createdJob     store.CollectionJob
+	apiJob         store.APIJob
+	createCalls    int
+	queuedKey      string
+	person         uuid.UUID
+	from           time.Time
+	to             time.Time
+	limit          int
+	calls          int
 }
 
 const testAPIKey = "01234567890123456789012345678901"
@@ -110,6 +112,10 @@ func (s *testStore) GitHubForge(context.Context) (store.ForgeInstance, error) {
 	return s.forge, nil
 }
 
+func (s *testStore) UpdatePersonIdentifiers(context.Context, uuid.UUID, uuid.UUID, []store.APIIdentity, []store.APIIdentity) error {
+	return s.identifiersErr
+}
+
 func (s *testStore) EnqueueGitHubHistoryWithKey(_ context.Context, personID, _ uuid.UUID, key string) (store.CollectionJob, error) {
 	s.queuedKey = key
 	job := s.createdJob
@@ -119,7 +125,7 @@ func (s *testStore) EnqueueGitHubHistoryWithKey(_ context.Context, personID, _ u
 		job.SourceKey = store.SourceGitHubHistory
 		s.createdJob = job
 	}
-	return job, nil
+	return job, s.enqueueErr
 }
 
 func TestHandler_activity(t *testing.T) {
@@ -270,6 +276,31 @@ func TestHandler_createPersonRejectsInvalidBodies(t *testing.T) {
 	}
 }
 
+func TestHandler_patchPersonMapsPendingResolutionToConflict(t *testing.T) {
+	personID := uuid.New()
+	req := httptest.NewRequest(http.MethodPatch, "/v1/persons/"+personID.String(),
+		strings.NewReader(`{"remove":[{"kind":"login","value":"octocat"}]}`))
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	s := &testStore{identifiersErr: store.ErrOnboardingResolutionPending}
+	res := httptest.NewRecorder()
+	NewHandler(s, testLogger(), testOptions()).ServeHTTP(res, req)
+	if res.Code != http.StatusConflict {
+		t.Fatalf("PATCH /v1/persons status = %d, want %d: %s", res.Code, http.StatusConflict, res.Body.String())
+	}
+	var response struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode PATCH error response: %v", err)
+	}
+	if response.Error.Message != "GitHub account resolution is still pending" {
+		t.Errorf("PATCH error message = %q, want safe pending-resolution explanation", response.Error.Message)
+	}
+}
+
 func TestHandler_activityReturnsNotFoundForUnknownPerson(t *testing.T) {
 	s := &testStore{apiPersonErr: store.ErrNotFound}
 	path := "/v1/persons/" + uuid.NewString() + "/activity?from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z"
@@ -334,6 +365,29 @@ func TestHandler_syncPersonQueuesJob(t *testing.T) {
 	}
 	if got := res.Header().Get("Content-Type"); got != "application/json" {
 		t.Errorf("POST /sync Content-Type = %q, want application/json", got)
+	}
+}
+
+func TestHandler_syncPersonMapsUnavailableOnboardingTargetToConflict(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/persons/"+uuid.NewString()+"/sync", nil)
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req.Header.Set("Idempotency-Key", "sync-request-no-target")
+	s := &testStore{enqueueErr: store.ErrOnboardingTargetUnavailable}
+	res := httptest.NewRecorder()
+	NewHandler(s, testLogger(), testOptions()).ServeHTTP(res, req)
+	if res.Code != http.StatusConflict {
+		t.Fatalf("POST /sync status = %d, want %d: %s", res.Code, http.StatusConflict, res.Body.String())
+	}
+	var response struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode POST /sync error response: %v", err)
+	}
+	if response.Error.Message != "GitHub account resolution target is unavailable" {
+		t.Errorf("POST /sync error message = %q, want safe target-unavailable explanation", response.Error.Message)
 	}
 }
 
