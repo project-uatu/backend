@@ -1,6 +1,6 @@
 # 0009: GitLab.com and Codeberg connectors
 
-Status: Proposed
+Status: Accepted
 
 Date: 2026-10-18
 
@@ -13,7 +13,7 @@ Prerequisites: accepted ADRs [0001](0001-postgresql-backend-scope.md),
 [0007](0007-versioned-person-api.md) and
 [0008](0008-kubernetes-delivery-contract.md).
 
-Decision authority: the maintainer must accept this ADR before implementation.
+Decision authority: Accepted by the maintainer on 2026-10-18.
 
 ## Context
 
