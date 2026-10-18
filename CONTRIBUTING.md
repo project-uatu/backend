@@ -1,7 +1,46 @@
 # Contributing to Uatu
 
 Thank you for helping. Uatu is licensed under the [Apache License 2.0](LICENSE)
-and accepts contributions under the same license.
+and accepts contributions through GitHub pull requests under the same license.
+Improvements to documentation are as welcome as code. If you are new, start with
+documentation or a small bug fix.
+
+## Project structure
+
+- [project-uatu/backend](https://github.com/project-uatu/backend): this
+  repository, the collector and API.
+- The frontend and the Helm chart live in separate repositories and are not
+  accepted here.
+
+## Acceptance policy
+
+A pull request is more likely to be accepted when it:
+
+- Addresses an open issue. If none exists, open one to discuss the problem and
+  the proposed solution first.
+- Keeps backward compatibility for the API, configuration and database
+  migrations, including rolling updates between releases.
+- Follows the conventions of the surrounding code, has good test coverage and
+  is documented. Exported names and non-trivial declarations have doc comments.
+- Passes the [validation](#validation) checks.
+
+A maintainer's endorsement is enough to merge. Substantial changes may need more
+reviewers, or be split into several pull requests.
+
+## AI coding assistants
+
+Using an AI assistant is fine, but you are responsible for understanding and
+reviewing everything you submit.
+
+- Point your assistant to [`.github/copilot-instructions.md`](.github/copilot-instructions.md)
+  and the instruction files it references.
+- Disclose the assistance in the pull request description and in each commit
+  with an `Assisted-by: <agent>/<model>` trailer.
+- Assistants must not add `Signed-off-by` or `Co-authored-by` trailers. Only
+  humans can certify the DCO, so the human author signs off.
+- Keep PR descriptions, commit messages and code comments concise.
+- Write your own replies to maintainers; we want to talk to you, not to your
+  assistant.
 
 ## Developer Certificate of Origin
 
@@ -12,7 +51,10 @@ Every commit must be signed off to certify the
 git commit -s
 ```
 
-Commits should also be cryptographically signed (`git commit -s -S`).
+The sign-off must use your real name, so no pseudonyms or anonymous
+contributions. With `user.name` and `user.email` set in your Git config,
+`git commit -s` adds it for you. Commits should also be cryptographically signed
+(`git commit -s -S`).
 
 ## Commit messages and pull requests
 

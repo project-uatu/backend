@@ -7,6 +7,11 @@ The binary has two modes: `collect` fetches and stores data, then exits, and
 
 ## Required for every change
 
+- Commits use lowercase conventional commits without issue numbers, are signed
+  off by the human author (`-s`) and signed (`-S`). Agents must not add
+  `Signed-off-by` or `Co-authored-by`; disclose assistance with an
+  `Assisted-by: <agent>/<model>` trailer. See `CONTRIBUTING.md`.
+
 - Follow `.github/instructions/go.instructions.md` for all Go code.
 - Keep the executable in `cmd/uatu/` and application packages in `internal/`. This server has no public Go API; do not add project packages under `pkg/`.
 - Keep Uatu lightweight. Use a single static binary (`CGO_ENABLED=0`), a distroless non-root image, and PostgreSQL through pure-Go `pgx`. Do not add Redis or external message queues.
