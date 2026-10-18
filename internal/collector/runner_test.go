@@ -47,7 +47,7 @@ type persistedPage struct {
 	windowFrom time.Time
 }
 
-func (s *runnerStore) ClaimCollectionJob(context.Context, string, time.Duration) (store.JobClaim, bool, error) {
+func (s *runnerStore) ClaimCollectionJobForSources(context.Context, string, time.Duration, []string) (store.JobClaim, bool, error) {
 	if s.collectionClaim != nil {
 		claim := *s.collectionClaim
 		s.collectionClaim = nil

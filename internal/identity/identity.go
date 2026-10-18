@@ -68,3 +68,20 @@ func normalizeEmail(value string) (string, error) {
 	}
 	return local + "@" + strings.ToLower(domain), nil
 }
+
+// ValidHandle reports whether login is a plausible GitLab or Forgejo username:
+// 1 to 255 ASCII letters, digits, underscores, dots or hyphens that does not
+// start with a dot or hyphen.
+func ValidHandle(login string) bool {
+	if len(login) == 0 || len(login) > 255 {
+		return false
+	}
+	for i := 0; i < len(login); i++ {
+		c := login[i]
+		alnum := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
+		if !alnum && (i == 0 || c != '.' && c != '-') {
+			return false
+		}
+	}
+	return true
+}

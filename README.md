@@ -15,6 +15,21 @@ private, operator-authenticated API. GitHub release coverage is limited to
 known public repositories; the API does not claim complete account-wide
 release history.
 
+GitLab.com and Codeberg are collected too. The person API takes an optional
+`forge` (`github.com` by default, `gitlab.com` or `codeberg.org`), and
+`POST /v1/persons/{id}/sync` accepts `?forge=`. Both forges identify accounts by
+their numeric ID, store only public projects and repositories, and need no
+token for public data. GitLab covers authored issues and merge requests, known
+public projects' releases and recent approval events. Codeberg is read from the
+public activity feed (issues, pull requests, merges, reviews, releases) and its
+heatmap as aggregate counts; history the feed no longer reaches is reported as a
+coverage gap. Merge and review actions are attributed to the person who
+performed them: a GitLab merge request merged by someone else is recorded as
+opened only. Confidential GitLab issues and private projects are never stored.
+A source limit that retrying cannot close, such as the Codeberg feed depth, stays
+a visible coverage gap but does not make every later sync repeat the backfill.
+A worker only claims jobs for the forges it has a connector for.
+
 ## Getting started
 
 Use the released container image,
@@ -90,7 +105,16 @@ curl -H "Authorization: Bearer $UATU_API_KEY" \
 | `UATU_API_KEY` | Required for `serve` | Operator bearer key; at least 32 bytes |
 | `UATU_CORS_ORIGINS` | Empty | Comma-separated exact HTTP(S) origins allowed by browser clients |
 | `UATU_USERS` | | Comma-separated GitHub users to track and collect |
-| `GITHUB_TOKEN` | Required for `collect` | GitHub API token for identity refresh and public contribution counts |
+| `GITHUB_TOKEN` | Required for `collect` when GitHub is enabled | GitHub API token for identity refresh and public contribution counts |
+| `GITLAB_TOKEN` | Optional | Read-only GitLab.com token for `collect`; raises rate limits, never stored or logged |
+| `CODEBERG_TOKEN` | Optional | Read-only Codeberg token for `collect`; raises rate limits, never stored or logged |
+| `UATU_FORGES` | All | Comma-separated enabled forges: `github.com`, `gitlab.com`, `codeberg.org` |
+
+Migration `007` renames the GitHub-named tables to `source_accounts` and
+`known_repositories` and keeps updatable views under the old names so the
+previous release keeps working during a rolling update. Do not create GitLab or
+Codeberg work until every replica runs this release; the previous release has no
+connector for those sources. A later release drops the views.
 
 `serve` and `collect` do not change the database schema. Run `uatu migrate`
 once before starting or upgrading them; they refuse to start against a schema

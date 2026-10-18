@@ -157,3 +157,29 @@ func TestLoad_rejectsInvalidPoolSettings(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_forgeSelection(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "gl")
+	t.Setenv("CODEBERG_TOKEN", "cb")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Forges) != 3 || cfg.GitLabToken != "gl" || cfg.CodebergToken != "cb" {
+		t.Errorf("defaults = %+v, want all forges and tokens", cfg)
+	}
+	t.Setenv("UATU_FORGES", "gitlab.com, Codeberg.org")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ForgeEnabled("github.com") || !cfg.ForgeEnabled("gitlab.com") || !cfg.ForgeEnabled("codeberg.org") {
+		t.Errorf("forges = %v", cfg.Forges)
+	}
+	for _, bad := range []string{"git.example.com", "gitlab.com,gitlab.com"} {
+		t.Setenv("UATU_FORGES", bad)
+		if _, err := Load(); err == nil {
+			t.Errorf("UATU_FORGES=%q accepted", bad)
+		}
+	}
+}

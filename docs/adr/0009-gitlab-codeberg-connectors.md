@@ -111,14 +111,18 @@ documentation and live responses on 2026-10-18.
 
 - One migration adds `source_accounts` (forge instance, person, account ID,
   login, optional node ID, optional account creation time) and
-  `known_repositories` (replacing `github_known_repositories`), backfilled
-  from the GitHub tables. After it, a new source needs no core migration.
+  `known_repositories`. The migration renames `github_accounts` and
+  `github_known_repositories` in place, so no data is copied. After it, a new
+  source needs no core migration.
 - `store` replaces its `SourceGitHubHistory` special cases with a small
   per-source profile (source key, provider, whether onboarding must resolve
   an account). Source keys are `gitlab_history` and `forgejo_history`.
-- Rolling updates (ADR 0008) must keep working. This release reads the new
-  tables and also writes the GitHub tables; a later release drops them in a
-  contract migration. Both steps are covered by tests.
+- Rolling updates (ADR 0008) must keep working. The old names remain as
+  single-table, auto-updatable views, so the previous release can still read,
+  insert and upsert through them. A later release drops the views in a
+  contract migration. A test covers writes through the views. The previous
+  release has no GitLab or Codeberg connector, so GitLab and Codeberg work
+  must not be created until every replica runs this release.
 
 ### Shared client behavior
 
@@ -150,7 +154,15 @@ documentation and live responses on 2026-10-18.
   pagination with the same split-on-cap and gap rules as ADR 0006. Incremental
   syncs use `updated_after` with overlap.
 - Lifecycle milestones come from `created_at`, `closed_at` and `merged_at` on
-  the returned object. No intermediate state changes are invented.
+  the returned object. No intermediate state changes are invented. A merge is
+  credited only when `merged_by` is the tracked account; the author of a request
+  merged by someone else gets only the opened action.
+- Confidential issues are excluded with `confidential=false` and by dropping any
+  record marked confidential. Project visibility is verified one request at a
+  time before a page becomes events, and the persisted cursor never holds
+  records, paths or URLs of unverified or private projects, only their numeric
+  IDs. Release scans are scheduled for every public project discovered during a
+  scan, and release IDs use the numeric project ID so renames do not duplicate.
 - Releases: per known public project, filtered by the author's numeric ID.
   Coverage is **known projects only**, as for GitHub.
 - Reviews: `approved` events from the user events API, labeled with coverage
@@ -167,11 +179,17 @@ documentation and live responses on 2026-10-18.
   re-read a bounded overlap and upsert by feed ID.
 - Because the feed depth is instance-defined, the earliest reachable entry is
   recorded as the coverage boundary. History before it is a stated gap unless
-  filled from known repositories.
-- Known repositories (from feed items and the user's public repositories)
-  are enumerated with `issues?created_by=`, pull request `poster` filtering
-  and `releases` to backfill authored records the feed no longer returns.
-  Coverage for this part is **known repositories only**.
+  filled from known repositories. Each scan refreshes the login from the stable
+  account ID first, so renamed accounts keep working. Incremental scans report
+  the boundary only when the heatmap shows earlier contributions.
+- Source limits are recorded as boundary gaps: they stay visible in coverage
+  and mark the sync partial, but do not keep the checkpoint from advancing to
+  incremental scans.
+- Backfilling authored records the feed no longer returns, by enumerating
+  known repositories with `issues?created_by=`, pull request `poster`
+  filtering and `releases`, is **deferred**. It needs a rule for combining
+  feed and repository records of the same issue or pull request without
+  double-counting actions. Until then the feed boundary is reported as a gap.
 - Feed items are reduced to the fields the normalizer needs. The embedded
   user email and unrelated profile fields are dropped before persistence.
 - The heatmap is stored as aggregate counts in `contribution_counts` only,
@@ -200,7 +218,7 @@ source-specific pure handlers. No event schema change is required.
 ## Consequences
 
 - No per-forge schema from this point on. The cost is one compatibility
-  migration and a two-release contract window.
+  migration with views and a two-release contract window.
 - Neither forge can claim complete, account-wide history. GitLab review and
   release coverage and Codeberg pre-feed history are explicit and visible in
   coverage records, consistent with ADR 0006.

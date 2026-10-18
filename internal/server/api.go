@@ -26,13 +26,13 @@ const maxRequestBody = 64 << 10
 
 type apiStore interface {
 	historyStore
-	GitHubForge(context.Context) (store.ForgeInstance, error)
-	CreateGitHubPerson(context.Context, string, string, []string) (store.Person, store.CollectionJob, error)
+	ForgeForHost(context.Context, string) (store.ForgeInstance, store.SourceProfile, error)
+	CreateOnboardedPerson(context.Context, store.ForgeInstance, string, string, []string) (store.Person, store.CollectionJob, error)
 	ListAPIPersons(context.Context, string, uuid.UUID, int) ([]store.APIPerson, bool, error)
 	APIPersonByID(context.Context, uuid.UUID) (store.APIPerson, error)
 	PersonSourceCoverage(context.Context, uuid.UUID) ([]store.APISourceCoverage, error)
 	UpdatePersonIdentifiers(context.Context, uuid.UUID, uuid.UUID, []store.APIIdentity, []store.APIIdentity) error
-	EnqueueGitHubHistoryWithKey(context.Context, uuid.UUID, uuid.UUID, string) (store.CollectionJob, error)
+	EnqueueHistoryWithKey(context.Context, uuid.UUID, uuid.UUID, string) (store.CollectionJob, error)
 	APIJobByID(context.Context, uuid.UUID) (store.APIJob, error)
 	ActivityPage(context.Context, store.ActivityFilter) (store.ActivityPage, error)
 	PersonSummaryByYear(context.Context, uuid.UUID) ([]store.PersonSummary, error)
@@ -73,12 +73,14 @@ type jobResponse struct {
 }
 
 type createPersonRequest struct {
+	Forge       string   `json:"forge,omitempty"`
 	Login       string   `json:"login"`
 	DisplayName string   `json:"display_name"`
 	Emails      []string `json:"emails,omitempty"`
 }
 
 type patchPersonRequest struct {
+	Forge  string              `json:"forge,omitempty"`
 	Add    []identifierRequest `json:"add,omitempty"`
 	Remove []identifierRequest `json:"remove,omitempty"`
 }
@@ -181,7 +183,11 @@ func createPersonHandler(s apiStore, logger apiLogger) http.HandlerFunc {
 		}
 		input.Login = strings.TrimSpace(input.Login)
 		input.DisplayName = strings.TrimSpace(input.DisplayName)
-		if !github.ValidLogin(input.Login) || utf8.RuneCountInString(input.DisplayName) > 200 ||
+		forge, profile, ok := requestedForge(w, r, s, logger, input.Forge)
+		if !ok {
+			return
+		}
+		if !validLogin(profile, input.Login) || utf8.RuneCountInString(input.DisplayName) > 200 ||
 			strings.ContainsRune(input.DisplayName, '\x00') || len(input.Emails) > 20 {
 			writeError(w, r, logger, http.StatusBadRequest, "login, display_name or emails are invalid")
 			return
@@ -205,7 +211,7 @@ func createPersonHandler(s apiStore, logger apiLogger) http.HandlerFunc {
 			seenEmails[normalized] = struct{}{}
 			input.Emails[i] = email
 		}
-		person, job, err := s.CreateGitHubPerson(r.Context(), input.DisplayName, input.Login, input.Emails)
+		person, job, err := s.CreateOnboardedPerson(r.Context(), forge, input.DisplayName, input.Login, input.Emails)
 		if errors.Is(err, store.ErrIdentityConflict) {
 			writeError(w, r, logger, http.StatusConflict, "one or more identifiers are already assigned")
 			return
@@ -277,19 +283,23 @@ func patchPersonHandler(s apiStore, logger apiLogger) http.HandlerFunc {
 			writeError(w, r, logger, http.StatusBadRequest, "provide 1 to 20 identifiers to add or remove")
 			return
 		}
-		add, err := validateIdentifiers(input.Add)
+		forge, profile, ok := requestedForge(w, r, s, logger, input.Forge)
+		if !ok {
+			return
+		}
+		add, err := validateIdentifiers(profile, input.Add)
 		if err != nil {
 			writeError(w, r, logger, http.StatusBadRequest, err.Error())
 			return
 		}
-		remove, err := validateIdentifiers(input.Remove)
+		remove, err := validateIdentifiers(profile, input.Remove)
 		if err != nil {
 			writeError(w, r, logger, http.StatusBadRequest, err.Error())
 			return
 		}
 		added := make(map[string]struct{}, len(add))
 		for _, item := range add {
-			normalized, err := identity.Normalize("github", item.Kind, item.Value)
+			normalized, err := identity.Normalize(profile.Provider, item.Kind, item.Value)
 			if err != nil {
 				writeError(w, r, logger, http.StatusBadRequest, "identifier value is invalid")
 				return
@@ -297,7 +307,7 @@ func patchPersonHandler(s apiStore, logger apiLogger) http.HandlerFunc {
 			added[string(item.Kind)+"\x00"+normalized] = struct{}{}
 		}
 		for _, item := range remove {
-			normalized, err := identity.Normalize("github", item.Kind, item.Value)
+			normalized, err := identity.Normalize(profile.Provider, item.Kind, item.Value)
 			if err != nil {
 				writeError(w, r, logger, http.StatusBadRequest, "identifier value is invalid")
 				return
@@ -307,17 +317,11 @@ func patchPersonHandler(s apiStore, logger apiLogger) http.HandlerFunc {
 				return
 			}
 		}
-		forge, err := s.GitHubForge(r.Context())
-		if err != nil {
-			logger.ErrorContext(r.Context(), "load GitHub forge for identifier update", "request_id", r.Header.Get("X-Request-ID"), "err", err)
-			writeError(w, r, logger, http.StatusInternalServerError, "failed to update identifiers")
-			return
-		}
 		if err := s.UpdatePersonIdentifiers(r.Context(), personID, forge.ID, add, remove); errors.Is(err, store.ErrNotFound) {
 			writeError(w, r, logger, http.StatusNotFound, "person not found")
 			return
 		} else if errors.Is(err, store.ErrOnboardingResolutionPending) {
-			writeError(w, r, logger, http.StatusConflict, "GitHub account resolution is still pending")
+			writeError(w, r, logger, http.StatusConflict, "account resolution is still pending")
 			return
 		} else if errors.Is(err, store.ErrIdentityConflict) {
 			writeError(w, r, logger, http.StatusConflict, "identifier is assigned to another person")
@@ -345,7 +349,7 @@ func patchPersonHandler(s apiStore, logger apiLogger) http.HandlerFunc {
 
 func syncPersonHandler(s apiStore, logger apiLogger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !allowQueryKeys(w, r, logger) {
+		if !allowQueryKeys(w, r, logger, "forge") {
 			return
 		}
 		personID, ok := requestedPersonID(w, r, logger)
@@ -374,13 +378,15 @@ func syncPersonHandler(s apiStore, logger apiLogger) http.HandlerFunc {
 		if _, ok := requirePerson(w, r, s, logger, personID); !ok {
 			return
 		}
-		forge, err := s.GitHubForge(r.Context())
-		if err != nil {
-			logger.ErrorContext(r.Context(), "load GitHub forge for sync", "request_id", r.Header.Get("X-Request-ID"), "err", err)
-			writeError(w, r, logger, http.StatusInternalServerError, "failed to request sync")
+		host, ok := oneQueryValue(w, r, logger, "forge", false)
+		if !ok {
 			return
 		}
-		job, err := s.EnqueueGitHubHistoryWithKey(r.Context(), personID, forge.ID, key)
+		forge, _, ok := requestedForge(w, r, s, logger, host)
+		if !ok {
+			return
+		}
+		job, err := s.EnqueueHistoryWithKey(r.Context(), personID, forge.ID, key)
 		if errors.Is(err, store.ErrIdempotencyConflict) {
 			writeError(w, r, logger, http.StatusConflict, "idempotency key is already assigned to another job")
 			return
@@ -390,7 +396,7 @@ func syncPersonHandler(s apiStore, logger apiLogger) http.HandlerFunc {
 			return
 		}
 		if errors.Is(err, store.ErrOnboardingTargetUnavailable) {
-			writeError(w, r, logger, http.StatusConflict, "GitHub account resolution target is unavailable")
+			writeError(w, r, logger, http.StatusConflict, "account resolution target is unavailable")
 			return
 		}
 		if err != nil {
@@ -613,7 +619,7 @@ func projectsHandler(s apiStore, logger apiLogger) http.HandlerFunc {
 	}
 }
 
-func validateIdentifiers(input []identifierRequest) ([]store.APIIdentity, error) {
+func validateIdentifiers(profile store.SourceProfile, input []identifierRequest) ([]store.APIIdentity, error) {
 	identifiers := make([]store.APIIdentity, 0, len(input))
 	seen := make(map[string]struct{}, len(input))
 	for _, item := range input {
@@ -621,8 +627,8 @@ func validateIdentifiers(input []identifierRequest) ([]store.APIIdentity, error)
 		if kind != identity.KindLogin && kind != identity.KindEmail {
 			return nil, errors.New("identifier kind must be login or email")
 		}
-		if kind == identity.KindLogin && !github.ValidLogin(item.Value) {
-			return nil, errors.New("GitHub login identifier is invalid")
+		if kind == identity.KindLogin && !validLogin(profile, item.Value) {
+			return nil, errors.New("login identifier is invalid")
 		}
 		value := item.Value
 		if kind == identity.KindEmail {
@@ -636,7 +642,7 @@ func validateIdentifiers(input []identifierRequest) ([]store.APIIdentity, error)
 		if kind == identity.KindEmail {
 			normalized, err = normalizeEmailIdentifier(value)
 		} else {
-			normalized, err = identity.Normalize("github", kind, value)
+			normalized, err = identity.Normalize(profile.Provider, kind, value)
 		}
 		if err != nil {
 			return nil, errors.New("identifier value is invalid")
@@ -848,4 +854,31 @@ func apiKeyFromOptions(r *http.Request) string {
 		return ""
 	}
 	return key
+}
+
+const defaultForgeHost = "github.com"
+
+// requestedForge resolves an optional forge host, defaulting to GitHub.com.
+func requestedForge(w http.ResponseWriter, r *http.Request, s apiStore, logger apiLogger, host string) (store.ForgeInstance, store.SourceProfile, bool) {
+	if host == "" {
+		host = defaultForgeHost
+	}
+	forge, profile, err := s.ForgeForHost(r.Context(), host)
+	if errors.Is(err, store.ErrUnknownForge) {
+		writeError(w, r, logger, http.StatusBadRequest, "forge is not supported")
+		return store.ForgeInstance{}, store.SourceProfile{}, false
+	}
+	if err != nil {
+		logger.ErrorContext(r.Context(), "load forge", "request_id", r.Header.Get("X-Request-ID"), "forge", host, "err", err)
+		writeError(w, r, logger, http.StatusInternalServerError, "failed to load forge")
+		return store.ForgeInstance{}, store.SourceProfile{}, false
+	}
+	return forge, profile, true
+}
+
+func validLogin(profile store.SourceProfile, login string) bool {
+	if profile.Provider == "github" {
+		return github.ValidLogin(login)
+	}
+	return identity.ValidHandle(login)
 }

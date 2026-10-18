@@ -85,6 +85,9 @@ type Gap struct {
 	From   time.Time `json:"from"`
 	To     time.Time `json:"to"`
 	Reason string    `json:"reason"`
+	// Boundary marks a permanent source limit that retrying cannot close. It
+	// remains a visible gap but does not block later incremental scans.
+	Boundary bool `json:"boundary,omitempty"`
 }
 
 // FetchReport records page, rate-limit and coverage information. It remains

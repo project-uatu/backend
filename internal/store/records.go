@@ -29,8 +29,12 @@ type ForgeInstance struct {
 	CreatedAt time.Time
 }
 
-// GitHubAccount stores immutable and current GitHub profile identifiers.
-type GitHubAccount struct {
+// GitHubAccount is kept for existing callers.
+type GitHubAccount = SourceAccount
+
+// SourceAccount stores immutable and current forge profile identifiers. NodeID
+// and AccountCreatedAt are optional for forges that do not provide them.
+type SourceAccount struct {
 	PersonID         uuid.UUID
 	ForgeInstanceID  uuid.UUID
 	AccountID        string
@@ -184,20 +188,24 @@ func (s *Store) trackGitHubAccount(ctx context.Context, expectedPersonID, forgeI
 }
 
 func trackGitHubAccountTx(ctx context.Context, tx pgx.Tx, expectedPersonID, forgeInstanceID uuid.UUID, account GitHubAccount, onboardingLogin string) (GitHubAccount, error) {
-	accountID, parseErr := strconv.ParseInt(account.AccountID, 10, 64)
-	if forgeInstanceID == uuid.Nil || parseErr != nil || accountID <= 0 ||
-		account.NodeID == "" || account.Login == "" || account.AccountCreatedAt.IsZero() {
-		return GitHubAccount{}, errors.New("GitHub account requires forge, account ID, node ID, login and creation time")
+	profile, err := profileForForge(ctx, tx, forgeInstanceID)
+	if err != nil {
+		return GitHubAccount{}, err
 	}
-	lockKey := fmt.Sprintf("github:%s:%s", forgeInstanceID, account.AccountID)
+	accountID, parseErr := strconv.ParseInt(account.AccountID, 10, 64)
+	if forgeInstanceID == uuid.Nil || parseErr != nil || accountID <= 0 || account.Login == "" ||
+		profile.RequireNodeID && account.NodeID == "" ||
+		profile.RequireCreatedAt && account.AccountCreatedAt.IsZero() {
+		return GitHubAccount{}, errors.New("source account requires forge, account ID, login and the forge's required metadata")
+	}
+	lockKey := fmt.Sprintf("%s:%s:%s", profile.Provider, forgeInstanceID, account.AccountID)
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", lockKey); err != nil {
 		return GitHubAccount{}, fmt.Errorf("lock GitHub account identity: %w", err)
 	}
 
 	var personID uuid.UUID
-	var err error
 	err = tx.QueryRow(ctx, `
-		SELECT person_id FROM github_accounts
+		SELECT person_id FROM source_accounts
 		WHERE forge_instance_id = $1 AND account_id = $2 FOR UPDATE`,
 		forgeInstanceID, account.AccountID).Scan(&personID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -210,7 +218,7 @@ func trackGitHubAccountTx(ctx context.Context, tx pgx.Tx, expectedPersonID, forg
 				if onboardingLogin == "" {
 					onboardingLogin = account.Login
 				}
-				personID, err = pendingOnboardingPersonForLogin(ctx, tx, forgeInstanceID, onboardingLogin)
+				personID, err = pendingOnboardingPersonForLogin(ctx, tx, forgeInstanceID, profile.Key, onboardingLogin)
 				if err != nil {
 					return GitHubAccount{}, err
 				}
@@ -225,24 +233,36 @@ func trackGitHubAccountTx(ctx context.Context, tx pgx.Tx, expectedPersonID, forg
 				}
 			}
 		} else if expectedPersonID != uuid.Nil && personID != expectedPersonID {
-			return GitHubAccount{}, fmt.Errorf("%w: GitHub account is already assigned to another person", ErrIdentityConflict)
+			return GitHubAccount{}, fmt.Errorf("%w: account is already assigned to another person", ErrIdentityConflict)
 		}
 	} else if err != nil {
 		return GitHubAccount{}, fmt.Errorf("find tracked GitHub account: %w", err)
 	} else if expectedPersonID != uuid.Nil && personID != expectedPersonID {
-		return GitHubAccount{}, fmt.Errorf("%w: GitHub account is already assigned to another person", ErrIdentityConflict)
+		return GitHubAccount{}, fmt.Errorf("%w: account is already assigned to another person", ErrIdentityConflict)
+	}
+	var nodeID *string
+	if account.NodeID != "" {
+		nodeID = &account.NodeID
+	}
+	var createdAt *time.Time
+	if !account.AccountCreatedAt.IsZero() {
+		utc := account.AccountCreatedAt.UTC()
+		createdAt = &utc
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO github_accounts
+		INSERT INTO source_accounts
 			(forge_instance_id, person_id, account_id, node_id, login, account_created_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (forge_instance_id, account_id)
-		DO UPDATE SET node_id = EXCLUDED.node_id, login = EXCLUDED.login, updated_at = now()`,
-		forgeInstanceID, personID, account.AccountID, account.NodeID, account.Login,
-		account.AccountCreatedAt.UTC()); err != nil {
+		DO UPDATE SET node_id = COALESCE(EXCLUDED.node_id, source_accounts.node_id),
+		              login = EXCLUDED.login,
+		              account_created_at = COALESCE(source_accounts.account_created_at, EXCLUDED.account_created_at),
+		              updated_at = now()`,
+		forgeInstanceID, personID, account.AccountID, nodeID, account.Login,
+		createdAt); err != nil {
 		return GitHubAccount{}, fmt.Errorf("save GitHub account identifiers: %w", err)
 	}
-	if err := ensureGitHubIdentity(ctx, tx, forgeInstanceID, personID, "account_id", account.AccountID); err != nil {
+	if err := ensureAccountIdentity(ctx, tx, profile.Provider, forgeInstanceID, personID, "account_id", account.AccountID); err != nil {
 		return GitHubAccount{}, err
 	}
 	if _, err := tx.Exec(ctx, `
@@ -259,16 +279,16 @@ func trackGitHubAccountTx(ctx context.Context, tx pgx.Tx, expectedPersonID, forg
 		personID, forgeInstanceID, strings.ToLower(account.Login)); err != nil {
 		return GitHubAccount{}, fmt.Errorf("retire prior GitHub login assignment: %w", err)
 	}
-	if err := ensureGitHubIdentity(ctx, tx, forgeInstanceID, personID, "login", account.Login); err != nil {
+	if err := ensureAccountIdentity(ctx, tx, profile.Provider, forgeInstanceID, personID, "login", account.Login); err != nil {
 		return GitHubAccount{}, err
 	}
-	if expectedPersonID != uuid.Nil {
+	if expectedPersonID != uuid.Nil && createdAt != nil {
 		if _, err := tx.Exec(ctx, `
 			UPDATE jobs SET window_start = $3, updated_at = now()
 			WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $4
 			  AND status IN ('queued', 'running') AND scan_mode = 'backfill'
 			  AND window_start IS NULL`,
-			personID, forgeInstanceID, account.AccountCreatedAt.UTC(), SourceGitHubHistory); err != nil {
+			personID, forgeInstanceID, *createdAt, profile.Key); err != nil {
 			return GitHubAccount{}, fmt.Errorf("set GitHub onboarding history start: %w", err)
 		}
 	}
@@ -277,7 +297,7 @@ func trackGitHubAccountTx(ctx context.Context, tx pgx.Tx, expectedPersonID, forg
 	return account, nil
 }
 
-func pendingOnboardingPersonForLogin(ctx context.Context, tx pgx.Tx, forgeInstanceID uuid.UUID, login string) (uuid.UUID, error) {
+func pendingOnboardingPersonForLogin(ctx context.Context, tx pgx.Tx, forgeInstanceID uuid.UUID, sourceKey, login string) (uuid.UUID, error) {
 	var personID uuid.UUID
 	err := tx.QueryRow(ctx, `
 		SELECT j.person_id
@@ -290,12 +310,12 @@ func pendingOnboardingPersonForLogin(ctx context.Context, tx pgx.Tx, forgeInstan
 		  AND ik.forge_instance_id = $1 AND ik.kind = 'login'
 		  AND ik.normalized_value = lower($3)
 		  AND NOT EXISTS (
-		      SELECT 1 FROM github_accounts ga
+		      SELECT 1 FROM source_accounts ga
 		      WHERE ga.forge_instance_id = j.forge_instance_id
 		        AND ga.person_id = j.person_id
 		  )
 		ORDER BY j.created_at
-		LIMIT 1`, forgeInstanceID, SourceGitHubHistory, login).Scan(&personID)
+		LIMIT 1`, forgeInstanceID, sourceKey, login).Scan(&personID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, nil
 	}
@@ -321,7 +341,7 @@ func assignedPersonForGitHubID(ctx context.Context, tx pgx.Tx, forgeInstanceID u
 	return personID, nil
 }
 
-func ensureGitHubIdentity(ctx context.Context, tx pgx.Tx, forgeInstanceID, personID uuid.UUID, kind, value string) error {
+func ensureAccountIdentity(ctx context.Context, tx pgx.Tx, provider string, forgeInstanceID, personID uuid.UUID, kind, value string) error {
 	normalized := value
 	if kind == "login" {
 		normalized = strings.ToLower(value)
@@ -347,14 +367,14 @@ func ensureGitHubIdentity(ctx context.Context, tx pgx.Tx, forgeInstanceID, perso
 		return nil
 	case err == nil:
 		if kind == "login" {
-			return fmt.Errorf("%w: GitHub login is already assigned to another person", ErrIdentityConflict)
+			return fmt.Errorf("%w: login is already assigned to another person", ErrIdentityConflict)
 		}
 		return nil
 	case !errors.Is(err, pgx.ErrNoRows):
 		return fmt.Errorf("check GitHub %s identity assignment: %w", kind, err)
 	}
 	claimID := uuid.New()
-	evidence, err := json.Marshal(map[string]string{"provider": "github", "kind": kind, "value": value})
+	evidence, err := json.Marshal(map[string]string{"provider": provider, "kind": kind, "value": value})
 	if err != nil {
 		return fmt.Errorf("encode GitHub identity evidence: %w", err)
 	}

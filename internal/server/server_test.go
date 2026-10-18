@@ -33,6 +33,7 @@ type testStore struct {
 	createdJob     store.CollectionJob
 	apiJob         store.APIJob
 	createCalls    int
+	lastForge      store.ForgeInstance
 	queuedKey      string
 	person         uuid.UUID
 	from           time.Time
@@ -75,8 +76,9 @@ func (s *testStore) PersonSourceCoverage(context.Context, uuid.UUID) ([]store.AP
 	return nil, nil
 }
 
-func (s *testStore) CreateGitHubPerson(_ context.Context, displayName, _ string, _ []string) (store.Person, store.CollectionJob, error) {
+func (s *testStore) CreateOnboardedPerson(_ context.Context, forge store.ForgeInstance, displayName, _ string, _ []string) (store.Person, store.CollectionJob, error) {
 	s.createCalls++
+	s.lastForge = forge
 	person := s.createdPerson
 	if person.ID == uuid.Nil {
 		person.ID = uuid.New()
@@ -108,18 +110,24 @@ func (s *testStore) APIJobByID(_ context.Context, jobID uuid.UUID) (store.APIJob
 	return job, nil
 }
 
-func (s *testStore) GitHubForge(context.Context) (store.ForgeInstance, error) {
+func (s *testStore) ForgeForHost(_ context.Context, host string) (store.ForgeInstance, store.SourceProfile, error) {
+	profile, ok := store.ProfileForHost(host)
+	if !ok {
+		return store.ForgeInstance{}, store.SourceProfile{}, store.ErrUnknownForge
+	}
 	if s.forge.ID == uuid.Nil {
 		s.forge.ID = uuid.New()
 	}
-	return s.forge, nil
+	forge := s.forge
+	forge.Provider, forge.BaseURL = profile.Provider, profile.BaseURL
+	return forge, profile, nil
 }
 
 func (s *testStore) UpdatePersonIdentifiers(context.Context, uuid.UUID, uuid.UUID, []store.APIIdentity, []store.APIIdentity) error {
 	return s.identifiersErr
 }
 
-func (s *testStore) EnqueueGitHubHistoryWithKey(_ context.Context, personID, _ uuid.UUID, key string) (store.CollectionJob, error) {
+func (s *testStore) EnqueueHistoryWithKey(_ context.Context, personID, _ uuid.UUID, key string) (store.CollectionJob, error) {
 	s.queuedKey = key
 	job := s.createdJob
 	if job.ID == uuid.Nil {
@@ -299,7 +307,7 @@ func TestHandler_patchPersonMapsPendingResolutionToConflict(t *testing.T) {
 	if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode PATCH error response: %v", err)
 	}
-	if response.Error.Message != "GitHub account resolution is still pending" {
+	if response.Error.Message != "account resolution is still pending" {
 		t.Errorf("PATCH error message = %q, want safe pending-resolution explanation", response.Error.Message)
 	}
 }
@@ -389,7 +397,7 @@ func TestHandler_syncPersonMapsUnavailableOnboardingTargetToConflict(t *testing.
 	if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode POST /sync error response: %v", err)
 	}
-	if response.Error.Message != "GitHub account resolution target is unavailable" {
+	if response.Error.Message != "account resolution target is unavailable" {
 		t.Errorf("POST /sync error message = %q, want safe target-unavailable explanation", response.Error.Message)
 	}
 }
@@ -609,4 +617,63 @@ func serve(t *testing.T, handler http.Handler, path string) *httptest.ResponseRe
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestHandler_createPersonSelectsForge(t *testing.T) {
+	tests := []struct {
+		name         string
+		body         string
+		wantStatus   int
+		wantProvider string
+	}{
+		{"default is GitHub", `{"login":"octocat"}`, http.StatusCreated, "github"},
+		{"GitLab", `{"forge":"gitlab.com","login":"jane.doe"}`, http.StatusCreated, "gitlab"},
+		{"Codeberg", `{"forge":"codeberg.org","login":"jane_doe-1"}`, http.StatusCreated, "forgejo"},
+		{"unknown forge", `{"forge":"git.example.com","login":"jane"}`, http.StatusBadRequest, ""},
+		{"login invalid for GitHub", `{"forge":"github.com","login":"jane.doe"}`, http.StatusBadRequest, ""},
+		{"login invalid for GitLab", `{"forge":"gitlab.com","login":"-jane"}`, http.StatusBadRequest, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &testStore{}
+			req := httptest.NewRequest(http.MethodPost, "/v1/persons", strings.NewReader(tt.body))
+			req.Header.Set("Authorization", "Bearer "+testAPIKey)
+			req.Header.Set("Content-Type", "application/json")
+			res := httptest.NewRecorder()
+			NewHandler(s, testLogger(), testOptions()).ServeHTTP(res, req)
+			if res.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d: %s", res.Code, tt.wantStatus, res.Body.String())
+			}
+			if tt.wantProvider != "" && s.lastForge.Provider != tt.wantProvider {
+				t.Errorf("forge provider = %q, want %q", s.lastForge.Provider, tt.wantProvider)
+			}
+			if tt.wantProvider == "" && s.createCalls != 0 {
+				t.Errorf("store create calls = %d, want zero for rejected request", s.createCalls)
+			}
+		})
+	}
+}
+
+func TestHandler_patchPersonValidatesLoginsForSelectedForge(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus int
+	}{
+		{"GitLab handle with dot", `{"forge":"gitlab.com","add":[{"kind":"login","value":"jane.doe"}]}`, http.StatusOK},
+		{"GitLab handle on remove", `{"forge":"gitlab.com","remove":[{"kind":"login","value":"jane.doe"}]}`, http.StatusOK},
+		{"same handle on GitHub", `{"add":[{"kind":"login","value":"jane.doe"}]}`, http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPatch, "/v1/persons/"+uuid.NewString(), strings.NewReader(tt.body))
+			req.Header.Set("Authorization", "Bearer "+testAPIKey)
+			req.Header.Set("Content-Type", "application/json")
+			res := httptest.NewRecorder()
+			NewHandler(&testStore{}, testLogger(), testOptions()).ServeHTTP(res, req)
+			if res.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d: %s", res.Code, tt.wantStatus, res.Body.String())
+			}
+		})
+	}
 }

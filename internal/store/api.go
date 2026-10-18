@@ -88,31 +88,22 @@ type APIIdentity struct {
 }
 
 // ErrOnboardingResolutionPending indicates the required login cannot be removed yet.
-var ErrOnboardingResolutionPending = errors.New("GitHub account resolution is pending")
+var ErrOnboardingResolutionPending = errors.New("account resolution is pending")
 
-// GitHubForge returns the canonical GitHub.com forge instance.
-func (s *Store) GitHubForge(ctx context.Context) (ForgeInstance, error) {
-	forge, err := s.CreateForgeInstance(ctx, "github", "https://github.com")
-	if err != nil {
-		return ForgeInstance{}, fmt.Errorf("load GitHub forge: %w", err)
-	}
-	return forge, nil
-}
-
-// CreateGitHubPerson creates a person, assigns submitted identifiers, and
-// queues account resolution and the initial history backfill atomically.
-func (s *Store) CreateGitHubPerson(ctx context.Context, displayName, login string, emails []string) (person Person, job CollectionJob, createErr error) {
+// CreateOnboardedPerson creates a person, assigns submitted identifiers, and queues
+// account resolution and the initial history backfill on one forge atomically.
+func (s *Store) CreateOnboardedPerson(ctx context.Context, forge ForgeInstance, displayName, login string, emails []string) (person Person, job CollectionJob, createErr error) {
 	if login == "" {
-		return Person{}, CollectionJob{}, errors.New("GitHub login is required")
+		return Person{}, CollectionJob{}, errors.New("login is required")
 	}
-	for _, email := range emails {
-		if _, err := identity.Normalize("github", identity.KindEmail, email); err != nil {
-			return Person{}, CollectionJob{}, fmt.Errorf("invalid email identity: %w", err)
-		}
-	}
-	forge, err := s.GitHubForge(ctx)
+	profile, err := profileForForge(ctx, s.db, forge.ID)
 	if err != nil {
 		return Person{}, CollectionJob{}, err
+	}
+	for _, email := range emails {
+		if _, err := identity.Normalize(profile.Provider, identity.KindEmail, email); err != nil {
+			return Person{}, CollectionJob{}, fmt.Errorf("invalid email identity: %w", err)
+		}
 	}
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -137,22 +128,33 @@ func (s *Store) CreateGitHubPerson(ctx context.Context, displayName, login strin
 		kind  identity.Kind
 		value string
 	}{{kind: identity.KindLogin, value: login}}, emailIdentifiers(emails)...) {
-		if err := claimAPIIdentity(ctx, tx, forge.ID, person.ID, submitted.kind, submitted.value); err != nil {
+		if err := claimAPIIdentity(ctx, tx, profile.Provider, forge.ID, person.ID, submitted.kind, submitted.value); err != nil {
 			return Person{}, CollectionJob{}, err
 		}
-		if err := queueIdentityRenormalization(ctx, tx, forge.ID, APIIdentity{
+		if err := queueIdentityRenormalization(ctx, tx, profile.Provider, forge.ID, APIIdentity{
 			Kind: submitted.kind, Value: submitted.value,
 		}); err != nil {
 			return Person{}, CollectionJob{}, err
 		}
 	}
-	job = CollectionJob{
-		ID: uuid.New(), PersonID: person.ID, ForgeInstanceID: forge.ID,
-		SourceKey: SourceGitHubHistory, ScanMode: "backfill",
+	job, err = insertOnboardingJob(ctx, tx, profile.Key, forge.ID, person.ID, login)
+	if err != nil {
+		return Person{}, CollectionJob{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Person{}, CollectionJob{}, fmt.Errorf("commit person onboarding: %w", err)
+	}
+	return person, job, nil
+}
+
+func insertOnboardingJob(ctx context.Context, tx pgx.Tx, sourceKey string, forgeID, personID uuid.UUID, login string) (CollectionJob, error) {
+	job := CollectionJob{
+		ID: uuid.New(), PersonID: personID, ForgeInstanceID: forgeID,
+		SourceKey: sourceKey, ScanMode: "backfill",
 		OnboardingLogin: strings.ToLower(login),
 		Window:          event.Window{To: time.Now().UTC()}, MaxAttempts: 10,
 	}
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		INSERT INTO jobs
 			(id, person_id, forge_instance_id, source_key, status, due_at, max_attempts,
 			 cursor, scan_mode, onboarding_login, window_start, window_end)
@@ -161,12 +163,29 @@ func (s *Store) CreateGitHubPerson(ctx context.Context, displayName, login strin
 		job.ID, job.PersonID, job.ForgeInstanceID, job.SourceKey,
 		job.MaxAttempts, job.ScanMode, job.OnboardingLogin, job.Window.To).Scan(&job.DueAt)
 	if err != nil {
-		return Person{}, CollectionJob{}, fmt.Errorf("enqueue initial GitHub account resolution: %w", err)
+		return CollectionJob{}, fmt.Errorf("enqueue initial account resolution: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return Person{}, CollectionJob{}, fmt.Errorf("commit person onboarding: %w", err)
+	return job, nil
+}
+
+// queueOnboardingIfNeeded starts account resolution when a login is added for
+// a forge where the person has neither a resolved account nor active work.
+func queueOnboardingIfNeeded(ctx context.Context, tx pgx.Tx, sourceKey string, forgeID, personID uuid.UUID, login string) error {
+	var covered bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM source_accounts WHERE forge_instance_id = $1 AND person_id = $2
+		) OR EXISTS (
+			SELECT 1 FROM jobs WHERE forge_instance_id = $1 AND person_id = $2
+			  AND source_key = $3 AND status IN ('queued', 'running')
+		)`, forgeID, personID, sourceKey).Scan(&covered); err != nil {
+		return fmt.Errorf("check forge onboarding state: %w", err)
 	}
-	return person, job, nil
+	if covered {
+		return nil
+	}
+	_, err := insertOnboardingJob(ctx, tx, sourceKey, forgeID, personID, login)
+	return err
 }
 
 func emailIdentifiers(emails []string) []struct {
@@ -186,8 +205,8 @@ func emailIdentifiers(emails []string) []struct {
 	return identifiers
 }
 
-func claimAPIIdentity(ctx context.Context, tx pgx.Tx, forgeID, personID uuid.UUID, kind identity.Kind, value string) error {
-	normalized, err := identity.Normalize("github", kind, value)
+func claimAPIIdentity(ctx context.Context, tx pgx.Tx, provider string, forgeID, personID uuid.UUID, kind identity.Kind, value string) error {
+	normalized, err := identity.Normalize(provider, kind, value)
 	if err != nil {
 		return fmt.Errorf("normalize API identity: %w", err)
 	}
@@ -259,6 +278,10 @@ func (s *Store) UpdatePersonIdentifiers(ctx context.Context, personID, forgeID u
 	if err := lockEventIdentityChanges(ctx, tx); err != nil {
 		return err
 	}
+	profile, err := profileForForge(ctx, tx, forgeID)
+	if err != nil {
+		return err
+	}
 	var found bool
 	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM persons WHERE id = $1)", personID).Scan(&found); err != nil {
 		return fmt.Errorf("check API person: %w", err)
@@ -268,13 +291,18 @@ func (s *Store) UpdatePersonIdentifiers(ctx context.Context, personID, forgeID u
 	}
 	for _, item := range add {
 		if item.Kind != identity.KindLogin && item.Kind != identity.KindEmail {
-			return errors.New("API identifiers may only be GitHub logins or emails")
+			return errors.New("API identifiers may only be logins or emails")
 		}
-		if err := claimAPIIdentity(ctx, tx, forgeID, personID, item.Kind, item.Value); err != nil {
+		if err := claimAPIIdentity(ctx, tx, profile.Provider, forgeID, personID, item.Kind, item.Value); err != nil {
 			return err
 		}
-		if err := queueIdentityRenormalization(ctx, tx, forgeID, item); err != nil {
+		if err := queueIdentityRenormalization(ctx, tx, profile.Provider, forgeID, item); err != nil {
 			return err
+		}
+		if item.Kind == identity.KindLogin {
+			if err := queueOnboardingIfNeeded(ctx, tx, profile.Key, forgeID, personID, item.Value); err != nil {
+				return err
+			}
 		}
 	}
 	for _, item := range remove {
@@ -286,12 +314,12 @@ func (s *Store) UpdatePersonIdentifiers(ctx context.Context, personID, forgeID u
 				  AND j.source_key = $3 AND j.status IN ('queued', 'running')
 				  AND j.onboarding_login = $4
 				  AND NOT EXISTS (
-				      SELECT 1 FROM github_accounts ga
+				      SELECT 1 FROM source_accounts ga
 				      WHERE ga.forge_instance_id = j.forge_instance_id
 				        AND ga.person_id = j.person_id
 				  )
 				FOR UPDATE OF j`,
-				personID, forgeID, SourceGitHubHistory, strings.ToLower(item.Value)).Scan(&pendingJobID)
+				personID, forgeID, profile.Key, strings.ToLower(item.Value)).Scan(&pendingJobID)
 			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 				return fmt.Errorf("check pending onboarding login: %w", err)
 			}
@@ -299,7 +327,7 @@ func (s *Store) UpdatePersonIdentifiers(ctx context.Context, personID, forgeID u
 				return ErrOnboardingResolutionPending
 			}
 		}
-		keyID, claimID, assigned, err := lockAssignedAPIIdentity(ctx, tx, forgeID, personID, item)
+		keyID, claimID, assigned, err := lockAssignedAPIIdentity(ctx, tx, profile.Provider, forgeID, personID, item)
 		if err != nil {
 			return err
 		}
@@ -326,7 +354,7 @@ func (s *Store) UpdatePersonIdentifiers(ctx context.Context, personID, forgeID u
 			uuid.New(), keyID, personID, evidence); err != nil {
 			return fmt.Errorf("record identity removal: %w", err)
 		}
-		if err := queueIdentityRenormalization(ctx, tx, forgeID, item); err != nil {
+		if err := queueIdentityRenormalization(ctx, tx, profile.Provider, forgeID, item); err != nil {
 			return err
 		}
 	}
@@ -336,11 +364,11 @@ func (s *Store) UpdatePersonIdentifiers(ctx context.Context, personID, forgeID u
 	return nil
 }
 
-func lockAssignedAPIIdentity(ctx context.Context, tx pgx.Tx, forgeID, personID uuid.UUID, item APIIdentity) (uuid.UUID, uuid.UUID, bool, error) {
+func lockAssignedAPIIdentity(ctx context.Context, tx pgx.Tx, provider string, forgeID, personID uuid.UUID, item APIIdentity) (uuid.UUID, uuid.UUID, bool, error) {
 	if item.Kind != identity.KindLogin && item.Kind != identity.KindEmail {
-		return uuid.Nil, uuid.Nil, false, errors.New("API identifiers may only be GitHub logins or emails")
+		return uuid.Nil, uuid.Nil, false, errors.New("API identifiers may only be logins or emails")
 	}
-	normalized, err := identity.Normalize("github", item.Kind, item.Value)
+	normalized, err := identity.Normalize(provider, item.Kind, item.Value)
 	if err != nil {
 		return uuid.Nil, uuid.Nil, false, fmt.Errorf("normalize API identity: %w", err)
 	}
@@ -370,8 +398,8 @@ func lockAssignedAPIIdentity(ctx context.Context, tx pgx.Tx, forgeID, personID u
 	return keyID, claimID, true, nil
 }
 
-func queueIdentityRenormalization(ctx context.Context, tx pgx.Tx, forgeID uuid.UUID, item APIIdentity) error {
-	normalized, err := identity.Normalize("github", item.Kind, item.Value)
+func queueIdentityRenormalization(ctx context.Context, tx pgx.Tx, provider string, forgeID uuid.UUID, item APIIdentity) error {
+	normalized, err := identity.Normalize(provider, item.Kind, item.Value)
 	if err != nil {
 		return fmt.Errorf("normalize API identity: %w", err)
 	}

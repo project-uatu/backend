@@ -761,7 +761,7 @@ func countRows(t *testing.T, s *Store, query string, args ...any) int {
 
 func intValue(value int) *int { return &value }
 
-func TestStore_EnqueueGitHubHistoryUsesBackfillThenOverlap(t *testing.T) {
+func TestStore_EnqueueHistoryUsesBackfillThenOverlap(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()
 	forge, err := s.CreateForgeInstance(ctx, "github", "https://github.com")
@@ -776,9 +776,9 @@ func TestStore_EnqueueGitHubHistoryUsesBackfillThenOverlap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TrackGitHubAccount: %v", err)
 	}
-	initial, err := s.EnqueueGitHubHistory(ctx, tracked.PersonID, forge.ID)
+	initial, err := s.EnqueueHistory(ctx, tracked.PersonID, forge.ID)
 	if err != nil {
-		t.Fatalf("EnqueueGitHubHistory(initial): %v", err)
+		t.Fatalf("EnqueueHistory(initial): %v", err)
 	}
 	if initial.ScanMode != "backfill" || !initial.Window.From.Equal(createdAt) {
 		t.Errorf("initial GitHub scan = mode %q, from %s; want backfill from account creation %s",
@@ -794,8 +794,8 @@ func TestStore_EnqueueGitHubHistoryUsesBackfillThenOverlap(t *testing.T) {
 		t.Fatalf("PersistCollectionPage(first): %v", err)
 	}
 	claim.Cursor = "page-2"
-	if _, err := s.EnqueueGitHubHistory(ctx, tracked.PersonID, forge.ID); !errors.Is(err, ErrCollectionJobActive) {
-		t.Fatalf("EnqueueGitHubHistory(interrupted) error = %v, want existing resumable work", err)
+	if _, err := s.EnqueueHistory(ctx, tracked.PersonID, forge.ID); !errors.Is(err, ErrCollectionJobActive) {
+		t.Fatalf("EnqueueHistory(interrupted) error = %v, want existing resumable work", err)
 	}
 	if err := s.ReleaseCollectionJob(ctx, claim); err != nil {
 		t.Fatalf("ReleaseCollectionJob: %v", err)
@@ -811,9 +811,9 @@ func TestStore_EnqueueGitHubHistoryUsesBackfillThenOverlap(t *testing.T) {
 	}
 
 	completedThrough := claim.Window.To
-	incremental, err := s.EnqueueGitHubHistory(ctx, tracked.PersonID, forge.ID)
+	incremental, err := s.EnqueueHistory(ctx, tracked.PersonID, forge.ID)
 	if err != nil {
-		t.Fatalf("EnqueueGitHubHistory(incremental): %v", err)
+		t.Fatalf("EnqueueHistory(incremental): %v", err)
 	}
 	wantFrom := completedThrough.Add(-7 * 24 * time.Hour)
 	if incremental.ScanMode != "incremental" || !incremental.Window.From.Equal(wantFrom) {
@@ -872,7 +872,7 @@ func TestStore_CompletedBackfillSetsWatermarkOnFirstPage(t *testing.T) {
 func TestStore_ResolvedAccountPersistenceIsFencedWithPage(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()
-	_, job, err := s.CreateGitHubPerson(ctx, "", "octocat", nil)
+	_, job, err := s.CreateOnboardedPerson(ctx, githubForge(t, s), "", "octocat", nil)
 	if err != nil {
 		t.Fatalf("CreateGitHubPerson: %v", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 const defaultPageSize = 100
 
 type durableWork interface {
-	ClaimCollectionJob(context.Context, string, time.Duration) (store.JobClaim, bool, error)
+	ClaimCollectionJobForSources(context.Context, string, time.Duration, []string) (store.JobClaim, bool, error)
 	RenewCollectionLease(context.Context, store.JobClaim, time.Duration) error
 	PersistCollectionPage(context.Context, store.JobClaim, event.Page, event.FetchReport, bool, int, uuid.UUID) (bool, error)
 	DeferCollectionJob(context.Context, store.JobClaim, time.Time) error
@@ -109,6 +110,16 @@ func NewRunner(s durableWork, connectors []Connector, transformer Normalizer, lo
 	}, nil
 }
 
+// sources lists the sources this worker has connectors for.
+func (r *Runner) sources() []string {
+	sources := make([]string, 0, len(r.connectors))
+	for source := range r.connectors {
+		sources = append(sources, string(source))
+	}
+	slices.Sort(sources)
+	return sources
+}
+
 // RunOnce processes one normalization item or one complete source scan.
 func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
 	normalization, found, err := r.store.ClaimNormalizationJob(
@@ -119,7 +130,7 @@ func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
 	if found {
 		return true, r.processNormalization(ctx, normalization)
 	}
-	claim, found, err := r.store.ClaimCollectionJob(ctx, r.options.Owner, r.options.LeaseDuration)
+	claim, found, err := r.store.ClaimCollectionJobForSources(ctx, r.options.Owner, r.options.LeaseDuration, r.sources())
 	if err != nil {
 		return false, fmt.Errorf("claim collection work: %w", err)
 	}

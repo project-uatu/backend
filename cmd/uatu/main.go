@@ -13,7 +13,11 @@ import (
 
 	"github.com/project-uatu/backend/internal/collector"
 	"github.com/project-uatu/backend/internal/config"
+	"github.com/project-uatu/backend/internal/event"
+	"github.com/project-uatu/backend/internal/forgejo"
+	"github.com/project-uatu/backend/internal/forgenorm"
 	"github.com/project-uatu/backend/internal/github"
+	"github.com/project-uatu/backend/internal/gitlab"
 	"github.com/project-uatu/backend/internal/server"
 	"github.com/project-uatu/backend/internal/store"
 )
@@ -83,7 +87,7 @@ func run(ctx context.Context, args []string, cfg config.Config, logger *slog.Log
 		logger.InfoContext(ctx, "database migrations applied")
 		return nil
 	case "collect":
-		if cfg.GitHubToken == "" {
+		if cfg.ForgeEnabled("github.com") && cfg.GitHubToken == "" {
 			return &usageError{err: errors.New("collect requires GITHUB_TOKEN for GitHub identity refresh and contribution counts")}
 		}
 		if len(args) > 0 && args[0] == "--loop" {
@@ -149,7 +153,7 @@ func collectPeople(ctx context.Context, cfg config.Config, users []string, logge
 			return fmt.Errorf("track GitHub user %s: %w", login, err)
 		}
 		logger.InfoContext(ctx, "GitHub account tracked", "login", tracked.Login, "person_id", tracked.PersonID)
-		if _, err := db.EnqueueGitHubHistory(ctx, tracked.PersonID, forge.ID); err != nil {
+		if _, err := db.EnqueueHistory(ctx, tracked.PersonID, forge.ID); err != nil {
 			if !errors.Is(err, store.ErrCollectionJobActive) {
 				return fmt.Errorf("enqueue GitHub history for %s: %w", login, err)
 			}
@@ -201,9 +205,27 @@ func runCollectionWorker(ctx context.Context, db *store.Store, cfg config.Config
 	if err != nil {
 		return fmt.Errorf("configure GitHub history normalizer: %w", err)
 	}
-	runner, err := collector.NewRunner(db, []collector.Connector{
-		github.NewHistoryConnector(github.NewClient(cfg.GitHubToken, nil)),
-	}, transformer, logger, collector.RunnerOptions{
+	// Normalizers are pure, so every forge's handlers stay registered for
+	// already stored data. Only connectors depend on enablement.
+	for _, source := range []event.Source{gitlab.Source, forgejo.Source} {
+		if err := forgenorm.Register(transformer, source); err != nil {
+			return fmt.Errorf("configure forge normalizer: %w", err)
+		}
+	}
+	var connectors []collector.Connector
+	if cfg.ForgeEnabled("github.com") {
+		connectors = append(connectors, github.NewHistoryConnector(github.NewClient(cfg.GitHubToken, nil)))
+	}
+	if cfg.ForgeEnabled("gitlab.com") {
+		connectors = append(connectors, gitlab.New(gitlab.Options{Token: cfg.GitLabToken}))
+	}
+	if cfg.ForgeEnabled("codeberg.org") {
+		connectors = append(connectors, forgejo.New(forgejo.Options{Token: cfg.CodebergToken}))
+	}
+	if len(connectors) == 0 {
+		return errors.New("no forges enabled; set UATU_FORGES")
+	}
+	runner, err := collector.NewRunner(db, connectors, transformer, logger, collector.RunnerOptions{
 		Owner: fmt.Sprintf("%s-%d", host, os.Getpid()),
 	})
 	if err != nil {

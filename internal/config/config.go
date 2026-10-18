@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +23,12 @@ type Config struct {
 	APIKey                 string
 	CORSOrigins            []string
 	GitHubToken            string
-	Users                  []string
+	// GitLabToken and CodebergToken are optional read-only tokens.
+	GitLabToken   string
+	CodebergToken string
+	// Forges lists the enabled forge hosts.
+	Forges []string
+	Users  []string
 }
 
 // Load reads Uatu configuration from the environment.
@@ -59,6 +65,10 @@ func Load() (Config, error) {
 	default:
 		return Config{}, fmt.Errorf("invalid UATU_DB_SSLMODE %q", sslMode)
 	}
+	forges, err := parseForges(os.Getenv("UATU_FORGES"))
+	if err != nil {
+		return Config{}, err
+	}
 	return Config{
 		DatabaseURL:            os.Getenv("UATU_DATABASE_URL"),
 		DatabaseSSLMode:        sslMode,
@@ -70,8 +80,40 @@ func Load() (Config, error) {
 		APIKey:                 apiKey,
 		CORSOrigins:            corsOrigins,
 		GitHubToken:            os.Getenv("GITHUB_TOKEN"),
+		GitLabToken:            os.Getenv("GITLAB_TOKEN"),
+		CodebergToken:          os.Getenv("CODEBERG_TOKEN"),
+		Forges:                 forges,
 		Users:                  splitUsers(os.Getenv("UATU_USERS")),
 	}, nil
+}
+
+// SupportedForges are the forge hosts Uatu can collect from.
+var SupportedForges = []string{"github.com", "gitlab.com", "codeberg.org"}
+
+func parseForges(value string) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return append([]string(nil), SupportedForges...), nil
+	}
+	var forges []string
+	seen := map[string]bool{}
+	for _, host := range strings.Split(value, ",") {
+		host = strings.ToLower(strings.TrimSpace(host))
+		if !slices.Contains(SupportedForges, host) {
+			return nil, fmt.Errorf("UATU_FORGES contains unsupported forge %q", host)
+		}
+		if seen[host] {
+			return nil, fmt.Errorf("UATU_FORGES contains duplicate forge %q", host)
+		}
+		seen[host] = true
+		forges = append(forges, host)
+	}
+	return forges, nil
+}
+
+// ForgeEnabled reports whether host is enabled; an unset list enables all
+// supported forges.
+func (c Config) ForgeEnabled(host string) bool {
+	return len(c.Forges) == 0 || slices.Contains(c.Forges, host)
 }
 
 func parseCORSOrigins(value string) ([]string, error) {
