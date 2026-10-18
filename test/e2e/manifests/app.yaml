@@ -62,6 +62,9 @@ spec:
                 secretKeyRef: {name: uatu-db, key: url}
             - name: UATU_DB_MAX_CONNS
               value: "3"
+            - name: UATU_API_KEY
+              valueFrom:
+                secretKeyRef: {name: uatu-api-key, key: key}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

@@ -168,24 +168,28 @@ func collectWork(ctx context.Context, cfg config.Config, loop bool, logger *slog
 	if !loop {
 		return runCollectionWorker(ctx, db, cfg, logger, false)
 	}
-	return runWithHealth(ctx, cfg, db, logger)
+	return runWithHealth(ctx, cfg.HealthAddress, db.Ready, func(ctx context.Context) error {
+		return runCollectionWorker(ctx, db, cfg, logger, true)
+	}, logger)
 }
 
-// runWithHealth runs the worker loop beside a health listener. Either one
-// stopping ends the other.
-func runWithHealth(ctx context.Context, cfg config.Config, db *store.Store, logger *slog.Logger) error {
+// runWithHealth runs work beside a health listener. Either one stopping,
+// including a listener that cannot bind, ends the other.
+func runWithHealth(ctx context.Context, addr string, ready server.ReadyFunc, work func(context.Context) error, logger *slog.Logger) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	healthErr := make(chan error, 1)
 	go func() {
-		healthErr <- server.Run(ctx, cfg.HealthAddress, server.NewHealthHandler(db.Ready, logger), logger)
+		err := server.Run(ctx, addr, server.NewHealthHandler(ready, logger), logger)
+		cancel()
+		healthErr <- err
 	}()
-	workerErr := runCollectionWorker(ctx, db, cfg, logger, true)
+	workErr := work(ctx)
 	cancel()
 	if err := <-healthErr; err != nil {
-		return errors.Join(workerErr, fmt.Errorf("serve worker health endpoints: %w", err))
+		return errors.Join(workErr, fmt.Errorf("serve worker health endpoints: %w", err))
 	}
-	return workerErr
+	return workErr
 }
 
 func runCollectionWorker(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.Logger, loop bool) error {

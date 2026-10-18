@@ -71,6 +71,7 @@ new_namespace() {
   k delete namespace "$1" --ignore-not-found --wait=true >/dev/null
   k create namespace "$1" >/dev/null
   k -n "$1" create secret generic uatu-github --from-literal=token=e2e-not-a-real-token >/dev/null
+  k -n "$1" create secret generic uatu-api-key --from-literal=key=e2e-api-key-0123456789-0123456789-abcdef >/dev/null
 }
 
 deploy_postgres() { # namespace name
@@ -110,19 +111,26 @@ restart_count() { # namespace app
   k -n "$1" get pods -l "app=$2" -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' | awk '{n += $1} END {print n + 0}'
 }
 
-# Runs a pod that polls the API Service and records failures.
-start_probe() { # namespace seconds
+# Runs a pod that polls the API Service until finish_probe stops it, and waits
+# for a first successful request so later disruption is actually observed.
+start_probe() { # namespace
   k -n "$1" delete pod probe --ignore-not-found --wait=true >/dev/null
   k -n "$1" run probe --image="$CURL_IMAGE" --image-pull-policy=IfNotPresent --restart=Never --command -- \
-    sh -c "end=\$((\$(date +%s)+$2)); while [ \$(date +%s) -lt \$end ]; do curl -fsS -o /dev/null -m 2 http://uatu-api:3000/readyz && echo OK || echo FAIL; sleep 0.2; done" >/dev/null
+    sh -c 'while [ ! -f /tmp/stop ]; do curl -fsS -o /dev/null -m 2 http://uatu-api:3000/readyz && echo OK || echo FAIL; sleep 0.2; done' >/dev/null
+  local _
+  for _ in $(seq 1 60); do
+    k -n "$1" logs probe 2>/dev/null | grep -q OK && return 0
+    sleep 2
+  done
+  fail "probe never reached the API"
 }
 
 finish_probe() { # namespace
-  k -n "$1" wait --for=jsonpath='{.status.phase}'=Succeeded pod/probe --timeout=180s >/dev/null
+  k -n "$1" exec probe -- touch /tmp/stop
+  k -n "$1" wait --for=jsonpath='{.status.phase}'=Succeeded pod/probe --timeout=60s >/dev/null
   local out
   out="$(k -n "$1" logs probe)"
   k -n "$1" delete pod probe --wait=false >/dev/null
-  grep -q OK <<<"$out" || fail "probe saw no successful requests"
   if grep -q FAIL <<<"$out"; then
     fail "API was unavailable during disruption ($(grep -c FAIL <<<"$out") failed requests)"
   fi
@@ -177,7 +185,7 @@ scenario_bundled() {
   [[ "$conns" -le 12 ]] || fail "application holds $conns connections, limit is 12 (4 pods x 3)"
 
   step "[bundled] Rolling upgrade and pod termination keep the API available"
-  start_probe "$ns" 60
+  start_probe "$ns"
   k -n "$ns" rollout restart deployment/uatu-api deployment/uatu-worker >/dev/null
   k -n "$ns" rollout status deployment/uatu-api --timeout=180s
   k -n "$ns" rollout status deployment/uatu-worker --timeout=180s
@@ -202,7 +210,8 @@ scenario_bundled() {
   done
   [[ "$(ready_count "$ns" uatu-api)" == 0 ]] || fail "API stayed ready during database outage"
   [[ "$(ready_count "$ns" uatu-worker)" == 0 ]] || fail "worker stayed ready during database outage"
-  sleep 15 # longer than one liveness period
+  # Liveness fails after 3 x 10s, then termination takes up to 30s.
+  sleep 80
   after=$(( $(restart_count "$ns" uatu-api) + $(restart_count "$ns" uatu-worker) ))
   [[ "$before" == "$after" ]] || fail "pods restarted during database outage ($before -> $after)"
   k -n "$ns" scale statefulset/postgres --replicas=1 >/dev/null

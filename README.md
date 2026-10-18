@@ -144,8 +144,8 @@ defines the contract it relies on:
 - **Probes:** `GET /healthz` (liveness; never checks the database) and
   `GET /readyz` (readiness; checks the database and schema) on `UATU_ADDR` for
   the API and on `UATU_HEALTH_ADDR` for the worker.
-- **Configuration:** environment only. Put `UATU_DATABASE_URL` and
-  `GITHUB_TOKEN` in Secrets. Keep replicas x `UATU_DB_MAX_CONNS` below the
+- **Configuration:** environment only. Put `UATU_DATABASE_URL`,
+  `UATU_API_KEY` (API) and `GITHUB_TOKEN` (worker) in Secrets. Keep replicas x `UATU_DB_MAX_CONNS` below the
   database's `max_connections`.
 - **Container:** numeric non-root user 65532, read-only root filesystem, no
   capabilities. Give API pods a short `preStop` sleep (about five seconds) so

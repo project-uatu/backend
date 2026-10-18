@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -89,4 +91,30 @@ func TestRun_help(t *testing.T) {
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestRunWithHealth_stopsWorkerWhenHealthListenerFails(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	ready := func(context.Context) error { return nil }
+	work := func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- runWithHealth(t.Context(), listener.Addr().String(), ready, work, testLogger())
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "health endpoints") {
+			t.Errorf("runWithHealth error = %v, want health listener error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker kept running after the health listener failed")
+	}
 }
