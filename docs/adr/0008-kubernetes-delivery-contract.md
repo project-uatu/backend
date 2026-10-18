@@ -1,10 +1,12 @@
 # 0008: Kubernetes delivery contract and separate Helm chart repository
 
-Status: Proposed
+Status: Accepted
 
 Date: 2026-10-18
 
 Issue: [#7](https://github.com/project-uatu/backend/issues/7)
+
+Decision authority: Accepted by the maintainer on 2026-10-18.
 
 Prerequisites: [ADR 0001](0001-postgresql-backend-scope.md),
 [ADR 0002](0002-kubernetes-collector.md), #1, #2, #5 and #6.
@@ -50,13 +52,16 @@ does not contain chart code. It owns and tests the runtime contract:
   listener, or an equivalent documented probe.
 - **Configuration:** environment variables only. `UATU_DATABASE_URL` and
   `GITHUB_TOKEN` come from Kubernetes Secrets. The contract documents
-  `UATU_DATABASE_MAX_CONNS` budgeting: replicas times pool size must stay below
+  `UATU_DB_MAX_CONNS` budgeting: replicas times pool size must stay below
   the server's `max_connections`.
-- **Security context:** the image runs as non-root with a read-only root
-  filesystem and no extra capabilities. The binary needs no writable paths.
+- **Security context:** the image runs as a numeric non-root user (65532) so
+  `runAsNonRoot` can be verified, with a read-only root filesystem and no extra
+  capabilities. The binary needs no writable paths.
 - **Termination:** on SIGTERM, `serve` drains in-flight requests and workers stop
   claiming, cancel fetches and leave unfinished leases to expire (ADR 0002),
-  within the default termination grace period.
+  within the default termination grace period. API pods need a short `preStop`
+  delay so endpoints are removed before the listener stops. A worker survives
+  database outages by retrying polls instead of exiting.
 - **Database modes:** the chart uses an external PostgreSQL when configured and
   provisions one otherwise. There is no fallback from a failing external
   database to a provisioned one. The bundled database is a single instance and
