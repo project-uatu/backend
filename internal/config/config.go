@@ -18,6 +18,7 @@ type Config struct {
 	DatabaseMaxConns       int32
 	DatabaseConnectTimeout time.Duration
 	Address                string
+	HealthAddress          string
 	APIKey                 string
 	CORSOrigins            []string
 	GitHubToken            string
@@ -65,6 +66,7 @@ func Load() (Config, error) {
 		DatabaseMaxConns:       maxConns,
 		DatabaseConnectTimeout: connectTimeout,
 		Address:                envOr("UATU_ADDR", ":3000"),
+		HealthAddress:          envOr("UATU_HEALTH_ADDR", ":3001"),
 		APIKey:                 apiKey,
 		CORSOrigins:            corsOrigins,
 		GitHubToken:            os.Getenv("GITHUB_TOKEN"),

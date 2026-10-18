@@ -86,10 +86,16 @@ curl -H "Authorization: Bearer $UATU_API_KEY" \
 | `UATU_DB_MAX_CONNS` | `10` | Maximum connections in the pool |
 | `UATU_DB_CONNECT_TIMEOUT` | `5s` | Timeout when opening a database connection |
 | `UATU_ADDR` | `:3000` | HTTP listen address |
+| `UATU_HEALTH_ADDR` | `:3001` | `collect --loop` health listener address |
 | `UATU_API_KEY` | Required for `serve` | Operator bearer key; at least 32 bytes |
 | `UATU_CORS_ORIGINS` | Empty | Comma-separated exact HTTP(S) origins allowed by browser clients |
 | `UATU_USERS` | | Comma-separated GitHub users to track and collect |
 | `GITHUB_TOKEN` | Required for `collect` | GitHub API token for identity refresh and public contribution counts |
+
+`serve` and `collect` do not change the database schema. Run `uatu migrate`
+once before starting or upgrading them; they refuse to start against a schema
+that lacks a migration they need. Concurrent `migrate` runs are serialized by a
+database lock.
 
 Run `docker run --rm ghcr.io/project-uatu/backend:latest help` to see the
 available commands.
@@ -117,6 +123,8 @@ docker run -d --name uatu-postgres --network uatu \
   -e POSTGRES_USER=uatu -e POSTGRES_PASSWORD=local-only -e POSTGRES_DB=uatu \
   postgres:17
 docker run --rm --network uatu -e UATU_DATABASE_URL='postgres://uatu:local-only@uatu-postgres:5432/uatu?sslmode=disable' \
+  "$UATU_IMAGE" migrate
+docker run --rm --network uatu -e UATU_DATABASE_URL='postgres://uatu:local-only@uatu-postgres:5432/uatu?sslmode=disable' \
   -e GITHUB_TOKEN "$UATU_IMAGE" collect octocat
 docker run --rm --network uatu -p 3000:3000 -e UATU_API_KEY \
   -e UATU_DATABASE_URL='postgres://uatu:local-only@uatu-postgres:5432/uatu?sslmode=disable' "$UATU_IMAGE" serve
@@ -125,6 +133,40 @@ docker run --rm --network uatu -p 3000:3000 -e UATU_API_KEY \
 The image contains a static binary and runs as a non-root user. PostgreSQL is
 separate from the application container; configure a durable database for
 anything beyond local testing.
+
+## Kubernetes runtime contract
+
+The Helm chart lives in a separate repository
+([ADR 0008](docs/adr/0008-kubernetes-delivery-contract.md)). This repository
+defines the contract it relies on:
+
+- **Commands:** API `serve`, worker `collect --loop`, and a one-shot `migrate`
+  run as a pre-install/pre-upgrade Job before the other workloads. Migrations
+  must stay compatible with the previous release while a rolling update runs.
+- **Probes:** `GET /healthz` (liveness; never checks the database) and
+  `GET /readyz` (readiness; checks the database and schema) on `UATU_ADDR` for
+  the API and on `UATU_HEALTH_ADDR` for the worker.
+- **Configuration:** environment only. Put `UATU_DATABASE_URL`,
+  `UATU_API_KEY` (API) and `GITHUB_TOKEN` (worker) in Secrets. Keep replicas x
+  `UATU_DB_MAX_CONNS` below the database's `max_connections`.
+- **Container:** numeric non-root user 65532, read-only root filesystem, no
+  capabilities. Give API pods a short `preStop` sleep (about five seconds) so
+  endpoints are removed before the listener stops.
+- **Databases:** use the external PostgreSQL when configured and a provisioned
+  one otherwise, never falling back from a failing external database. A
+  provisioned single instance is not highly available; use a managed database
+  for HA. Back up and restore PostgreSQL itself (for example `pg_dump -Fc` and
+  `pg_restore`). Workers retry through database outages and leases recover
+  interrupted work.
+
+`test/e2e/run.sh` exercises this contract with plain manifests on a throwaway
+kind cluster, or on any cluster with two or more nodes
+(`CONTEXT=<context> IMAGE=<pullable image> test/e2e/run.sh`). It covers
+spread across nodes, hardened security contexts, serialized migrations,
+migration-before-start, rolling update and pod termination, worker crash,
+database outage, connection limits, backup/restore, both database modes and
+no fallback. Lease expiry and stale-token writes are covered by the PostgreSQL
+integration tests (`UATU_TEST_DATABASE_URL`).
 
 ## Development
 
@@ -146,6 +188,7 @@ from your source checkout:
 export UATU_DATABASE_URL='postgres://uatu:local-only@localhost:5432/uatu?sslmode=disable'
 export GITHUB_TOKEN='<your-token>'
 export UATU_API_KEY="$(openssl rand -hex 32)"
+go run ./cmd/uatu migrate
 go run ./cmd/uatu collect octocat
 go run ./cmd/uatu serve
 ```

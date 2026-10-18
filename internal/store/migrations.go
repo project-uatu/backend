@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -160,4 +161,47 @@ func migrate(ctx context.Context, pool *pgxpool.Pool) (migrationErr error) {
 	}
 	committed = true
 	return nil
+}
+
+// checkSchema verifies that every migration known to this binary is applied
+// with an unchanged checksum. Extra, newer migrations are allowed.
+func checkSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	migrations, err := loadMigrations()
+	if err != nil {
+		return err
+	}
+	rows, err := pool.Query(ctx, "SELECT version, name, checksum FROM schema_migrations")
+	if err != nil {
+		return schemaQueryError(err)
+	}
+	defer rows.Close()
+	applied := make(map[int]migration, len(migrations))
+	for rows.Next() {
+		var item migration
+		if err := rows.Scan(&item.version, &item.name, &item.checksum); err != nil {
+			return fmt.Errorf("scan applied migration: %w", err)
+		}
+		applied[item.version] = item
+	}
+	if err := rows.Err(); err != nil {
+		return schemaQueryError(err)
+	}
+	for _, item := range migrations {
+		existing, ok := applied[item.version]
+		if !ok {
+			return fmt.Errorf("%w: migration %s is not applied; run uatu migrate", ErrSchemaIncompatible, item.name)
+		}
+		if existing.name != item.name || existing.checksum != item.checksum {
+			return fmt.Errorf("%w: migration %d does not match %s", ErrSchemaIncompatible, item.version, item.name)
+		}
+	}
+	return nil
+}
+
+func schemaQueryError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+		return fmt.Errorf("%w: schema_migrations is missing; run uatu migrate", ErrSchemaIncompatible)
+	}
+	return fmt.Errorf("read applied migrations: %w", err)
 }

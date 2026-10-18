@@ -30,7 +30,7 @@ events, coverage and collector state. The existing repository-list endpoint
 still uses a temporary snapshot table until issue #5 replaces it with
 contribution history. The HTTP API is read-only and never fetches from
 upstream (ADR 0003).
-There is no Kubernetes deployment or versioned person-centric API yet.
+The Kubernetes runtime contract and e2e harness (ADR 0008) live in this repository; the Helm chart is maintained separately.
 
 The module path and imports have now been corrected and legacy-organization
 references audited. CI pins golangci-lint v2.14.0, which supports Go 1.26.

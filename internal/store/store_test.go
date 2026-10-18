@@ -30,21 +30,25 @@ func TestOpen_serializesConcurrentMigrations(t *testing.T) {
 	defer cleanup()
 
 	const clients = 4
-	stores := make([]*Store, clients)
 	errs := make([]error, clients)
 	var wg sync.WaitGroup
 	for i := range clients {
 		wg.Go(func() {
-			stores[i], errs[i] = Open(t.Context(), options)
+			errs[i] = Migrate(t.Context(), options)
 		})
 	}
 	wg.Wait()
 	for i, err := range errs {
 		if err != nil {
-			t.Fatalf("Open client %d: %v", i, err)
+			t.Fatalf("Migrate client %d: %v", i, err)
 		}
-		defer stores[i].Close()
 	}
+	store, err := Open(t.Context(), options)
+	if err != nil {
+		t.Fatalf("Open migrated database: %v", err)
+	}
+	defer store.Close()
+	stores := []*Store{store}
 
 	var count int
 	if err := stores[0].db.QueryRow(t.Context(),
@@ -208,12 +212,15 @@ func TestOpen_rejectsMigrationChecksumChange(t *testing.T) {
 		"UPDATE schema_migrations SET checksum = 'invalid' WHERE version = 1"); err != nil {
 		t.Fatalf("change migration checksum: %v", err)
 	}
-	if _, err := Open(t.Context(), options); err == nil || !strings.Contains(err.Error(), "checksum does not match") {
-		t.Fatalf("Open modified migration error = %v, want checksum mismatch", err)
+	if err := Migrate(t.Context(), options); err == nil || !strings.Contains(err.Error(), "checksum does not match") {
+		t.Fatalf("Migrate modified migration error = %v, want checksum mismatch", err)
+	}
+	if _, err := Open(t.Context(), options); !errors.Is(err, ErrSchemaIncompatible) {
+		t.Fatalf("Open modified migration error = %v, want ErrSchemaIncompatible", err)
 	}
 }
 
-func TestOpen_rejectsNewerSchema(t *testing.T) {
+func TestMigrate_rejectsNewerSchema(t *testing.T) {
 	options, cleanup := testDatabase(t)
 	defer cleanup()
 	store := openTestStore(t, options)
@@ -222,8 +229,40 @@ func TestOpen_rejectsNewerSchema(t *testing.T) {
 		VALUES (99, 'future.sql', 'future')`); err != nil {
 		t.Fatalf("insert newer schema version: %v", err)
 	}
-	if _, err := Open(t.Context(), options); err == nil || !strings.Contains(err.Error(), "newer than supported") {
-		t.Fatalf("Open newer schema error = %v, want newer-version error", err)
+	if err := Migrate(t.Context(), options); err == nil || !strings.Contains(err.Error(), "newer than supported") {
+		t.Fatalf("Migrate newer schema error = %v, want newer-version error", err)
+	}
+	// Old replicas keep running while a newer release has already migrated.
+	old, err := Open(t.Context(), options)
+	if err != nil {
+		t.Fatalf("Open newer schema: %v", err)
+	}
+	defer old.Close()
+	if err := old.Ready(t.Context()); err != nil {
+		t.Errorf("Ready newer schema = %v, want nil", err)
+	}
+}
+
+func TestOpen_requiresMigratedSchema(t *testing.T) {
+	options, cleanup := testDatabase(t)
+	defer cleanup()
+	if _, err := Open(t.Context(), options); !errors.Is(err, ErrSchemaIncompatible) {
+		t.Fatalf("Open unmigrated database error = %v, want ErrSchemaIncompatible", err)
+	}
+}
+
+func TestStore_readyReportsOutdatedSchema(t *testing.T) {
+	options, cleanup := testDatabase(t)
+	defer cleanup()
+	store := openTestStore(t, options)
+	if err := store.Ready(t.Context()); err != nil {
+		t.Fatalf("Ready migrated database = %v, want nil", err)
+	}
+	if _, err := store.db.Exec(t.Context(), "DELETE FROM schema_migrations WHERE version = 1"); err != nil {
+		t.Fatalf("remove migration record: %v", err)
+	}
+	if err := store.Ready(t.Context()); !errors.Is(err, ErrSchemaIncompatible) {
+		t.Errorf("Ready outdated schema = %v, want ErrSchemaIncompatible", err)
 	}
 }
 
@@ -822,6 +861,9 @@ func testStore(t *testing.T) *Store {
 
 func openTestStore(t *testing.T, options Options) *Store {
 	t.Helper()
+	if err := Migrate(t.Context(), options); err != nil {
+		t.Fatalf("Migrate test database: %v", err)
+	}
 	store, err := Open(t.Context(), options)
 	if err != nil {
 		t.Fatalf("Open test store: %v", err)

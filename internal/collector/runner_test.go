@@ -34,6 +34,9 @@ type runnerStore struct {
 	collectionRenewals    int
 	normalizationRenewals int
 	releasedQuota         int
+	claimErr              error
+	claimErrs             int
+	onClaimErr            func()
 }
 
 type persistedPage struct {
@@ -100,6 +103,13 @@ func (s *runnerStore) ReleaseCollectionJob(context.Context, store.JobClaim) erro
 }
 
 func (s *runnerStore) ClaimNormalizationJob(_ context.Context, _ string, version int, _ time.Duration) (store.NormalizationClaim, bool, error) {
+	if s.claimErr != nil {
+		s.claimErrs++
+		if s.onClaimErr != nil {
+			s.onClaimErr()
+		}
+		return store.NormalizationClaim{}, false, s.claimErr
+	}
 	if s.normalization == nil || s.normalization.NormalizerVersion != version {
 		return store.NormalizationClaim{}, false, nil
 	}
@@ -539,6 +549,49 @@ func TestRunner_Run_stopsOnCancellation(t *testing.T) {
 	cancel()
 	if err := runner.Run(ctx); !errors.Is(err, context.Canceled) {
 		t.Errorf("Run(canceled) error = %v, want context.Canceled", err)
+	}
+}
+
+func TestRunner_Run_resumesWorkAfterDatabaseOutage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	storeStub := &runnerStore{claimErr: errors.New("connection refused")}
+	storeStub.onClaimErr = func() {
+		if storeStub.claimErrs == 3 {
+			// The database "recovers" and work becomes available.
+			storeStub.claimErr = nil
+			storeStub.normalization = &store.NormalizationClaim{
+				RawEventID: uuid.New(), NormalizerVersion: 1,
+				Event: event.RawEvent{Source: "test", Kind: "change", ExternalID: "after-outage"},
+			}
+		}
+	}
+	done := make(chan struct{})
+	runner, err := NewRunner(storeStub, nil, normalizerFunc(func(event.RawEvent) ([]event.Action, error) {
+		defer close(done)
+		return nil, nil
+	}), slog.New(slog.NewTextHandler(io.Discard, nil)), RunnerOptions{
+		Owner: "test", PollInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- runner.Run(ctx) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("worker did not process work after the database recovered")
+	}
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Errorf("Run error = %v, want context.Canceled", err)
+	}
+	if storeStub.claimErrs < 3 {
+		t.Errorf("failed claim attempts = %d, want at least 3 retries", storeStub.claimErrs)
+	}
+	if storeStub.completed != 1 {
+		t.Errorf("completed normalizations = %d, want 1 after recovery", storeStub.completed)
 	}
 }
 

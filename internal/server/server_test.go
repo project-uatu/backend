@@ -22,6 +22,7 @@ type testStore struct {
 	coverage       []store.CoverageInterval
 	counts         []store.ContributionCount
 	err            error
+	readyErr       error
 	apiPersonErr   error
 	createErr      error
 	identifiersErr error
@@ -45,6 +46,8 @@ const testAPIKey = "01234567890123456789012345678901"
 func testOptions() Options {
 	return Options{APIKey: testAPIKey, CORSOrigins: []string{"https://frontend.example"}}
 }
+
+func (s *testStore) Ready(context.Context) error { return s.readyErr }
 
 func (s *testStore) CoverageForPerson(_ context.Context, person uuid.UUID, from, to time.Time) ([]store.CoverageInterval, error) {
 	s.calls++
@@ -485,6 +488,45 @@ func TestHandler_healthz(t *testing.T) {
 	res := serve(t, NewHandler(&testStore{}, testLogger(), testOptions()), "/healthz")
 	if res.Code != http.StatusNoContent {
 		t.Errorf("GET /healthz status = %d, want %d", res.Code, http.StatusNoContent)
+	}
+}
+
+func TestHandler_readyz(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"ready", nil, http.StatusNoContent},
+		{"database unavailable", errors.New("connection refused"), http.StatusServiceUnavailable},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := serve(t, NewHandler(&testStore{readyErr: tt.err}, testLogger(), testOptions()), "/readyz")
+			if res.Code != tt.want {
+				t.Errorf("GET /readyz status = %d, want %d", res.Code, tt.want)
+			}
+			if res.Body.Len() != 0 {
+				t.Errorf("GET /readyz body = %q, want empty", res.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandler_healthzIgnoresDatabaseOutage(t *testing.T) {
+	res := serve(t, NewHandler(&testStore{readyErr: errors.New("down")}, testLogger(), testOptions()), "/healthz")
+	if res.Code != http.StatusNoContent {
+		t.Errorf("GET /healthz status = %d, want %d during database outage", res.Code, http.StatusNoContent)
+	}
+}
+
+func TestHealthHandler(t *testing.T) {
+	handler := NewHealthHandler(func(context.Context) error { return errors.New("down") }, testLogger())
+	if res := serve(t, handler, "/healthz"); res.Code != http.StatusNoContent {
+		t.Errorf("GET /healthz status = %d, want %d", res.Code, http.StatusNoContent)
+	}
+	if res := serve(t, handler, "/readyz"); res.Code != http.StatusServiceUnavailable {
+		t.Errorf("GET /readyz status = %d, want %d", res.Code, http.StatusServiceUnavailable)
 	}
 }
 
