@@ -240,7 +240,7 @@ a development or production database.
 Uatu is licensed under the [Apache License 2.0](LICENSE), the license used by
 CNCF and Linux Foundation projects. Contributions are accepted under the
 [Developer Certificate of Origin](https://developercertificate.org/): sign off
-every commit with `git commit -s`. Commits are also expected to be signed and to
+every commit with `git commit -s`; see [CONTRIBUTING.md](CONTRIBUTING.md). Commits are also expected to be signed and to
 follow lowercase conventional commits. New Go files start with
 `// SPDX-License-Identifier: Apache-2.0`.
 
