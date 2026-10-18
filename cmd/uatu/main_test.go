@@ -65,6 +65,14 @@ func TestRun_collectRequiresToken(t *testing.T) {
 	}
 }
 
+func TestRun_serveRequiresAPIKeyBeforeOpeningDatabase(t *testing.T) {
+	cfg := config.Config{DatabaseURL: "invalid"}
+	err := run(t.Context(), []string{"serve"}, cfg, testLogger(), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "UATU_API_KEY") {
+		t.Fatalf("run(serve) error = %v, want API key requirement before database access", err)
+	}
+}
+
 func TestRun_help(t *testing.T) {
 	for _, arg := range []string{"help", "-h", "--help"} {
 		t.Run(arg, func(t *testing.T) {

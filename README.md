@@ -11,8 +11,9 @@ in a separate repository.
 Uatu collects public GitHub contribution history for tracked people, stores
 raw records and normalized timeline actions in PostgreSQL, and serves
 time-bounded history, source aggregates and collection coverage through a
-read-only API. GitHub release coverage is limited to known public repositories;
-the API does not claim complete account-wide release history.
+private, operator-authenticated API. GitHub release coverage is limited to
+known public repositories; the API does not claim complete account-wide
+release history.
 
 ## Getting started
 
@@ -29,8 +30,9 @@ incremental scan with a seven-day overlap after a successful backfill.
 
 `GITHUB_TOKEN` is required for all `collect` modes: GitHub GraphQL requires
 authentication for stable account refresh and contribution aggregates. Serving
-stored data does not require a token. Repeating `collect` while work is queued
-or interrupted resumes its original window and saved cursor.
+stored data does not require a GitHub token, but does require `UATU_API_KEY`.
+Repeating `collect` while work is queued or interrupted resumes its original
+window and saved cursor.
 Searches are restricted to public results. The collector verifies repository
 visibility before emitting search events and never persists private repository
 activity. `sslmode=disable` is for this
@@ -52,13 +54,28 @@ calendar total. Capped aggregate windows are split; unresolved daily caps are
 recorded as coverage gaps. Repeated observations are retained, not additive.
 
 After collection, use the logged person ID to query the timeline and source
-metadata. `from` and `to` are required RFC3339 timestamps; `limit` is optional
-for activity and defaults to 100 (maximum 500).
+metadata. `serve` requires `UATU_API_KEY`, a random secret of at least 32 bytes.
+Keep it on a trusted server-side frontend/proxy; never embed it in browser code,
+a URL or local storage. CORS is disabled unless exact origins are configured
+with `UATU_CORS_ORIGINS`. It is not a substitute for authentication. The API
+contract is documented in [OpenAPI](docs/openapi/v1.yaml).
+
+`from` and `to` are required RFC3339 timestamps for activity, coverage and
+counts; activity uses the half-open range `[from,to)`, with a default page size
+of 100 and maximum 500. Requests require a bearer token:
 
 ```sh
-curl 'http://localhost:3000/v1/persons/<person-id>/activity?from=2020-01-01T00:00:00Z&to=2021-01-01T00:00:00Z'
-curl 'http://localhost:3000/v1/persons/<person-id>/coverage?from=2020-01-01T00:00:00Z&to=2021-01-01T00:00:00Z'
-curl 'http://localhost:3000/v1/persons/<person-id>/counts?from=2020-01-01T00:00:00Z&to=2021-01-01T00:00:00Z'
+export UATU_API_KEY="$(openssl rand -hex 32)"
+curl -X POST 'http://localhost:3000/v1/persons' \
+  -H "Authorization: Bearer $UATU_API_KEY" \
+  -H 'Content-Type: application/json' \
+  --data '{"login":"octocat","display_name":"Octocat"}'
+curl -H "Authorization: Bearer $UATU_API_KEY" \
+  'http://localhost:3000/v1/persons/<person-id>/activity?from=2020-01-01T00:00:00Z&to=2021-01-01T00:00:00Z'
+curl -H "Authorization: Bearer $UATU_API_KEY" \
+  'http://localhost:3000/v1/persons/<person-id>/coverage?from=2020-01-01T00:00:00Z&to=2021-01-01T00:00:00Z'
+curl -H "Authorization: Bearer $UATU_API_KEY" \
+  'http://localhost:3000/v1/persons/<person-id>/counts?from=2020-01-01T00:00:00Z&to=2021-01-01T00:00:00Z'
 ```
 
 | Variable | Default | Purpose |
@@ -70,6 +87,8 @@ curl 'http://localhost:3000/v1/persons/<person-id>/counts?from=2020-01-01T00:00:
 | `UATU_DB_CONNECT_TIMEOUT` | `5s` | Timeout when opening a database connection |
 | `UATU_ADDR` | `:3000` | HTTP listen address |
 | `UATU_HEALTH_ADDR` | `:3001` | `collect --loop` health listener address |
+| `UATU_API_KEY` | Required for `serve` | Operator bearer key; at least 32 bytes |
+| `UATU_CORS_ORIGINS` | Empty | Comma-separated exact HTTP(S) origins allowed by browser clients |
 | `UATU_USERS` | | Comma-separated GitHub users to track and collect |
 | `GITHUB_TOKEN` | Required for `collect` | GitHub API token for identity refresh and public contribution counts |
 
@@ -96,6 +115,7 @@ or you must authenticate to GHCR with an account that has package access.
 
 ```sh
 export GITHUB_TOKEN='<your-token>'
+export UATU_API_KEY="$(openssl rand -hex 32)"
 export UATU_IMAGE=ghcr.io/project-uatu/backend:latest
 docker pull "$UATU_IMAGE"
 docker network create uatu
@@ -104,7 +124,7 @@ docker run -d --name uatu-postgres --network uatu \
   postgres:17
 docker run --rm --network uatu -e UATU_DATABASE_URL='postgres://uatu:local-only@uatu-postgres:5432/uatu?sslmode=disable' \
   -e GITHUB_TOKEN "$UATU_IMAGE" collect octocat
-docker run --rm --network uatu -p 3000:3000 \
+docker run --rm --network uatu -p 3000:3000 -e UATU_API_KEY \
   -e UATU_DATABASE_URL='postgres://uatu:local-only@uatu-postgres:5432/uatu?sslmode=disable' "$UATU_IMAGE" serve
 ```
 
@@ -165,6 +185,7 @@ from your source checkout:
 ```sh
 export UATU_DATABASE_URL='postgres://uatu:local-only@localhost:5432/uatu?sslmode=disable'
 export GITHUB_TOKEN='<your-token>'
+export UATU_API_KEY="$(openssl rand -hex 32)"
 go run ./cmd/uatu collect octocat
 go run ./cmd/uatu serve
 ```

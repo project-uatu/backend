@@ -836,6 +836,7 @@ func TestStore_CompletedBackfillSetsWatermarkOnFirstPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreatePerson: %v", err)
 	}
+
 	forge, err := s.CreateForgeInstance(ctx, "forgejo", "https://forge.example")
 	if err != nil {
 		t.Fatalf("CreateForgeInstance: %v", err)
@@ -865,5 +866,53 @@ func TestStore_CompletedBackfillSetsWatermarkOnFirstPage(t *testing.T) {
 	}
 	if !complete || through == nil || !through.Equal(windowEnd) {
 		t.Errorf("checkpoint = complete %t, through %v; want complete through %s", complete, through, windowEnd)
+	}
+}
+
+func TestStore_ResolvedAccountPersistenceIsFencedWithPage(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	_, job, err := s.CreateGitHubPerson(ctx, "", "octocat", nil)
+	if err != nil {
+		t.Fatalf("CreateGitHubPerson: %v", err)
+	}
+	staleClaim, found, err := s.ClaimCollectionJob(ctx, "stale-worker", time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimCollectionJob(stale) = %t, %v; want claim", found, err)
+	}
+	if _, err := s.db.Exec(ctx, `
+		UPDATE jobs SET lease_expires_at = now() - interval '1 second'
+		WHERE id = $1`, job.ID); err != nil {
+		t.Fatalf("expire stale claim: %v", err)
+	}
+	currentClaim, found, err := s.ClaimCollectionJob(ctx, "current-worker", time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimCollectionJob(current) = %t, %v; want reclaimed job", found, err)
+	}
+	resolved := event.Page{
+		NextCursor: "resolved",
+		ResolvedAccount: &event.ResolvedAccount{
+			AccountID: "42", NodeID: "MDQ6VXNlcjQy", Login: "octocat",
+			CreatedAt: time.Date(2011, 1, 25, 18, 44, 36, 0, time.UTC),
+		},
+	}
+	if _, err := s.PersistCollectionPage(ctx, staleClaim, resolved, event.FetchReport{}, true, 1, uuid.Nil); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("PersistCollectionPage(stale) error = %v; want ErrLeaseLost", err)
+	}
+	if got := countRows(t, s, "SELECT count(*) FROM github_accounts WHERE person_id = $1", job.PersonID); got != 0 {
+		t.Fatalf("stored accounts after stale persist = %d; want no stale resolution writes", got)
+	}
+	if _, err := s.PersistCollectionPage(ctx, currentClaim, resolved, event.FetchReport{}, true, 1, uuid.Nil); err != nil {
+		t.Fatalf("PersistCollectionPage(current): %v", err)
+	}
+	if got := countRows(t, s, "SELECT count(*) FROM github_accounts WHERE person_id = $1", job.PersonID); got != 1 {
+		t.Errorf("stored accounts after current persist = %d; want resolved account", got)
+	}
+	var windowStart time.Time
+	if err := s.db.QueryRow(ctx, "SELECT window_start FROM jobs WHERE id = $1", job.ID).Scan(&windowStart); err != nil {
+		t.Fatalf("load resolved job window: %v", err)
+	}
+	if want := resolved.ResolvedAccount.CreatedAt; !windowStart.Equal(want) {
+		t.Errorf("resolved job window start = %s, want %s", windowStart, want)
 	}
 }
