@@ -28,3 +28,4 @@ an ADR unless they change an architectural contract.
 | [0005: Resumable bounded collection and normalization](0005-resumable-collection.md) | Accepted |
 | [0006: GitHub event enumeration and coverage strategy](0006-github-event-enumeration.md) | Accepted |
 | [0007: Versioned person API, authentication and privacy](0007-versioned-person-api.md) | Accepted |
+| [0008: Kubernetes delivery contract and separate Helm chart repository](0008-kubernetes-delivery-contract.md) | Proposed |
