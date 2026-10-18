@@ -2,8 +2,7 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
+	"crypto/hmac"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -25,7 +24,6 @@ type apiLogger interface {
 }
 
 func secureAPI(next http.Handler, options Options, logger *slog.Logger) http.Handler {
-	expectedKey := sha256.Sum256([]byte(options.APIKey))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := uuid.NewString()
 		w.Header().Set("X-Request-ID", requestID)
@@ -72,8 +70,7 @@ func secureAPI(next http.Handler, options Options, logger *slog.Logger) http.Han
 				writeAuthError(w, logger, requestID, http.StatusUnauthorized, "unauthorized", "valid bearer token required")
 				return
 			}
-			providedKey := sha256.Sum256([]byte(provided))
-			if subtle.ConstantTimeCompare(providedKey[:], expectedKey[:]) != 1 {
+			if !hmac.Equal([]byte(provided), []byte(options.APIKey)) {
 				w.Header().Set("WWW-Authenticate", `Bearer realm="uatu"`)
 				writeAuthError(w, logger, requestID, http.StatusUnauthorized, "unauthorized", "valid bearer token required")
 				return
