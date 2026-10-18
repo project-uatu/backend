@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package gitlab collects public GitLab.com person activity.
 package gitlab
 

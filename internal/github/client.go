@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package github retrieves public person history from GitHub.
 package github
 

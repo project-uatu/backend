@@ -235,6 +235,15 @@ Store integration tests run against an isolated PostgreSQL database when
 dedicated PostgreSQL service for these tests. Never point the test variable at
 a development or production database.
 
+## License and contributing
+
+Uatu is licensed under the [Apache License 2.0](LICENSE), the license used by
+CNCF and Linux Foundation projects. Contributions are accepted under the
+[Developer Certificate of Origin](https://developercertificate.org/): sign off
+every commit with `git commit -s`. Commits are also expected to be signed and to
+follow lowercase conventional commits. New Go files start with
+`// SPDX-License-Identifier: Apache-2.0`.
+
 ## Learn more
 
 - [Implementation plan](docs/plan.md)

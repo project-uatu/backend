@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package forgenorm normalizes the canonical public-activity payload emitted
 // by the GitLab and Forgejo connectors into contribution actions.
 package forgenorm

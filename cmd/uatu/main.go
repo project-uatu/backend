@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Command uatu collects open source activity and serves stored results.
 package main
 

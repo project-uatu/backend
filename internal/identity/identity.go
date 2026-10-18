@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package identity normalizes forge identifiers without guessing person names.
 package identity
 

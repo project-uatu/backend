@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package event defines the typed values exchanged by collection, normalization and storage.
 package event
 

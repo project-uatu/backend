@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package forgejo collects public Codeberg (Forgejo) person activity.
 package forgejo
 
