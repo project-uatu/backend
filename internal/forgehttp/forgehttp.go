@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package forgehttp provides the HTTP transport shared by forge connectors:
 // a descriptive User-Agent, bounded responses, rate-limit header parsing and
 // error values that never include response content.

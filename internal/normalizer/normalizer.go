@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package normalizer transforms stored raw events into contribution actions.
 package normalizer
 
