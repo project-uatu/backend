@@ -101,12 +101,18 @@ func run(ctx context.Context, args []string, cfg config.Config, logger *slog.Log
 }
 
 func serve(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
+	if len(cfg.APIKey) < 32 {
+		return errors.New("serve requires UATU_API_KEY with at least 32 bytes")
+	}
 	db, err := store.Open(ctx, storeOptions(cfg))
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	return server.Run(ctx, cfg.Address, server.NewHandler(db, logger), logger)
+	handler := server.NewHandler(db, logger, server.Options{
+		APIKey: cfg.APIKey, CORSOrigins: cfg.CORSOrigins,
+	})
+	return server.Run(ctx, cfg.Address, handler, logger)
 }
 
 func collectPeople(ctx context.Context, cfg config.Config, users []string, logger *slog.Logger) error {
@@ -121,11 +127,11 @@ func collectPeople(ctx context.Context, cfg config.Config, users []string, logge
 	}
 	client := github.NewClient(cfg.GitHubToken, nil)
 	for _, login := range users {
-		account, err := client.ResolveAccount(ctx, login)
+		account, _, err := client.ResolveAccount(ctx, login)
 		if err != nil {
 			return fmt.Errorf("resolve GitHub user %s: %w", login, err)
 		}
-		tracked, err := db.TrackGitHubAccount(ctx, forge.ID, store.GitHubAccount{
+		tracked, err := db.TrackGitHubAccountForLogin(ctx, forge.ID, login, store.GitHubAccount{
 			AccountID: account.ID, NodeID: account.NodeID, Login: account.Login,
 			AccountCreatedAt: account.CreatedAt,
 		})

@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -17,6 +18,8 @@ type Config struct {
 	DatabaseMaxConns       int32
 	DatabaseConnectTimeout time.Duration
 	Address                string
+	APIKey                 string
+	CORSOrigins            []string
 	GitHubToken            string
 	Users                  []string
 }
@@ -41,6 +44,14 @@ func Load() (Config, error) {
 	if connectTimeout <= 0 {
 		return Config{}, fmt.Errorf("UATU_DB_CONNECT_TIMEOUT must be positive")
 	}
+	apiKey := os.Getenv("UATU_API_KEY")
+	if apiKey != "" && (len(apiKey) < 32 || strings.ContainsAny(apiKey, " \t\r\n")) {
+		return Config{}, fmt.Errorf("UATU_API_KEY must be at least 32 bytes and contain no whitespace")
+	}
+	corsOrigins, err := parseCORSOrigins(os.Getenv("UATU_CORS_ORIGINS"))
+	if err != nil {
+		return Config{}, err
+	}
 	sslMode := envOr("UATU_DB_SSLMODE", "verify-full")
 	switch sslMode {
 	case "disable", "allow", "prefer", "require", "verify-ca", "verify-full":
@@ -54,9 +65,34 @@ func Load() (Config, error) {
 		DatabaseMaxConns:       maxConns,
 		DatabaseConnectTimeout: connectTimeout,
 		Address:                envOr("UATU_ADDR", ":3000"),
+		APIKey:                 apiKey,
+		CORSOrigins:            corsOrigins,
 		GitHubToken:            os.Getenv("GITHUB_TOKEN"),
 		Users:                  splitUsers(os.Getenv("UATU_USERS")),
 	}, nil
+}
+
+func parseCORSOrigins(value string) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	origins := strings.Split(value, ",")
+	seen := make(map[string]struct{}, len(origins))
+	for i, origin := range origins {
+		origin = strings.TrimSpace(origin)
+		parsed, err := url.Parse(origin)
+		if err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" ||
+			parsed.Host == "" || parsed.User != nil || parsed.Path != "" ||
+			parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || origin == "*" {
+			return nil, fmt.Errorf("UATU_CORS_ORIGINS must contain exact HTTP origins")
+		}
+		if _, ok := seen[origin]; ok {
+			return nil, fmt.Errorf("UATU_CORS_ORIGINS contains duplicate origin %q", origin)
+		}
+		seen[origin] = struct{}{}
+		origins[i] = origin
+	}
+	return origins, nil
 }
 
 // ParseUsers returns trimmed, non-empty user names from args or the fallback

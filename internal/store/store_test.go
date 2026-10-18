@@ -139,6 +139,66 @@ func TestOpen_migrationConsolidatesActiveCollectionJobs(t *testing.T) {
 	}
 }
 
+func TestOpen_migrationHandlesNullRawEventActorKeys(t *testing.T) {
+	options, cleanup := testDatabase(t)
+	defer cleanup()
+	conn, err := pgx.Connect(t.Context(), options.URL)
+	if err != nil {
+		t.Fatalf("connect to migration test schema: %v", err)
+	}
+	defer func() {
+		if err := conn.Close(context.Background()); err != nil {
+			t.Errorf("close migration test connection: %v", err)
+		}
+	}()
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+	}
+	if len(migrations) < 6 {
+		t.Fatalf("migration count = %d, want migration 006", len(migrations))
+	}
+	if _, err := conn.Exec(t.Context(), `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
+		t.Fatalf("create schema migration history: %v", err)
+	}
+	for _, migration := range migrations[:5] {
+		if _, err := conn.Exec(t.Context(), migration.sql, pgx.QueryExecModeSimpleProtocol); err != nil {
+			t.Fatalf("apply migration %s: %v", migration.name, err)
+		}
+		if _, err := conn.Exec(t.Context(), `
+			INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)`,
+			migration.version, migration.name, migration.checksum); err != nil {
+			t.Fatalf("record migration %s: %v", migration.name, err)
+		}
+	}
+	forgeID, rawEventID := uuid.New(), uuid.New()
+	if _, err := conn.Exec(t.Context(), `
+		INSERT INTO forge_instances (id, provider, base_url)
+		VALUES ($1, 'github', 'https://github.example')`, forgeID); err != nil {
+		t.Fatalf("create migration fixture forge: %v", err)
+	}
+	if _, err := conn.Exec(t.Context(), `
+		INSERT INTO raw_events
+			(id, forge_instance_id, external_id, kind, payload, payload_schema_version, actor_keys)
+		VALUES ($1, $2, 'null-actors', 'activity', '{}', 1, 'null'::jsonb)`,
+		rawEventID, forgeID); err != nil {
+		t.Fatalf("create raw event with JSON null actors: %v", err)
+	}
+
+	s := openTestStore(t, options)
+	var indexed int
+	if err := s.db.QueryRow(t.Context(),
+		"SELECT count(*) FROM raw_event_actor_keys WHERE raw_event_id = $1", rawEventID).Scan(&indexed); err != nil {
+		t.Fatalf("count indexed actors after migration: %v", err)
+	}
+	if indexed != 0 {
+		t.Errorf("indexed actors from JSON null = %d, want 0", indexed)
+	}
+}
+
 func TestOpen_rejectsMigrationChecksumChange(t *testing.T) {
 	options, cleanup := testDatabase(t)
 	defer cleanup()

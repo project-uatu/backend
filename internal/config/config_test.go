@@ -38,6 +38,8 @@ func TestLoad_readsEnvironment(t *testing.T) {
 	t.Setenv("UATU_DB_MAX_CONNS", "12")
 	t.Setenv("UATU_DB_CONNECT_TIMEOUT", "3s")
 	t.Setenv("UATU_ADDR", "127.0.0.1:4000")
+	t.Setenv("UATU_API_KEY", "01234567890123456789012345678901")
+	t.Setenv("UATU_CORS_ORIGINS", "https://app.example, http://localhost:3000")
 	t.Setenv("GITHUB_TOKEN", "test-token")
 	t.Setenv("UATU_USERS", "alice, bob")
 
@@ -49,7 +51,10 @@ func TestLoad_readsEnvironment(t *testing.T) {
 		got.DatabaseSSLMode != "verify-full" ||
 		got.DatabaseMinConns != 1 || got.DatabaseMaxConns != 12 ||
 		got.DatabaseConnectTimeout != 3*time.Second ||
-		got.Address != "127.0.0.1:4000" || got.GitHubToken != "test-token" ||
+		got.Address != "127.0.0.1:4000" ||
+		got.APIKey != "01234567890123456789012345678901" ||
+		!reflect.DeepEqual(got.CORSOrigins, []string{"https://app.example", "http://localhost:3000"}) ||
+		got.GitHubToken != "test-token" ||
 		!reflect.DeepEqual(got.Users, []string{"alice", "bob"}) {
 		t.Errorf("Load = %+v, want configured values", got)
 	}
@@ -61,6 +66,8 @@ func TestLoad_defaultsDatabasePool(t *testing.T) {
 	t.Setenv("UATU_DB_MIN_CONNS", "")
 	t.Setenv("UATU_DB_MAX_CONNS", "")
 	t.Setenv("UATU_DB_CONNECT_TIMEOUT", "")
+	t.Setenv("UATU_API_KEY", "")
+	t.Setenv("UATU_CORS_ORIGINS", "")
 
 	got, err := Load()
 	if err != nil {
@@ -102,6 +109,42 @@ func TestLoad_rejectsInvalidPoolSettings(t *testing.T) {
 			name: "invalid ssl mode",
 			set: func(t *testing.T) {
 				t.Setenv("UATU_DB_SSLMODE", "trust-me")
+			},
+		},
+		{
+			name: "short API key",
+			set: func(t *testing.T) {
+				t.Setenv("UATU_API_KEY", "short")
+			},
+		},
+		{
+			name: "API key contains whitespace",
+			set: func(t *testing.T) {
+				t.Setenv("UATU_API_KEY", "01234567890123456789012345678901 ")
+			},
+		},
+		{
+			name: "wildcard CORS origin",
+			set: func(t *testing.T) {
+				t.Setenv("UATU_CORS_ORIGINS", "*")
+			},
+		},
+		{
+			name: "CORS origin includes a path",
+			set: func(t *testing.T) {
+				t.Setenv("UATU_CORS_ORIGINS", "https://app.example/path")
+			},
+		},
+		{
+			name: "CORS origin includes an empty query",
+			set: func(t *testing.T) {
+				t.Setenv("UATU_CORS_ORIGINS", "https://app.example?")
+			},
+		},
+		{
+			name: "duplicate CORS origin",
+			set: func(t *testing.T) {
+				t.Setenv("UATU_CORS_ORIGINS", "https://app.example,https://app.example")
 			},
 		},
 	}

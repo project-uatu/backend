@@ -181,7 +181,7 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 		request := event.PageRequest{
 			PersonID: claim.PersonID, ForgeInstanceID: claim.ForgeInstanceID,
 			Source: source, ScanMode: claim.ScanMode,
-			IdentityKeys: claim.IdentityKeys, Window: claim.Window,
+			IdentityKeys: claim.IdentityKeys, OnboardingLogin: claim.OnboardingLogin, Window: claim.Window,
 			Cursor: claim.Cursor, PageSize: r.options.PageSize,
 			AccountNodeID: claim.AccountNodeID, CurrentLogin: claim.CurrentAccountLogin,
 			KnownRepositories: claim.KnownRepositories,
@@ -211,6 +211,9 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 			reservationID = reservation.ID
 		}
 		page, report, fetchErr := r.fetchPage(ctx, connector, request, claim)
+		if fetchErr == nil && page.ResolvedAccount != nil && claim.ScanMode == "backfill" && claim.Window.From.IsZero() {
+			claim.Window.From = page.ResolvedAccount.CreatedAt.UTC()
+		}
 		report = sanitizeFetchReport(report)
 		report.Requests++
 		report.Pages++
@@ -276,14 +279,27 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 		done, err := r.store.PersistCollectionPage(
 			ctx, claim, page, report, true, r.options.NormalizerVersion, reservationID)
 		if err != nil {
+			var cleanupErr error
 			if reservationID != uuid.Nil {
 				releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 				releaseErr := r.store.ReleaseRateLimit(releaseCtx, reservationID)
 				cancel()
 				if releaseErr != nil {
-					return errors.Join(fmt.Errorf("persist collection page: %w", err),
-						fmt.Errorf("settle quota reservation: %w", releaseErr))
+					cleanupErr = fmt.Errorf("settle quota reservation: %w", releaseErr)
 				}
+			}
+			if errors.Is(err, store.ErrIdentityConflict) {
+				failCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				failErr := r.store.FailCollectionJob(
+					failCtx, claim, "resolved GitHub account is assigned to another person")
+				cancel()
+				if cleanupErr != nil || failErr != nil {
+					return errors.Join(fmt.Errorf("persist collection page: %w", err), cleanupErr, failErr)
+				}
+				return nil
+			}
+			if cleanupErr != nil {
+				return errors.Join(fmt.Errorf("persist collection page: %w", err), cleanupErr)
 			}
 			return fmt.Errorf("persist collection page: %w", err)
 		}

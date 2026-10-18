@@ -38,29 +38,29 @@ type Account struct {
 }
 
 // ResolveAccount resolves a login to immutable GitHub account identifiers.
-func (c *Client) ResolveAccount(ctx context.Context, login string) (Account, error) {
+func (c *Client) ResolveAccount(ctx context.Context, login string) (Account, event.FetchReport, error) {
 	if !ValidLogin(login) {
-		return Account{}, fmt.Errorf("invalid GitHub login %q", login)
+		return Account{}, event.FetchReport{}, fmt.Errorf("invalid GitHub login %q", login)
 	}
 	target := c.baseURL + "/users/" + url.PathEscape(login)
-	body, _, err := c.do(ctx, http.MethodGet, target, nil, "github/core")
+	body, report, err := c.do(ctx, http.MethodGet, target, nil, "github/core")
 	if err != nil {
-		return Account{}, fmt.Errorf("resolve GitHub account: %w", err)
+		return Account{}, report, fmt.Errorf("resolve GitHub account: %w", err)
 	}
 	var user githubUser
 	if err := json.Unmarshal(body, &user); err != nil {
-		return Account{}, fmt.Errorf("decode GitHub account: %w", err)
+		return Account{}, report, fmt.Errorf("decode GitHub account: %w", err)
 	}
 	if user.ID <= 0 || user.NodeID == "" || !ValidLogin(user.Login) {
-		return Account{}, errors.New("GitHub returned an invalid account identity")
+		return Account{}, report, errors.New("GitHub returned an invalid account identity")
 	}
 	if user.CreatedAt.IsZero() {
-		return Account{}, errors.New("GitHub returned an account without a creation time")
+		return Account{}, report, errors.New("GitHub returned an account without a creation time")
 	}
 	return Account{
 		ID: strconv.FormatInt(user.ID, 10), NodeID: user.NodeID,
 		Login: user.Login, CreatedAt: user.CreatedAt.UTC(),
-	}, nil
+	}, report, nil
 }
 
 type scanTask struct {
@@ -76,13 +76,14 @@ type scanTask struct {
 }
 
 type scanState struct {
-	Tasks     []scanTask `json:"tasks"`
-	Repos     []string   `json:"repos,omitempty"`
-	Login     string     `json:"login"`
-	AccountID string     `json:"account_id"`
-	NodeID    string     `json:"node_id,omitempty"`
-	Stage     string     `json:"stage"`
-	Updated   bool       `json:"updated,omitempty"`
+	Tasks            []scanTask `json:"tasks"`
+	Repos            []string   `json:"repos,omitempty"`
+	Login            string     `json:"login"`
+	AccountID        string     `json:"account_id"`
+	NodeID           string     `json:"node_id,omitempty"`
+	AccountCreatedAt time.Time  `json:"account_created_at,omitempty"`
+	Stage            string     `json:"stage"`
+	Updated          bool       `json:"updated,omitempty"`
 }
 
 // HistoryConnector pages through GitHub person activity using Search, core
@@ -147,11 +148,60 @@ func (c *HistoryConnector) FetchPage(ctx context.Context, request event.PageRequ
 	if err != nil {
 		return event.Page{}, event.FetchReport{}, err
 	}
-	if state.Login == "" || state.AccountID == "" {
-		return event.Page{}, event.FetchReport{}, errors.New("GitHub history requires assigned account ID and login identities")
+	if state.Login == "" {
+		state.Login = request.CurrentLogin
+	}
+	if state.Login == "" {
+		return event.Page{}, event.FetchReport{}, errors.New("GitHub history requires an assigned login identity")
 	}
 	if !ValidLogin(state.Login) {
 		return event.Page{}, event.FetchReport{}, errors.New("GitHub history contains an invalid login identity")
+	}
+	report := event.FetchReport{
+		RateLimitBucket: c.QuotaBucketFor(request),
+		CoverageScope:   historyCoverageScope,
+	}
+	if request.Cursor == "" && state.AccountID == "" {
+		account, resolutionReport, err := c.client.ResolveAccount(ctx, state.Login)
+		mergeReport(&report, resolutionReport)
+		if err != nil {
+			return event.Page{}, report, err
+		}
+		state.AccountID, state.NodeID, state.Login = account.ID, account.NodeID, account.Login
+		state.AccountCreatedAt = account.CreatedAt
+		start, end := request.Window.From, request.Window.To
+		if start.IsZero() {
+			start = account.CreatedAt
+		}
+		if end.IsZero() {
+			end = time.Now().UTC()
+		}
+		state.Updated = request.ScanMode == "incremental"
+		state.Stage = "discover"
+		state.Tasks = []scanTask{{Kind: "owned_repos", Page: 1}}
+		for _, repo := range request.KnownRepositories {
+			state.Tasks = append(state.Tasks, scanTask{Kind: "verify_repo", Repo: repo})
+		}
+		for _, kind := range []string{"authored_issue", "authored_pr", "review_candidates"} {
+			searchStart := start
+			if kind == "review_candidates" && !state.Updated {
+				searchStart = time.Date(2008, 1, 1, 0, 0, 0, 0, time.UTC)
+			}
+			state.Tasks = append(state.Tasks, scanTask{
+				Kind: kind, Start: searchStart.UTC().Format("2006-01-02"),
+				End: end.Add(-time.Nanosecond).UTC().Format("2006-01-02"), Page: 1,
+			})
+		}
+		cursorBytes, err := json.Marshal(state)
+		if err != nil {
+			return event.Page{}, report, fmt.Errorf("encode resolved GitHub history cursor: %w", err)
+		}
+		return event.Page{
+			NextCursor: string(cursorBytes),
+			ResolvedAccount: &event.ResolvedAccount{
+				AccountID: account.ID, NodeID: account.NodeID, Login: account.Login, CreatedAt: account.CreatedAt,
+			},
+		}, report, nil
 	}
 	if request.Cursor == "" {
 		start, end := request.Window.From, request.Window.To
@@ -198,10 +248,6 @@ func (c *HistoryConnector) FetchPage(ctx context.Context, request event.PageRequ
 
 	task := state.Tasks[0]
 	repoCount := len(state.Repos)
-	report := event.FetchReport{
-		RateLimitBucket: c.QuotaBucketFor(request),
-		CoverageScope:   historyCoverageScope,
-	}
 	var rawEvents []event.RawEvent
 	var fetchErr error
 	switch task.Kind {
@@ -241,11 +287,13 @@ func (c *HistoryConnector) FetchPage(ctx context.Context, request event.PageRequ
 }
 
 func decodeScanState(request event.PageRequest) (scanState, error) {
-	state := scanState{}
+	state := scanState{Login: request.OnboardingLogin}
 	for _, key := range request.IdentityKeys {
 		switch key.IdentityKey.Kind {
 		case identity.KindLogin:
-			state.Login = key.IdentityKey.Value
+			if state.Login == "" {
+				state.Login = key.IdentityKey.Value
+			}
 		case identity.KindAccountID:
 			state.AccountID = key.IdentityKey.Value
 		}
@@ -263,6 +311,7 @@ func decodeScanState(request event.PageRequest) (scanState, error) {
 		}
 		state.Tasks, state.Repos, state.Stage, state.Updated = stored.Tasks, stored.Repos, stored.Stage, stored.Updated
 		state.NodeID = stored.NodeID
+		state.AccountCreatedAt = stored.AccountCreatedAt
 	}
 	return state, nil
 }
