@@ -15,7 +15,7 @@ func TestStore_APIOnboardingAndIdentifierLifecycle(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()
 
-	person, initialJob, err := s.CreateGitHubPerson(ctx, "Octo Cat", "octocat", []string{"octo@example.com"})
+	person, initialJob, err := s.CreateOnboardedPerson(ctx, githubForge(t, s), "Octo Cat", "octocat", []string{"octo@example.com"})
 	if err != nil {
 		t.Fatalf("CreateGitHubPerson: %v", err)
 	}
@@ -44,9 +44,9 @@ func TestStore_APIOnboardingAndIdentifierLifecycle(t *testing.T) {
 	}
 
 	for _, key := range []string{"sync-one", "sync-one"} {
-		job, err := s.EnqueueGitHubHistoryWithKey(ctx, person.ID, initialJob.ForgeInstanceID, key)
+		job, err := s.EnqueueHistoryWithKey(ctx, person.ID, initialJob.ForgeInstanceID, key)
 		if err != nil {
-			t.Fatalf("EnqueueGitHubHistoryWithKey(%q): %v", key, err)
+			t.Fatalf("EnqueueHistoryWithKey(%q): %v", key, err)
 		}
 		if job.ID != initialJob.ID {
 			t.Errorf("idempotent job ID = %s, want initial job %s", job.ID, initialJob.ID)
@@ -168,11 +168,11 @@ func TestStore_ActivityPageUsesDeterministicKeyset(t *testing.T) {
 func TestStore_APIOnboardingProtectsPendingLoginAndLeavesJobsClaimable(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()
-	firstPerson, firstJob, err := s.CreateGitHubPerson(ctx, "", "octocat", nil)
+	firstPerson, firstJob, err := s.CreateOnboardedPerson(ctx, githubForge(t, s), "", "octocat", nil)
 	if err != nil {
 		t.Fatalf("CreateGitHubPerson(octocat): %v", err)
 	}
-	_, secondJob, err := s.CreateGitHubPerson(ctx, "", "zebra", nil)
+	_, secondJob, err := s.CreateOnboardedPerson(ctx, githubForge(t, s), "", "zebra", nil)
 	if err != nil {
 		t.Fatalf("CreateGitHubPerson(zebra): %v", err)
 	}
@@ -193,7 +193,7 @@ func TestStore_APIOnboardingProtectsPendingLoginAndLeavesJobsClaimable(t *testin
 func TestStore_APIOnboardingRetainsTargetLoginAndIndexesActorIdentities(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()
-	person, job, err := s.CreateGitHubPerson(ctx, "", "octocat", nil)
+	person, job, err := s.CreateOnboardedPerson(ctx, githubForge(t, s), "", "octocat", nil)
 	if err != nil {
 		t.Fatalf("CreateGitHubPerson: %v", err)
 	}
@@ -275,7 +275,7 @@ func TestStore_ResolveAccountConflictRollsBackCollectionPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TrackGitHubAccount: %v", err)
 	}
-	person, job, err := s.CreateGitHubPerson(ctx, "", "zebra", nil)
+	person, job, err := s.CreateOnboardedPerson(ctx, githubForge(t, s), "", "zebra", nil)
 	if err != nil {
 		t.Fatalf("CreateGitHubPerson: %v", err)
 	}
@@ -324,10 +324,10 @@ func TestStore_ResolveAccountConflictRollsBackCollectionPage(t *testing.T) {
 	}
 }
 
-func TestStore_EnqueueGitHubHistoryPreservesFailedOnboardingTarget(t *testing.T) {
+func TestStore_EnqueueHistoryPreservesFailedOnboardingTarget(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()
-	person, originalJob, err := s.CreateGitHubPerson(ctx, "", "octocat", nil)
+	person, originalJob, err := s.CreateOnboardedPerson(ctx, githubForge(t, s), "", "octocat", nil)
 	if err != nil {
 		t.Fatalf("CreateGitHubPerson: %v", err)
 	}
@@ -339,9 +339,9 @@ func TestStore_EnqueueGitHubHistoryPreservesFailedOnboardingTarget(t *testing.T)
 		t.Fatalf("fail original onboarding job: %v", err)
 	}
 
-	replacement, err := s.EnqueueGitHubHistoryWithKey(ctx, person.ID, originalJob.ForgeInstanceID, "replacement-sync")
+	replacement, err := s.EnqueueHistoryWithKey(ctx, person.ID, originalJob.ForgeInstanceID, "replacement-sync")
 	if err != nil {
-		t.Fatalf("EnqueueGitHubHistoryWithKey: %v", err)
+		t.Fatalf("EnqueueHistoryWithKey: %v", err)
 	}
 	if replacement.OnboardingLogin != "octocat" {
 		t.Errorf("replacement onboarding login = %q, want original target octocat", replacement.OnboardingLogin)
@@ -355,7 +355,7 @@ func TestStore_EnqueueGitHubHistoryPreservesFailedOnboardingTarget(t *testing.T)
 func TestStore_EnqueueWithoutOnboardingTargetFailsAndInvalidJobDoesNotBlockQueue(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()
-	invalidPerson, invalidJob, err := s.CreateGitHubPerson(ctx, "", "octocat", nil)
+	invalidPerson, invalidJob, err := s.CreateOnboardedPerson(ctx, githubForge(t, s), "", "octocat", nil)
 	if err != nil {
 		t.Fatalf("CreateGitHubPerson(octocat): %v", err)
 	}
@@ -366,14 +366,14 @@ func TestStore_EnqueueWithoutOnboardingTargetFailsAndInvalidJobDoesNotBlockQueue
 		[]APIIdentity{{Kind: identity.KindLogin, Value: "octocat"}}); err != nil {
 		t.Fatalf("UpdatePersonIdentifiers(remove failed target): %v", err)
 	}
-	if _, err := s.EnqueueGitHubHistoryWithKey(ctx, invalidPerson.ID, invalidJob.ForgeInstanceID, "no-target"); !errors.Is(err, ErrOnboardingTargetUnavailable) {
-		t.Errorf("EnqueueGitHubHistoryWithKey without target error = %v, want ErrOnboardingTargetUnavailable", err)
+	if _, err := s.EnqueueHistoryWithKey(ctx, invalidPerson.ID, invalidJob.ForgeInstanceID, "no-target"); !errors.Is(err, ErrOnboardingTargetUnavailable) {
+		t.Errorf("EnqueueHistoryWithKey without target error = %v, want ErrOnboardingTargetUnavailable", err)
 	}
 	if _, err := s.db.Exec(ctx, "UPDATE jobs SET status = 'queued' WHERE id = $1", invalidJob.ID); err != nil {
 		t.Fatalf("requeue invalid legacy job: %v", err)
 	}
 
-	_, validJob, err := s.CreateGitHubPerson(ctx, "", "zebra", nil)
+	_, validJob, err := s.CreateOnboardedPerson(ctx, githubForge(t, s), "", "zebra", nil)
 	if err != nil {
 		t.Fatalf("CreateGitHubPerson(zebra): %v", err)
 	}
@@ -393,7 +393,7 @@ func TestStore_EnqueueWithoutOnboardingTargetFailsAndInvalidJobDoesNotBlockQueue
 func TestStore_CollectCLIReusesPendingAPIOnboarding(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()
-	person, job, err := s.CreateGitHubPerson(ctx, "", "octocat", nil)
+	person, job, err := s.CreateOnboardedPerson(ctx, githubForge(t, s), "", "octocat", nil)
 	if err != nil {
 		t.Fatalf("CreateGitHubPerson: %v", err)
 	}
@@ -415,4 +415,13 @@ func TestStore_CollectCLIReusesPendingAPIOnboarding(t *testing.T) {
 		claim.CurrentAccountLogin != "octo-cat" {
 		t.Fatalf("ClaimCollectionJob after CLI tracking = %+v, %t, %v; want pending API job", claim, found, err)
 	}
+}
+
+func githubForge(t *testing.T, s *Store) ForgeInstance {
+	t.Helper()
+	forge, err := s.GitHubForge(t.Context())
+	if err != nil {
+		t.Fatalf("GitHubForge: %v", err)
+	}
+	return forge
 }

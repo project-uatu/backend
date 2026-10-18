@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/project-uatu/backend/internal/event"
+	"github.com/project-uatu/backend/internal/forgehttp"
 	"github.com/project-uatu/backend/internal/identity"
 )
 
@@ -964,6 +965,7 @@ func (c *Client) do(ctx context.Context, method, target string, body []byte, buc
 		return nil, report, fmt.Errorf("build GitHub request: %w", err)
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", forgehttp.UserAgent())
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/json")
 	}
