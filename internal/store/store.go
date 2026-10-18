@@ -28,8 +28,46 @@ type Store struct {
 	db *pgxpool.Pool
 }
 
-// Open connects to PostgreSQL, verifies the connection and applies migrations.
+// ErrSchemaIncompatible reports that the database schema lacks migrations the
+// running binary requires.
+var ErrSchemaIncompatible = errors.New("database schema is not compatible with this release")
+
+// Open connects to PostgreSQL and verifies that the schema contains every
+// migration this release needs. It never changes the schema; run Migrate first.
+// A schema that is newer than this release is accepted so that old replicas
+// keep serving during a rolling upgrade.
 func Open(ctx context.Context, options Options) (*Store, error) {
+	pool, err := openPool(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkSchema(ctx, pool); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return &Store{db: pool}, nil
+}
+
+// Migrate applies pending schema migrations under a database-wide lock, so
+// concurrent callers are serialized, and then closes its connections.
+func Migrate(ctx context.Context, options Options) error {
+	pool, err := openPool(ctx, options)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := migrate(ctx, pool); err != nil {
+		return fmt.Errorf("migrate PostgreSQL database: %w", err)
+	}
+	return nil
+}
+
+// Ready reports whether the database is reachable and has a compatible schema.
+func (s *Store) Ready(ctx context.Context) error {
+	return checkSchema(ctx, s.db)
+}
+
+func openPool(ctx context.Context, options Options) (*pgxpool.Pool, error) {
 	if options.URL == "" {
 		return nil, errors.New("UATU_DATABASE_URL is required")
 	}
@@ -59,11 +97,7 @@ func Open(ctx context.Context, options Options) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("connect to PostgreSQL: %w", err)
 	}
-	if err := migrate(ctx, pool); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("migrate PostgreSQL database: %w", err)
-	}
-	return &Store{db: pool}, nil
+	return pool, nil
 }
 
 func withDefaultSSLMode(databaseURL, sslMode string) (string, error) {

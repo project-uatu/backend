@@ -31,6 +31,9 @@ type runnerStore struct {
 	collectionRenewals    int
 	normalizationRenewals int
 	releasedQuota         int
+	claimErr              error
+	claimErrs             int
+	onClaimErr            func()
 }
 
 type persistedPage struct {
@@ -80,6 +83,13 @@ func (s *runnerStore) ReleaseCollectionJob(context.Context, store.JobClaim) erro
 }
 
 func (s *runnerStore) ClaimNormalizationJob(_ context.Context, _ string, version int, _ time.Duration) (store.NormalizationClaim, bool, error) {
+	if s.claimErr != nil {
+		s.claimErrs++
+		if s.onClaimErr != nil {
+			s.onClaimErr()
+		}
+		return store.NormalizationClaim{}, false, s.claimErr
+	}
 	if s.normalization == nil || s.normalization.NormalizerVersion != version {
 		return store.NormalizationClaim{}, false, nil
 	}
@@ -423,6 +433,34 @@ func TestRunner_Run_stopsOnCancellation(t *testing.T) {
 	cancel()
 	if err := runner.Run(ctx); !errors.Is(err, context.Canceled) {
 		t.Errorf("Run(canceled) error = %v, want context.Canceled", err)
+	}
+}
+
+func TestRunner_Run_survivesDatabaseOutage(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	storeStub := &runnerStore{claimErr: errors.New("connection refused")}
+	storeStub.onClaimErr = func() {
+		if storeStub.claimErrs == 3 {
+			storeStub.claimErr = nil
+		}
+		if storeStub.claimErr == nil {
+			cancel()
+		}
+	}
+	runner, err := NewRunner(storeStub, nil, normalizerFunc(func(event.RawEvent) ([]event.Action, error) {
+		return nil, nil
+	}), slog.New(slog.NewTextHandler(io.Discard, nil)), RunnerOptions{
+		Owner: "test", PollInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	if err := runner.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("Run error = %v, want context.Canceled after retrying", err)
+	}
+	if storeStub.claimErrs < 3 {
+		t.Errorf("claim attempts with errors = %d, want at least 3 retries", storeStub.claimErrs)
 	}
 }
 

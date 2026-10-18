@@ -17,6 +17,7 @@ type Config struct {
 	DatabaseMaxConns       int32
 	DatabaseConnectTimeout time.Duration
 	Address                string
+	HealthAddress          string
 	GitHubToken            string
 	Users                  []string
 }
@@ -54,6 +55,7 @@ func Load() (Config, error) {
 		DatabaseMaxConns:       maxConns,
 		DatabaseConnectTimeout: connectTimeout,
 		Address:                envOr("UATU_ADDR", ":3000"),
+		HealthAddress:          envOr("UATU_HEALTH_ADDR", ":3001"),
 		GitHubToken:            os.Getenv("GITHUB_TOKEN"),
 		Users:                  splitUsers(os.Getenv("UATU_USERS")),
 	}, nil

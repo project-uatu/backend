@@ -20,6 +20,7 @@ import (
 
 const usage = `Usage:
   uatu [serve]             serve stored results over HTTP (default)
+  uatu migrate             apply database migrations and exit
   uatu collect [user ...]  collect public contribution history for GitHub users
   uatu collect             process due event work once when no users are configured
   uatu collect --loop      run the event worker until interrupted
@@ -72,6 +73,15 @@ func run(ctx context.Context, args []string, cfg config.Config, logger *slog.Log
 			return &usageError{err: fmt.Errorf("serve takes no arguments, got %q", args)}
 		}
 		return serve(ctx, cfg, logger)
+	case "migrate":
+		if len(args) > 0 {
+			return &usageError{err: fmt.Errorf("migrate takes no arguments, got %q", args)}
+		}
+		if err := store.Migrate(ctx, storeOptions(cfg)); err != nil {
+			return err
+		}
+		logger.InfoContext(ctx, "database migrations applied")
+		return nil
 	case "collect":
 		if cfg.GitHubToken == "" {
 			return &usageError{err: errors.New("collect requires GITHUB_TOKEN for GitHub identity refresh and contribution counts")}
@@ -149,7 +159,27 @@ func collectWork(ctx context.Context, cfg config.Config, loop bool, logger *slog
 		return err
 	}
 	defer db.Close()
-	return runCollectionWorker(ctx, db, cfg, logger, loop)
+	if !loop {
+		return runCollectionWorker(ctx, db, cfg, logger, false)
+	}
+	return runWithHealth(ctx, cfg, db, logger)
+}
+
+// runWithHealth runs the worker loop beside a health listener. Either one
+// stopping ends the other.
+func runWithHealth(ctx context.Context, cfg config.Config, db *store.Store, logger *slog.Logger) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	healthErr := make(chan error, 1)
+	go func() {
+		healthErr <- server.Run(ctx, cfg.HealthAddress, server.NewHealthHandler(db.Ready, logger), logger)
+	}()
+	workerErr := runCollectionWorker(ctx, db, cfg, logger, true)
+	cancel()
+	if err := <-healthErr; err != nil {
+		return errors.Join(workerErr, fmt.Errorf("serve worker health endpoints: %w", err))
+	}
+	return workerErr
 }
 
 func runCollectionWorker(ctx context.Context, db *store.Store, cfg config.Config, logger *slog.Logger, loop bool) error {

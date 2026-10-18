@@ -18,18 +18,47 @@ type historyStore interface {
 	Timeline(context.Context, uuid.UUID, time.Time, time.Time, int) ([]store.TimelineEntry, error)
 	CoverageForPerson(context.Context, uuid.UUID, time.Time, time.Time) ([]store.CoverageInterval, error)
 	ContributionCounts(context.Context, uuid.UUID, time.Time, time.Time) ([]store.ContributionCount, error)
+	Ready(context.Context) error
 }
+
+const readyTimeout = 2 * time.Second
+
+// ReadyFunc reports whether a process can do useful work.
+type ReadyFunc func(context.Context) error
 
 // NewHandler returns the HTTP API handler. Handlers only read stored data;
 // collection happens in the collector.
 func NewHandler(s historyStore, logger *slog.Logger) http.Handler {
+	mux := newHealthMux(s.Ready, logger)
+	mux.HandleFunc("GET /v1/persons/{id}/activity", activityHandler(s, logger))
+	mux.HandleFunc("GET /v1/persons/{id}/coverage", coverageHandler(s, logger))
+	mux.HandleFunc("GET /v1/persons/{id}/counts", countsHandler(s, logger))
+	return mux
+}
+
+// NewHealthHandler returns a handler serving only /healthz and /readyz, for
+// processes such as the collector that have no API.
+func NewHealthHandler(ready ReadyFunc, logger *slog.Logger) http.Handler {
+	return newHealthMux(ready, logger)
+}
+
+// newHealthMux serves liveness and readiness. Liveness never checks the
+// database, so a database outage does not restart pods; readiness does.
+func newHealthMux(ready ReadyFunc, logger *slog.Logger) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	mux.HandleFunc("GET /v1/persons/{id}/activity", activityHandler(s, logger))
-	mux.HandleFunc("GET /v1/persons/{id}/coverage", coverageHandler(s, logger))
-	mux.HandleFunc("GET /v1/persons/{id}/counts", countsHandler(s, logger))
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
+		defer cancel()
+		if err := ready(ctx); err != nil {
+			logger.WarnContext(r.Context(), "readiness check failed", "err", err)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	return mux
 }
 

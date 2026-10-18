@@ -10,6 +10,6 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/uatu ./cmd/uatu
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/uatu /uatu
 EXPOSE 3000
-USER nonroot:nonroot
+USER 65532:65532
 ENTRYPOINT ["/uatu"]
 CMD ["serve"]

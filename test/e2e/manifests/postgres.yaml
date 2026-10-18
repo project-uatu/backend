@@ -1,0 +1,53 @@
+# A single-instance PostgreSQL for tests. It is not highly available. The name
+# is substituted with sed so one file can create both the "bundled" and the
+# "external" database.
+apiVersion: v1
+kind: Service
+metadata:
+  name: __NAME__
+spec:
+  selector:
+    app: __NAME__
+  ports:
+    - port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: __NAME__
+spec:
+  serviceName: __NAME__
+  replicas: 1
+  selector:
+    matchLabels:
+      app: __NAME__
+  template:
+    metadata:
+      labels:
+        app: __NAME__
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: POSTGRES_USER, value: uatu}
+            - {name: POSTGRES_PASSWORD, value: e2e-only}
+            - {name: POSTGRES_DB, value: uatu}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "uatu", "-d", "uatu"]
+            periodSeconds: 2
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

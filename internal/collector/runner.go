@@ -145,14 +145,20 @@ func (r *Runner) Drain(ctx context.Context) error {
 	}
 }
 
-// Run polls for durable work until the context is canceled.
+// Run polls for durable work until the context is canceled. A failed poll,
+// such as a database outage, is logged and retried after the poll interval so
+// the worker recovers without a restart; leases protect interrupted work.
 func (r *Runner) Run(ctx context.Context) error {
 	ticker := time.NewTicker(r.options.PollInterval)
 	defer ticker.Stop()
 	for {
 		worked, err := r.RunOnce(ctx)
 		if err != nil {
-			return err
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			r.logger.ErrorContext(ctx, "collection poll failed; retrying", "err", err)
+			worked = false
 		}
 		if worked {
 			continue

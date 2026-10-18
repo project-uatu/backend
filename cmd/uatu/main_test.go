@@ -17,7 +17,8 @@ func TestRun_usageErrors(t *testing.T) {
 		args  []string
 		users []string
 	}{
-		{name: "unknown command", args: []string{"migrate"}},
+		{name: "unknown command", args: []string{"upgrade"}},
+		{name: "migrate with arguments", args: []string{"migrate", "now"}},
 		{name: "serve with arguments", args: []string{"serve", "octocat"}},
 		{name: "collect invalid login", args: []string{"collect", "-octocat"}},
 		{name: "collect invalid fallback login", args: []string{"collect"}, users: []string{"bad_login"}},
