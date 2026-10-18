@@ -32,8 +32,8 @@ reviewers, or be split into several pull requests.
 Using an AI assistant is fine, but you are responsible for understanding and
 reviewing everything you submit.
 
-- Point your assistant to [`.github/copilot-instructions.md`](.github/copilot-instructions.md)
-  and the instruction files it references.
+- Point your assistant to [`AGENTS.md`](AGENTS.md) and ask it to follow the
+  guidelines there, including the instruction files it references.
 - Disclose the assistance in the pull request description and in each commit
   with an `Assisted-by: <agent>/<model>` trailer.
 - Assistants must not add `Signed-off-by` or `Co-authored-by` trailers. Only
