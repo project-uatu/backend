@@ -123,6 +123,8 @@ docker run -d --name uatu-postgres --network uatu \
   -e POSTGRES_USER=uatu -e POSTGRES_PASSWORD=local-only -e POSTGRES_DB=uatu \
   postgres:17
 docker run --rm --network uatu -e UATU_DATABASE_URL='postgres://uatu:local-only@uatu-postgres:5432/uatu?sslmode=disable' \
+  "$UATU_IMAGE" migrate
+docker run --rm --network uatu -e UATU_DATABASE_URL='postgres://uatu:local-only@uatu-postgres:5432/uatu?sslmode=disable' \
   -e GITHUB_TOKEN "$UATU_IMAGE" collect octocat
 docker run --rm --network uatu -p 3000:3000 -e UATU_API_KEY \
   -e UATU_DATABASE_URL='postgres://uatu:local-only@uatu-postgres:5432/uatu?sslmode=disable' "$UATU_IMAGE" serve
@@ -145,8 +147,8 @@ defines the contract it relies on:
   `GET /readyz` (readiness; checks the database and schema) on `UATU_ADDR` for
   the API and on `UATU_HEALTH_ADDR` for the worker.
 - **Configuration:** environment only. Put `UATU_DATABASE_URL`,
-  `UATU_API_KEY` (API) and `GITHUB_TOKEN` (worker) in Secrets. Keep replicas x `UATU_DB_MAX_CONNS` below the
-  database's `max_connections`.
+  `UATU_API_KEY` (API) and `GITHUB_TOKEN` (worker) in Secrets. Keep replicas x
+  `UATU_DB_MAX_CONNS` below the database's `max_connections`.
 - **Container:** numeric non-root user 65532, read-only root filesystem, no
   capabilities. Give API pods a short `preStop` sleep (about five seconds) so
   endpoints are removed before the listener stops.
@@ -186,6 +188,7 @@ from your source checkout:
 export UATU_DATABASE_URL='postgres://uatu:local-only@localhost:5432/uatu?sslmode=disable'
 export GITHUB_TOKEN='<your-token>'
 export UATU_API_KEY="$(openssl rand -hex 32)"
+go run ./cmd/uatu migrate
 go run ./cmd/uatu collect octocat
 go run ./cmd/uatu serve
 ```

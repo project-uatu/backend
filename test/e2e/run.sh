@@ -36,7 +36,6 @@ db_url() { printf 'postgres://uatu:e2e-only@%s:5432/uatu?sslmode=disable' "$1"; 
 
 cleanup() {
   local status=$?
-  rm -rf "$tmp"
   if [[ $status -ne 0 ]]; then
     for ns in uatu-bundled uatu-external uatu-nofallback; do
       k -n "$ns" get pods -o wide 2>/dev/null || true
@@ -45,6 +44,7 @@ cleanup() {
   if [[ $created_cluster -eq 1 && "${KEEP:-0}" != 1 ]]; then
     kind delete cluster --name "$CLUSTER" >/dev/null
   fi
+  rm -rf "$tmp"
 }
 trap cleanup EXIT
 
@@ -55,7 +55,11 @@ setup_cluster() {
     return
   fi
   step "Preparing kind cluster $CLUSTER"
-  if ! kind get clusters | grep -qx "$CLUSTER"; then
+  # Keep kind from changing the user's kubeconfig or current context.
+  export KUBECONFIG="$tmp/kubeconfig"
+  if kind get clusters | grep -qx "$CLUSTER"; then
+    kind export kubeconfig --name "$CLUSTER"
+  else
     kind create cluster --name "$CLUSTER" --config "$E2E/kind-config.yaml" --wait 120s
     created_cluster=1
   fi
@@ -131,8 +135,11 @@ finish_probe() { # namespace
   local out
   out="$(k -n "$1" logs probe)"
   k -n "$1" delete pod probe --wait=false >/dev/null
-  if grep -q FAIL <<<"$out"; then
-    fail "API was unavailable during disruption ($(grep -c FAIL <<<"$out") failed requests)"
+  # Failures before the first success are probe startup noise.
+  local failures
+  failures="$(awk '/OK/ {seen = 1} seen && /FAIL/ {n++} END {print n + 0}' <<<"$out")"
+  if [[ "$failures" -gt 0 ]]; then
+    fail "API was unavailable during disruption ($failures failed requests)"
   fi
 }
 
@@ -192,6 +199,7 @@ scenario_bundled() {
   sleep 10 # let replaced pods finish terminating
   victim="$(k -n "$ns" get pods -l app=uatu-api --no-headers | awk '$2 == "1/1" && $3 == "Running" {print $1; exit}')"
   k -n "$ns" delete "pod/$victim" --ignore-not-found --wait=false >/dev/null
+  k -n "$ns" wait --for=delete "pod/$victim" --timeout=90s >/dev/null
   wait_ready "$ns" uatu-api 2
   finish_probe "$ns"
 

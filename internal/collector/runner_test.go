@@ -552,19 +552,23 @@ func TestRunner_Run_stopsOnCancellation(t *testing.T) {
 	}
 }
 
-func TestRunner_Run_survivesDatabaseOutage(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
+func TestRunner_Run_resumesWorkAfterDatabaseOutage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	storeStub := &runnerStore{claimErr: errors.New("connection refused")}
 	storeStub.onClaimErr = func() {
 		if storeStub.claimErrs == 3 {
+			// The database "recovers" and work becomes available.
 			storeStub.claimErr = nil
-		}
-		if storeStub.claimErr == nil {
-			cancel()
+			storeStub.normalization = &store.NormalizationClaim{
+				RawEventID: uuid.New(), NormalizerVersion: 1,
+				Event: event.RawEvent{Source: "test", Kind: "change", ExternalID: "after-outage"},
+			}
 		}
 	}
+	done := make(chan struct{})
 	runner, err := NewRunner(storeStub, nil, normalizerFunc(func(event.RawEvent) ([]event.Action, error) {
+		defer close(done)
 		return nil, nil
 	}), slog.New(slog.NewTextHandler(io.Discard, nil)), RunnerOptions{
 		Owner: "test", PollInterval: time.Millisecond,
@@ -572,11 +576,22 @@ func TestRunner_Run_survivesDatabaseOutage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRunner: %v", err)
 	}
-	if err := runner.Run(ctx); !errors.Is(err, context.Canceled) {
-		t.Errorf("Run error = %v, want context.Canceled after retrying", err)
+	errc := make(chan error, 1)
+	go func() { errc <- runner.Run(ctx) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("worker did not process work after the database recovered")
+	}
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Errorf("Run error = %v, want context.Canceled", err)
 	}
 	if storeStub.claimErrs < 3 {
-		t.Errorf("claim attempts with errors = %d, want at least 3 retries", storeStub.claimErrs)
+		t.Errorf("failed claim attempts = %d, want at least 3 retries", storeStub.claimErrs)
+	}
+	if storeStub.completed != 1 {
+		t.Errorf("completed normalizations = %d, want 1 after recovery", storeStub.completed)
 	}
 }
 
