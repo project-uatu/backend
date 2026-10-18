@@ -98,7 +98,11 @@ func TestRunWithHealth_stopsWorkerWhenHealthListenerFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer listener.Close()
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil {
+			t.Errorf("close listener: %v", err)
+		}
+	})
 
 	ready := func(context.Context) error { return nil }
 	work := func(ctx context.Context) error {
