@@ -30,3 +30,4 @@ an ADR unless they change an architectural contract.
 | [0007: Versioned person API, authentication and privacy](0007-versioned-person-api.md) | Accepted |
 | [0008: Kubernetes delivery contract and separate Helm chart repository](0008-kubernetes-delivery-contract.md) | Accepted |
 | [0009: GitLab.com and Codeberg connectors](0009-gitlab-codeberg-connectors.md) | Accepted |
+| [0010: Bounded seeded-repository commit history](0010-commit-history.md) | Proposed |
