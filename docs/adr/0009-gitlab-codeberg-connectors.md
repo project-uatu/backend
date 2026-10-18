@@ -154,7 +154,15 @@ documentation and live responses on 2026-10-18.
   pagination with the same split-on-cap and gap rules as ADR 0006. Incremental
   syncs use `updated_after` with overlap.
 - Lifecycle milestones come from `created_at`, `closed_at` and `merged_at` on
-  the returned object. No intermediate state changes are invented.
+  the returned object. No intermediate state changes are invented. A merge is
+  credited only when `merged_by` is the tracked account; the author of a request
+  merged by someone else gets only the opened action.
+- Confidential issues are excluded with `confidential=false` and by dropping any
+  record marked confidential. Project visibility is verified one request at a
+  time before a page becomes events, and the persisted cursor never holds
+  records, paths or URLs of unverified or private projects, only their numeric
+  IDs. Release scans are scheduled for every public project discovered during a
+  scan, and release IDs use the numeric project ID so renames do not duplicate.
 - Releases: per known public project, filtered by the author's numeric ID.
   Coverage is **known projects only**, as for GitHub.
 - Reviews: `approved` events from the user events API, labeled with coverage
@@ -171,7 +179,12 @@ documentation and live responses on 2026-10-18.
   re-read a bounded overlap and upsert by feed ID.
 - Because the feed depth is instance-defined, the earliest reachable entry is
   recorded as the coverage boundary. History before it is a stated gap unless
-  filled from known repositories.
+  filled from known repositories. Each scan refreshes the login from the stable
+  account ID first, so renamed accounts keep working. Incremental scans report
+  the boundary only when the heatmap shows earlier contributions.
+- Source limits are recorded as boundary gaps: they stay visible in coverage
+  and mark the sync partial, but do not keep the checkpoint from advancing to
+  incremental scans.
 - Backfilling authored records the feed no longer returns, by enumerating
   known repositories with `issues?created_by=`, pull request `poster`
   filtering and `releases`, is **deferred**. It needs a rule for combining

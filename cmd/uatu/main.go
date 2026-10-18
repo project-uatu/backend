@@ -13,6 +13,7 @@ import (
 
 	"github.com/project-uatu/backend/internal/collector"
 	"github.com/project-uatu/backend/internal/config"
+	"github.com/project-uatu/backend/internal/event"
 	"github.com/project-uatu/backend/internal/forgejo"
 	"github.com/project-uatu/backend/internal/forgenorm"
 	"github.com/project-uatu/backend/internal/github"
@@ -204,21 +205,22 @@ func runCollectionWorker(ctx context.Context, db *store.Store, cfg config.Config
 	if err != nil {
 		return fmt.Errorf("configure GitHub history normalizer: %w", err)
 	}
+	// Normalizers are pure, so every forge's handlers stay registered for
+	// already stored data. Only connectors depend on enablement.
+	for _, source := range []event.Source{gitlab.Source, forgejo.Source} {
+		if err := forgenorm.Register(transformer, source); err != nil {
+			return fmt.Errorf("configure forge normalizer: %w", err)
+		}
+	}
 	var connectors []collector.Connector
 	if cfg.ForgeEnabled("github.com") {
 		connectors = append(connectors, github.NewHistoryConnector(github.NewClient(cfg.GitHubToken, nil)))
 	}
 	if cfg.ForgeEnabled("gitlab.com") {
 		connectors = append(connectors, gitlab.New(gitlab.Options{Token: cfg.GitLabToken}))
-		if err := forgenorm.Register(transformer, gitlab.Source); err != nil {
-			return fmt.Errorf("configure GitLab normalizer: %w", err)
-		}
 	}
 	if cfg.ForgeEnabled("codeberg.org") {
 		connectors = append(connectors, forgejo.New(forgejo.Options{Token: cfg.CodebergToken}))
-		if err := forgenorm.Register(transformer, forgejo.Source); err != nil {
-			return fmt.Errorf("configure Codeberg normalizer: %w", err)
-		}
 	}
 	if len(connectors) == 0 {
 		return errors.New("no forges enabled; set UATU_FORGES")

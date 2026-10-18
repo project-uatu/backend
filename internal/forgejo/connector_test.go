@@ -3,12 +3,14 @@ package forgejo
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/project-uatu/backend/internal/event"
+	"github.com/project-uatu/backend/internal/identity"
 )
 
 const page1 = `[
@@ -145,6 +147,76 @@ func TestParseContent(t *testing.T) {
 		if index, title := parseContent(tt.in); index != tt.index || title != tt.title {
 			t.Errorf("parseContent(%q) = %q, %q", tt.in, index, title)
 		}
+	}
+}
+
+func TestConnector_refreshesRenamedAccountByID(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch {
+		case r.URL.Path == "/users/search":
+			if r.URL.Query().Get("uid") != "5" {
+				t.Errorf("uid = %q, want 5", r.URL.Query().Get("uid"))
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"data":[{"id":5,"login":"new_name","created":"2020-01-01T00:00:00Z"}]}`))
+		case strings.HasSuffix(r.URL.Path, "/activities/feeds"), strings.HasSuffix(r.URL.Path, "/heatmap"):
+			if !strings.HasPrefix(r.URL.Path, "/users/new_name/") {
+				t.Errorf("path %q used a stale login", r.URL.Path)
+			}
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	c := New(Options{APIURL: server.URL, HTTPClient: server.Client()})
+	request := event.PageRequest{
+		PersonID: uuid.New(), ForgeInstanceID: uuid.New(), Source: Source, ScanMode: "backfill",
+		CurrentLogin: "old_name", PageSize: 50,
+		IdentityKeys: []event.ActorKey{{IdentityKey: identity.Key{Kind: identity.KindAccountID, Value: "5"}}},
+	}
+	_, resolved, _ := drain(t, c, request)
+	if resolved == nil || resolved.Login != "new_name" || resolved.AccountID != "5" {
+		t.Fatalf("resolved = %+v, want refreshed login new_name", resolved)
+	}
+}
+
+func TestConnector_incrementalGapNeedsHeatmapEvidence(t *testing.T) {
+	heatmap := ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/users/search":
+			_, _ = w.Write([]byte(`{"data":[{"id":5,"login":"jane_doe"}]}`))
+		case strings.HasSuffix(r.URL.Path, "/activities/feeds"):
+			_, _ = w.Write([]byte(`[]`))
+		case strings.HasSuffix(r.URL.Path, "/heatmap"):
+			_, _ = w.Write([]byte(heatmap))
+		}
+	}))
+	defer server.Close()
+	c := New(Options{APIURL: server.URL, HTTPClient: server.Client()})
+	from := time.Now().UTC().AddDate(0, 0, -30)
+	request := event.PageRequest{
+		PersonID: uuid.New(), ForgeInstanceID: uuid.New(), Source: Source, ScanMode: "incremental",
+		CurrentLogin: "jane_doe", PageSize: 50, Window: event.Window{From: from, To: time.Now().UTC()},
+		IdentityKeys: []event.ActorKey{{IdentityKey: identity.Key{Kind: identity.KindAccountID, Value: "5"}}},
+	}
+	gaps := func() int {
+		_, _, reports := drain(t, c, request)
+		n := 0
+		for _, report := range reports {
+			n += len(report.Gaps)
+		}
+		return n
+	}
+	heatmap = `[]`
+	if n := gaps(); n != 0 {
+		t.Errorf("quiet account reported %d gaps, want 0", n)
+	}
+	heatmap = `[{"timestamp":` + strconv.FormatInt(from.AddDate(0, 0, 3).Unix(), 10) + `,"contributions":4}]`
+	if n := gaps(); n != 1 {
+		t.Errorf("hidden contributions reported %d gaps, want 1", n)
 	}
 }
 

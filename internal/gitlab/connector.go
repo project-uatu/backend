@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"time"
 
@@ -66,21 +67,27 @@ func (c *Connector) Source() event.Source { return Source }
 // QuotaBucket names the GitLab.com API quota.
 func (c *Connector) QuotaBucket() string { return quotaBucket }
 
+// task is one step of a scan. Verify lists project IDs whose visibility must
+// be checked before the task's page may be turned into events. Nothing from an
+// unverified or private project is ever stored in the cursor except its
+// numeric ID.
 type task struct {
-	Kind    string            `json:"kind"`
-	Start   string            `json:"start,omitempty"`
-	End     string            `json:"end,omitempty"`
-	Since   string            `json:"since,omitempty"`
-	Page    int               `json:"page,omitempty"`
-	Project string            `json:"project,omitempty"`
-	Type    string            `json:"type,omitempty"`
-	Records []json.RawMessage `json:"records,omitempty"`
+	Kind    string  `json:"kind"`
+	Start   string  `json:"start,omitempty"`
+	End     string  `json:"end,omitempty"`
+	Since   string  `json:"since,omitempty"`
+	Page    int     `json:"page,omitempty"`
+	Project string  `json:"project,omitempty"`
+	Verify  []int64 `json:"verify,omitempty"`
 }
 
+// projectInfo holds metadata for public projects only. A non-public entry is
+// an empty marker.
 type projectInfo struct {
-	Path   string `json:"path"`
-	WebURL string `json:"web_url"`
-	Public bool   `json:"public"`
+	ID     int64  `json:"id,omitempty"`
+	Path   string `json:"path,omitempty"`
+	WebURL string `json:"web_url,omitempty"`
+	Public bool   `json:"public,omitempty"`
 }
 
 type scanState struct {
@@ -88,6 +95,8 @@ type scanState struct {
 	AccountID string                 `json:"account_id"`
 	Tasks     []task                 `json:"tasks"`
 	Projects  map[string]projectInfo `json:"projects,omitempty"`
+	// Scheduled lists public projects that already have a releases task.
+	Scheduled []string `json:"scheduled,omitempty"`
 }
 
 func decodeState(request event.PageRequest) (scanState, error) {
@@ -116,7 +125,7 @@ func decodeState(request event.PageRequest) (scanState, error) {
 		if stored.Login != "" {
 			state.Login = stored.Login
 		}
-		state.Tasks, state.Projects = stored.Tasks, stored.Projects
+		state.Tasks, state.Projects, state.Scheduled = stored.Tasks, stored.Projects, stored.Scheduled
 	}
 	if state.Projects == nil {
 		state.Projects = map[string]projectInfo{}
@@ -142,14 +151,14 @@ func (c *Connector) FetchPage(ctx context.Context, request event.PageRequest) (e
 	}
 	var events []event.RawEvent
 	var runErr error
-	switch state.Tasks[0].Kind {
-	case "issues", "merge_requests":
-		runErr = c.list(ctx, &state, &report)
-	case "approvals":
-		runErr = c.approvals(ctx, &state, &report)
-	case "process":
-		events, runErr = c.process(ctx, request, &state, &report)
-	case "releases":
+	switch {
+	case len(state.Tasks[0].Verify) > 0:
+		runErr = c.verifyNext(ctx, &state, &report)
+	case state.Tasks[0].Kind == "issues" || state.Tasks[0].Kind == "merge_requests":
+		events, runErr = c.list(ctx, request, &state, &report)
+	case state.Tasks[0].Kind == "approvals":
+		events, runErr = c.approvals(ctx, request, &state, &report)
+	case state.Tasks[0].Kind == "releases":
 		events, runErr = c.releases(ctx, request, &state, &report)
 	default:
 		runErr = fmt.Errorf("unknown GitLab history cursor task %q", state.Tasks[0].Kind)
@@ -205,7 +214,7 @@ func (c *Connector) plan(request event.PageRequest, state *scanState, created ti
 	now := time.Now().UTC()
 	incremental := request.ScanMode == "incremental" && !request.Window.From.IsZero()
 	for _, repo := range request.KnownRepositories {
-		state.Tasks = append(state.Tasks, task{Kind: "releases", Project: repo, Page: 1})
+		schedule(state, repo, repo)
 	}
 	if incremental {
 		since := request.Window.From.UTC().Add(-incrementalOverlap).Format(time.RFC3339)
@@ -250,12 +259,56 @@ func advance(state *scanState, got int) {
 	state.Tasks[0].Page++
 }
 
-func (c *Connector) list(ctx context.Context, state *scanState, report *event.FetchReport) error {
+// schedule queues one releases task for a public project unless it already has
+// one. key is the identifier used to fetch it; alias is another identifier of
+// the same project.
+func schedule(state *scanState, key, alias string) {
+	if slices.Contains(state.Scheduled, key) || slices.Contains(state.Scheduled, alias) {
+		return
+	}
+	state.Scheduled = append(state.Scheduled, key)
+	if alias != key {
+		state.Scheduled = append(state.Scheduled, alias)
+	}
+	state.Tasks = append(state.Tasks, task{Kind: "releases", Project: key, Page: 1})
+}
+
+// verifyNext checks the visibility of the next unverified project.
+func (c *Connector) verifyNext(ctx context.Context, state *scanState, report *event.FetchReport) error {
+	t := &state.Tasks[0]
+	id := strconv.FormatInt(t.Verify[0], 10)
+	if err := c.verifyProject(ctx, state, id, report); err != nil {
+		return err
+	}
+	t.Verify = t.Verify[1:]
+	return nil
+}
+
+// unverified returns the project IDs of records that have not been checked.
+func unverified(state *scanState, items []listed) []int64 {
+	var ids []int64
+	for _, item := range items {
+		if item.ProjectID <= 0 {
+			continue
+		}
+		id := strconv.FormatInt(item.ProjectID, 10)
+		if _, known := state.Projects[id]; !known && !slices.Contains(ids, item.ProjectID) {
+			ids = append(ids, item.ProjectID)
+		}
+	}
+	return ids
+}
+
+func (c *Connector) list(ctx context.Context, request event.PageRequest, state *scanState, report *event.FetchReport) ([]event.RawEvent, error) {
 	t := state.Tasks[0]
 	query := url.Values{
 		"scope": {"all"}, "author_id": {state.AccountID}, "state": {"all"},
 		"order_by": {"created_at"}, "sort": {"asc"},
 		"per_page": {strconv.Itoa(pageSize)}, "page": {strconv.Itoa(t.Page)},
+	}
+	if t.Kind == "issues" {
+		// Confidential issues must never be collected, even with a token.
+		query.Set("confidential", "false")
 	}
 	if t.Since != "" {
 		query.Set("updated_after", t.Since)
@@ -266,24 +319,29 @@ func (c *Connector) list(ctx context.Context, state *scanState, report *event.Fe
 	res, upstream, err := c.client.Get(ctx, "/"+t.Kind, query, quotaBucket)
 	mergeReport(report, upstream)
 	if err != nil {
-		return fmt.Errorf("list GitLab %s: %w", t.Kind, err)
+		return nil, fmt.Errorf("list GitLab %s: %w", t.Kind, err)
 	}
-	var records []json.RawMessage
-	if err := json.Unmarshal(res.Body, &records); err != nil {
-		return fmt.Errorf("decode GitLab %s: %w", t.Kind, err)
+	var items []listed
+	if err := json.Unmarshal(res.Body, &items); err != nil {
+		return nil, fmt.Errorf("decode GitLab %s: %w", t.Kind, err)
 	}
-	advance(state, len(records))
-	if len(records) > 0 {
-		state.Tasks = append([]task{{Kind: "process", Type: t.Kind, Records: records}}, state.Tasks...)
+	if ids := unverified(state, items); len(ids) > 0 {
+		state.Tasks[0].Verify = ids
+		return nil, nil
 	}
-	return nil
+	events, err := c.build(request, state, report, t.Kind, items)
+	if err != nil {
+		return nil, err
+	}
+	advance(state, len(items))
+	return events, nil
 }
 
-func (c *Connector) approvals(ctx context.Context, state *scanState, report *event.FetchReport) error {
+func (c *Connector) approvals(ctx context.Context, request event.PageRequest, state *scanState, report *event.FetchReport) ([]event.RawEvent, error) {
 	t := state.Tasks[0]
 	start, err := time.Parse(time.RFC3339, t.Start)
 	if err != nil {
-		return errors.New("invalid GitLab approvals cursor")
+		return nil, errors.New("invalid GitLab approvals cursor")
 	}
 	query := url.Values{
 		"action": {"approved"}, "target_type": {"merge_request"}, "sort": {"asc"},
@@ -299,72 +357,63 @@ func (c *Connector) approvals(ctx context.Context, state *scanState, report *eve
 			From: start, To: time.Now().UTC(), Reason: "GitLab approval events are unavailable",
 		})
 		pop(state)
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return fmt.Errorf("list GitLab approval events: %w", err)
+		return nil, fmt.Errorf("list GitLab approval events: %w", err)
 	}
-	var records []json.RawMessage
-	if err := json.Unmarshal(res.Body, &records); err != nil {
-		return fmt.Errorf("decode GitLab approval events: %w", err)
+	var items []listed
+	if err := json.Unmarshal(res.Body, &items); err != nil {
+		return nil, fmt.Errorf("decode GitLab approval events: %w", err)
 	}
-	advance(state, len(records))
-	if len(records) > 0 {
-		state.Tasks = append([]task{{Kind: "process", Type: "approvals", Records: records}}, state.Tasks...)
+	if ids := unverified(state, items); len(ids) > 0 {
+		state.Tasks[0].Verify = ids
+		return nil, nil
 	}
-	return nil
+	events, err := c.build(request, state, report, "approvals", items)
+	if err != nil {
+		return nil, err
+	}
+	advance(state, len(items))
+	return events, nil
 }
 
 type listed struct {
-	ID        int64      `json:"id"`
-	IID       int64      `json:"iid"`
-	ProjectID int64      `json:"project_id"`
-	Title     string     `json:"title"`
-	State     string     `json:"state"`
-	WebURL    string     `json:"web_url"`
-	CreatedAt *time.Time `json:"created_at"`
-	ClosedAt  *time.Time `json:"closed_at"`
-	MergedAt  *time.Time `json:"merged_at"`
-	TargetIID int64      `json:"target_iid"`
-	Target    string     `json:"target_title"`
+	ID           int64      `json:"id"`
+	IID          int64      `json:"iid"`
+	ProjectID    int64      `json:"project_id"`
+	Title        string     `json:"title"`
+	State        string     `json:"state"`
+	WebURL       string     `json:"web_url"`
+	Confidential bool       `json:"confidential"`
+	CreatedAt    *time.Time `json:"created_at"`
+	ClosedAt     *time.Time `json:"closed_at"`
+	MergedAt     *time.Time `json:"merged_at"`
+	MergedBy     *struct {
+		ID int64 `json:"id"`
+	} `json:"merged_by"`
+	TargetIID int64  `json:"target_iid"`
+	Target    string `json:"target_title"`
 }
 
-// process verifies project visibility one project per request, then emits the
-// events whose projects are public. Records from private or unreadable
-// projects are dropped.
-func (c *Connector) process(ctx context.Context, request event.PageRequest, state *scanState, report *event.FetchReport) ([]event.RawEvent, error) {
-	t := state.Tasks[0]
-	items := make([]listed, len(t.Records))
-	for i, record := range t.Records {
-		if err := json.Unmarshal(record, &items[i]); err != nil {
-			return nil, fmt.Errorf("decode GitLab %s record: %w", t.Type, err)
-		}
-		if items[i].ProjectID <= 0 {
-			continue
-		}
-		id := strconv.FormatInt(items[i].ProjectID, 10)
-		if _, known := state.Projects[id]; !known {
-			if err := c.verifyProject(ctx, state, id, report); err != nil {
-				return nil, err
-			}
-			return nil, nil
-		}
-	}
-	pop(state)
-	forgeID := request.ForgeInstanceID
+// build turns records of verified projects into events and schedules release
+// scans for newly discovered public projects. Private and unreadable projects
+// are dropped.
+func (c *Connector) build(request event.PageRequest, state *scanState, report *event.FetchReport, recordType string, items []listed) ([]event.RawEvent, error) {
 	var events []event.RawEvent
 	for _, item := range items {
 		project := state.Projects[strconv.FormatInt(item.ProjectID, 10)]
-		if !project.Public {
+		if !project.Public || item.Confidential {
 			continue
 		}
-		raw, ok, err := buildEvent(forgeID, request.Source, state.AccountID, t.Type, item, project)
+		raw, ok, err := buildEvent(request.ForgeInstanceID, request.Source, state.AccountID, recordType, item, project)
 		if err != nil {
 			return nil, err
 		}
 		if ok {
 			events = append(events, raw)
 			addKnown(report, project.Path)
+			schedule(state, strconv.FormatInt(project.ID, 10), project.Path)
 		}
 	}
 	return events, nil
@@ -399,11 +448,13 @@ func (c *Connector) verifyProject(ctx context.Context, state *scanState, idOrPat
 	if err := json.Unmarshal(res.Body, &project); err != nil {
 		return fmt.Errorf("decode GitLab project: %w", err)
 	}
-	info := projectInfo{Path: project.Path, WebURL: project.WebURL, Public: project.Visibility == "public" && project.Path != ""}
-	state.Projects[idOrPath] = info
-	if project.ID > 0 {
-		state.Projects[strconv.FormatInt(project.ID, 10)] = info
+	if project.Visibility != "public" || project.Path == "" || project.ID <= 0 {
+		state.Projects[idOrPath] = projectInfo{}
+		return nil
 	}
+	info := projectInfo{ID: project.ID, Path: project.Path, WebURL: project.WebURL, Public: true}
+	state.Projects[idOrPath] = info
+	state.Projects[strconv.FormatInt(project.ID, 10)] = info
 	return nil
 }
 
@@ -427,7 +478,14 @@ func buildEvent(forgeID uuid.UUID, source event.Source, accountID, recordType st
 			kind = forgenorm.KindChangeRequest
 			externalID = fmt.Sprintf("merge_request:%d:%d", item.ProjectID, item.IID)
 		}
-		payload.CreatedAt, payload.ClosedAt, payload.MergedAt = item.CreatedAt, item.ClosedAt, item.MergedAt
+		payload.CreatedAt, payload.ClosedAt, payload.MergedAt = item.CreatedAt, item.ClosedAt, nil
+		if recordType == "merge_requests" {
+			// A merge is credited only to the person who performed it, never
+			// to the author of someone else's merged request.
+			if item.MergedBy != nil && strconv.FormatInt(item.MergedBy.ID, 10) == accountID {
+				payload.MergedAt = item.MergedAt
+			}
+		}
 		at = item.CreatedAt
 	case "approvals":
 		if item.ID <= 0 || item.TargetIID <= 0 || item.CreatedAt == nil {
@@ -511,7 +569,7 @@ func (c *Connector) releases(ctx context.Context, request event.PageRequest, sta
 		}
 		events = append(events, event.RawEvent{
 			ForgeInstanceID: forgeID, Source: request.Source,
-			ExternalID: "release:" + project.Path + ":" + release.TagName, Kind: forgenorm.KindRelease,
+			ExternalID: fmt.Sprintf("release:%d:%s", project.ID, release.TagName), Kind: forgenorm.KindRelease,
 			OccurredAt: &occurred, Payload: body, PayloadSchemaVersion: 1,
 			Actors: []event.Actor{{Key: event.ActorKey{
 				IdentityKey:     identity.Key{Kind: identity.KindAccountID, Value: state.AccountID},

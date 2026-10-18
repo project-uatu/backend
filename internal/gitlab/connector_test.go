@@ -43,9 +43,19 @@ func fakeGitLab(t *testing.T, seen *[]string) *httptest.Server {
 			}
 			_, _ = w.Write([]byte(`[
 			 {"iid":1,"project_id":10,"title":"public issue","state":"closed","web_url":"https://gitlab.com/pub/app/-/issues/1","created_at":"2024-02-01T10:00:00Z","closed_at":"2024-02-02T10:00:00Z","author":{"email":"leak@example.com"}},
-			 {"iid":2,"project_id":20,"title":"private issue","state":"opened","web_url":"x","created_at":"2024-02-01T10:00:00Z"}]`))
+			 {"iid":2,"project_id":20,"title":"private issue","state":"opened","web_url":"x","created_at":"2024-02-01T10:00:00Z"},
+			 {"iid":3,"project_id":10,"title":"secret vuln","confidential":true,"state":"opened","web_url":"x","created_at":"2024-02-01T10:00:00Z"}]`))
+			if r.URL.Query().Get("confidential") != "false" {
+				t.Error("issues request must ask for confidential=false")
+			}
 		case r.URL.Path == "/merge_requests":
-			_, _ = w.Write([]byte(`[]`))
+			if r.URL.Query().Get("page") != "1" || r.URL.Query().Get("created_after") == "" {
+				_, _ = w.Write([]byte(`[]`))
+				return
+			}
+			_, _ = w.Write([]byte(`[
+			 {"iid":5,"project_id":10,"title":"mine","state":"merged","web_url":"u5","created_at":"2024-02-01T10:00:00Z","merged_at":"2024-02-02T10:00:00Z","merged_by":{"id":42}},
+			 {"iid":6,"project_id":10,"title":"theirs","state":"merged","web_url":"u6","created_at":"2024-02-01T10:00:00Z","merged_at":"2024-02-02T10:00:00Z","merged_by":{"id":7}}]`))
 		case r.URL.Path == "/users/42/events":
 			_, _ = w.Write([]byte(`[{"id":99,"project_id":10,"target_iid":7,"target_title":"Add thing","created_at":"2024-03-01T10:00:00Z"}]`))
 		case strings.HasPrefix(r.URL.Path, "/projects/") && strings.HasSuffix(r.URL.Path, "/releases"):
@@ -78,6 +88,11 @@ func drain(t *testing.T, c *Connector, request event.PageRequest) ([]event.RawEv
 		if err != nil {
 			t.Fatalf("FetchPage: %v", err)
 		}
+		for _, leak := range []string{"corp/secret", "private issue", "secret vuln", "leak@example.com"} {
+			if strings.Contains(page.NextCursor, leak) {
+				t.Fatalf("cursor leaks %q: %s", leak, page.NextCursor)
+			}
+		}
 		if page.ResolvedAccount != nil {
 			resolved = page.ResolvedAccount
 			request.IdentityKeys = append(request.IdentityKeys, event.ActorKey{
@@ -103,8 +118,7 @@ func TestConnector_collectsOnlyPublicActivity(t *testing.T) {
 	request := event.PageRequest{
 		PersonID: uuid.New(), ForgeInstanceID: uuid.New(), Source: Source, ScanMode: "backfill",
 		OnboardingLogin: "jane.doe", PageSize: 50,
-		Window:            event.Window{From: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), To: time.Date(2024, 12, 1, 0, 0, 0, 0, time.UTC)},
-		KnownRepositories: []string{"pub/app"},
+		Window: event.Window{From: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), To: time.Date(2024, 12, 1, 0, 0, 0, 0, time.UTC)},
 	}
 	events, resolved, report := drain(t, c, request)
 	if resolved == nil || resolved.AccountID != "42" || resolved.Login != "jane.doe" || !resolved.CreatedAt.IsZero() {
@@ -120,7 +134,7 @@ func TestConnector_collectsOnlyPublicActivity(t *testing.T) {
 			t.Errorf("event %s payload leaks data: %s", e.ExternalID, e.Payload)
 		}
 	}
-	for _, id := range []string{"issue:10:1", "approval:99", "release:pub/app:v1"} {
+	for _, id := range []string{"issue:10:1", "approval:99", "merge_request:10:5", "merge_request:10:6", "release:10:v1"} {
 		if _, ok := got[id]; !ok {
 			t.Errorf("missing event %q; got %v", id, keys(got))
 		}
@@ -128,8 +142,17 @@ func TestConnector_collectsOnlyPublicActivity(t *testing.T) {
 	if _, ok := got["issue:20:2"]; ok {
 		t.Error("private project issue was persisted")
 	}
-	if len(got) != 3 {
-		t.Errorf("got %d events %v, want 3", len(got), keys(got))
+	if _, ok := got["issue:10:3"]; ok {
+		t.Error("confidential issue was persisted")
+	}
+	if !strings.Contains(string(got["merge_request:10:5"].Payload), "merged_at") {
+		t.Error("merge by the tracked account lost its merge time")
+	}
+	if strings.Contains(string(got["merge_request:10:6"].Payload), "merged_at") {
+		t.Error("merge by another person was credited to the author")
+	}
+	if len(got) != 5 {
+		t.Errorf("got %d events %v, want 5", len(got), keys(got))
 	}
 	if report.RateLimitBucket != "gitlab/gitlab.com/api" || report.CoverageScope == "" {
 		t.Errorf("report = %+v", report)

@@ -287,12 +287,12 @@ func patchPersonHandler(s apiStore, logger apiLogger) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		add, err := validateIdentifiers(input.Add)
+		add, err := validateIdentifiers(profile, input.Add)
 		if err != nil {
 			writeError(w, r, logger, http.StatusBadRequest, err.Error())
 			return
 		}
-		remove, err := validateIdentifiers(input.Remove)
+		remove, err := validateIdentifiers(profile, input.Remove)
 		if err != nil {
 			writeError(w, r, logger, http.StatusBadRequest, err.Error())
 			return
@@ -619,7 +619,7 @@ func projectsHandler(s apiStore, logger apiLogger) http.HandlerFunc {
 	}
 }
 
-func validateIdentifiers(input []identifierRequest) ([]store.APIIdentity, error) {
+func validateIdentifiers(profile store.SourceProfile, input []identifierRequest) ([]store.APIIdentity, error) {
 	identifiers := make([]store.APIIdentity, 0, len(input))
 	seen := make(map[string]struct{}, len(input))
 	for _, item := range input {
@@ -627,8 +627,8 @@ func validateIdentifiers(input []identifierRequest) ([]store.APIIdentity, error)
 		if kind != identity.KindLogin && kind != identity.KindEmail {
 			return nil, errors.New("identifier kind must be login or email")
 		}
-		if kind == identity.KindLogin && !github.ValidLogin(item.Value) {
-			return nil, errors.New("GitHub login identifier is invalid")
+		if kind == identity.KindLogin && !validLogin(profile, item.Value) {
+			return nil, errors.New("login identifier is invalid")
 		}
 		value := item.Value
 		if kind == identity.KindEmail {
@@ -642,7 +642,7 @@ func validateIdentifiers(input []identifierRequest) ([]store.APIIdentity, error)
 		if kind == identity.KindEmail {
 			normalized, err = normalizeEmailIdentifier(value)
 		} else {
-			normalized, err = identity.Normalize("github", kind, value)
+			normalized, err = identity.Normalize(profile.Provider, kind, value)
 		}
 		if err != nil {
 			return nil, errors.New("identifier value is invalid")

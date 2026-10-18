@@ -653,3 +653,27 @@ func TestHandler_createPersonSelectsForge(t *testing.T) {
 		})
 	}
 }
+
+func TestHandler_patchPersonValidatesLoginsForSelectedForge(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus int
+	}{
+		{"GitLab handle with dot", `{"forge":"gitlab.com","add":[{"kind":"login","value":"jane.doe"}]}`, http.StatusOK},
+		{"GitLab handle on remove", `{"forge":"gitlab.com","remove":[{"kind":"login","value":"jane.doe"}]}`, http.StatusOK},
+		{"same handle on GitHub", `{"add":[{"kind":"login","value":"jane.doe"}]}`, http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPatch, "/v1/persons/"+uuid.NewString(), strings.NewReader(tt.body))
+			req.Header.Set("Authorization", "Bearer "+testAPIKey)
+			req.Header.Set("Content-Type", "application/json")
+			res := httptest.NewRecorder()
+			NewHandler(&testStore{}, testLogger(), testOptions()).ServeHTTP(res, req)
+			if res.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d: %s", res.Code, tt.wantStatus, res.Body.String())
+			}
+		})
+	}
+}

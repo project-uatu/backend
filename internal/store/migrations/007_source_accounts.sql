@@ -15,3 +15,8 @@ ALTER TABLE github_known_repositories RENAME TO known_repositories;
 CREATE VIEW github_known_repositories AS
 SELECT person_id, forge_instance_id, repository
 FROM known_repositories;
+
+-- A boundary gap is a permanent source limit, such as an activity feed that
+-- does not reach the start of history. It stays visible as a coverage gap but
+-- does not force every later sync to repeat the full backfill.
+ALTER TABLE collection_scan_gaps ADD COLUMN boundary boolean NOT NULL DEFAULT false;

@@ -453,8 +453,15 @@ func collectionJobForIdempotencyKey(ctx context.Context, tx pgx.Tx, input Collec
 	return job, true, nil
 }
 
-// ClaimCollectionJob claims one due job and starts a sync run.
-func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time.Duration) (claim JobClaim, found bool, claimErr error) {
+// ClaimCollectionJob claims one due job of any source and starts a sync run.
+func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time.Duration) (JobClaim, bool, error) {
+	return s.ClaimCollectionJobForSources(ctx, owner, lease, nil)
+}
+
+// ClaimCollectionJobForSources claims one due job whose source is in sources,
+// so a worker never claims work it has no connector for. Empty sources allows
+// every source.
+func (s *Store) ClaimCollectionJobForSources(ctx context.Context, owner string, lease time.Duration, sources []string) (claim JobClaim, found bool, claimErr error) {
 	if owner == "" || lease <= 0 {
 		return JobClaim{}, false, errors.New("job claim requires owner and positive lease")
 	}
@@ -503,13 +510,14 @@ func (s *Store) ClaimCollectionJob(ctx context.Context, owner string, lease time
 		SELECT id, person_id, forge_instance_id, source_key, scan_mode, onboarding_login,
 		       window_start, window_end, cursor, due_at, attempts, max_attempts, sync_run_id
 		FROM jobs
-		WHERE (status = 'queued' AND GREATEST(due_at, COALESCE(retry_at, due_at),
-		                                      COALESCE(rate_limit_reset_at, due_at)) <= now())
-		   OR (status = 'running' AND lease_expires_at <= now() AND attempts < max_attempts)
+		WHERE ((status = 'queued' AND GREATEST(due_at, COALESCE(retry_at, due_at),
+		                                       COALESCE(rate_limit_reset_at, due_at)) <= now())
+		   OR (status = 'running' AND lease_expires_at <= now() AND attempts < max_attempts))
+		  AND (cardinality($1::text[]) = 0 OR source_key = ANY($1))
 		ORDER BY GREATEST(due_at, COALESCE(retry_at, due_at),
 		                  COALESCE(rate_limit_reset_at, due_at)), created_at
 		LIMIT 1
-		FOR UPDATE SKIP LOCKED`).Scan(&job.ID, &job.PersonID, &job.ForgeInstanceID, &job.SourceKey,
+		FOR UPDATE SKIP LOCKED`, append([]string{}, sources...)).Scan(&job.ID, &job.PersonID, &job.ForgeInstanceID, &job.SourceKey,
 		&job.ScanMode, &job.OnboardingLogin, &windowStart, &job.Window.To, &job.Cursor, &job.DueAt,
 		&job.Attempts, &job.MaxAttempts, &oldRunID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -769,10 +777,10 @@ func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page 
 			return false, fmt.Errorf("record collection coverage gap: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO collection_scan_gaps (job_id, range_start, range_end, gap_reason)
-			VALUES ($1, $2, $3, $4)
+			INSERT INTO collection_scan_gaps (job_id, range_start, range_end, gap_reason, boundary)
+			VALUES ($1, $2, $3, $4, $5)
 			ON CONFLICT (job_id, range_start, range_end, gap_reason) DO NOTHING`,
-			claim.ID, gap.From.UTC(), gap.To.UTC(), gap.Reason); err != nil {
+			claim.ID, gap.From.UTC(), gap.To.UTC(), gap.Reason, gap.Boundary); err != nil {
 			return false, fmt.Errorf("record logical scan gap: %w", err)
 		}
 	}
@@ -807,16 +815,18 @@ func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page 
 			return false, fmt.Errorf("persist known repository: %w", err)
 		}
 	}
-	scanComplete := false
+	scanComplete, reachableComplete := false, false
 	if page.Done {
-		var gapCount int
+		var gapCount, retryableGaps int
 		if err := tx.QueryRow(ctx, `
-			SELECT count(*) FROM collection_scan_gaps WHERE job_id = $1`, claim.ID).Scan(&gapCount); err != nil {
+			SELECT count(*), count(*) FILTER (WHERE NOT boundary)
+			FROM collection_scan_gaps WHERE job_id = $1`, claim.ID).Scan(&gapCount, &retryableGaps); err != nil {
 			return false, fmt.Errorf("count scan coverage gaps: %w", err)
 		}
 		scanComplete = gapCount == 0
+		reachableComplete = retryableGaps == 0
 	}
-	if err := advanceCollectionCursor(ctx, tx, claim, page.NextCursor, scanComplete); err != nil {
+	if err := advanceCollectionCursor(ctx, tx, claim, page.NextCursor, reachableComplete); err != nil {
 		return false, err
 	}
 	if page.Done {

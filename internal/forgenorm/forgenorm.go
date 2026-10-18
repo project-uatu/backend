@@ -16,6 +16,10 @@ import (
 // Payload is the schema version 1 payload for issue, change_request, review
 // and release raw events. Connectors build it from upstream records so that
 // private and unrelated upstream fields are never persisted.
+//
+// A change_request payload with MergedAt set means the tracked person
+// performed the merge: the merged action is credited to the raw event's actors,
+// so connectors must leave MergedAt empty when someone else merged it.
 type Payload struct {
 	Title      string     `json:"title"`
 	URL        string     `json:"url"`

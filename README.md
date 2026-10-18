@@ -24,7 +24,11 @@ public projects' releases and recent approval events. Codeberg is read from the
 public activity feed (issues, pull requests, merges, reviews, releases) and its
 heatmap as aggregate counts; history the feed no longer reaches is reported as a
 coverage gap. Merge and review actions are attributed to the person who
-performed them.
+performed them: a GitLab merge request merged by someone else is recorded as
+opened only. Confidential GitLab issues and private projects are never stored.
+A source limit that retrying cannot close, such as the Codeberg feed depth, stays
+a visible coverage gap but does not make every later sync repeat the backfill.
+A worker only claims jobs for the forges it has a connector for.
 
 ## Getting started
 

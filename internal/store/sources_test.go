@@ -1,6 +1,8 @@
 package store
 
 import (
+	"github.com/google/uuid"
+	"github.com/project-uatu/backend/internal/event"
 	"testing"
 	"time"
 
@@ -116,5 +118,64 @@ func TestStore_legacyGitHubViewsStayWritableForPreviousBinaries(t *testing.T) {
 	}
 	if err := s.db.QueryRow(t.Context(), `SELECT count(*) FROM known_repositories`).Scan(&n); err != nil || n != 1 {
 		t.Errorf("known_repositories rows = %d, %v; want 1", n, err)
+	}
+}
+
+func TestStore_claimsAreLimitedToWorkerSources(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	gitlab, _, err := s.ForgeForHost(ctx, "gitlab.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CreateOnboardedPerson(ctx, gitlab, "Jane", "jane.doe", nil); err != nil {
+		t.Fatalf("CreateOnboardedPerson: %v", err)
+	}
+	if _, found, err := s.ClaimCollectionJobForSources(ctx, "github-only", time.Minute, []string{SourceGitHubHistory}); err != nil || found {
+		t.Fatalf("worker without the GitLab connector claimed = %t, %v; want no claim", found, err)
+	}
+	claim, found, err := s.ClaimCollectionJobForSources(ctx, "gitlab", time.Minute, []string{SourceGitHubHistory, "gitlab_history"})
+	if err != nil || !found || claim.SourceKey != "gitlab_history" {
+		t.Fatalf("worker with the GitLab connector claim = %+v, %t, %v", claim, found, err)
+	}
+}
+
+func TestStore_boundaryGapsStillLetBackfillComplete(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	gitlab, _, err := s.ForgeForHost(ctx, "gitlab.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	person, _, err := s.CreateOnboardedPerson(ctx, gitlab, "Jane", "jane.doe", nil)
+	if err != nil {
+		t.Fatalf("CreateOnboardedPerson: %v", err)
+	}
+	claim, found, err := s.ClaimCollectionJob(ctx, "worker", time.Minute)
+	if err != nil || !found {
+		t.Fatalf("ClaimCollectionJob = %t, %v", found, err)
+	}
+	gap := event.Gap{
+		From: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), To: time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC),
+		Reason: "source limit", Boundary: true,
+	}
+	if _, err := s.PersistCollectionPage(ctx, claim, event.Page{Done: true},
+		event.FetchReport{Gaps: []event.Gap{gap}}, true, 1, uuid.Nil); err != nil {
+		t.Fatalf("PersistCollectionPage: %v", err)
+	}
+	var complete bool
+	if err := s.db.QueryRow(ctx, `
+		SELECT backfill_complete FROM checkpoints WHERE person_id = $1 AND source_key = $2`,
+		person.ID, "gitlab_history").Scan(&complete); err != nil {
+		t.Fatalf("load checkpoint: %v", err)
+	}
+	if !complete {
+		t.Error("backfill_complete = false, want true so syncs become incremental")
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM sync_coverage WHERE person_id = $1 AND status = 'gap'`, person.ID); n != 1 {
+		t.Errorf("gap coverage rows = %d, want the boundary gap kept visible", n)
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM sync_coverage WHERE person_id = $1 AND status = 'complete'`, person.ID); n != 0 {
+		t.Errorf("complete coverage rows = %d, want 0", n)
 	}
 }

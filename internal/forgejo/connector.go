@@ -70,6 +70,8 @@ type scanState struct {
 	Start     time.Time  `json:"start,omitempty"`
 	Cutoff    *time.Time `json:"cutoff,omitempty"`
 	Earliest  *time.Time `json:"earliest,omitempty"`
+	// Exhausted is set when the feed ended before reaching the cutoff.
+	Exhausted bool `json:"exhausted,omitempty"`
 }
 
 func decodeState(request event.PageRequest) (scanState, error) {
@@ -100,6 +102,7 @@ func decodeState(request event.PageRequest) (scanState, error) {
 		}
 		state.Stage, state.Page = stored.Stage, stored.Page
 		state.Start, state.Cutoff, state.Earliest = stored.Start, stored.Cutoff, stored.Earliest
+		state.Exhausted = stored.Exhausted
 	}
 	return state, nil
 }
@@ -127,10 +130,9 @@ func (c *Connector) FetchPage(ctx context.Context, request event.PageRequest) (e
 		return event.Page{}, report, errors.New("history requires a valid Forgejo login identity")
 	}
 	if request.Cursor == "" {
-		if state.AccountID == "" {
-			return c.resolve(ctx, request, state, report)
-		}
-		c.begin(request, &state, time.Time{})
+		// Always resolve by the stable account ID so a renamed account is
+		// scanned under its current login.
+		return c.resolve(ctx, request, state, report)
 	}
 	var events []event.RawEvent
 	switch state.Stage {
@@ -155,19 +157,38 @@ func (c *Connector) FetchPage(ctx context.Context, request event.PageRequest) (e
 }
 
 func (c *Connector) resolve(ctx context.Context, request event.PageRequest, state scanState, report event.FetchReport) (event.Page, event.FetchReport, error) {
-	res, upstream, err := c.client.Get(ctx, "/users/"+url.PathEscape(state.Login), nil, quotaBucket)
-	mergeReport(&report, upstream)
-	if err != nil {
-		return event.Page{}, report, fmt.Errorf("resolve Forgejo account: %w", err)
-	}
 	// Only identifiers are decoded; the profile email is never read.
-	var user struct {
+	type account struct {
 		ID      int64      `json:"id"`
 		Login   string     `json:"login"`
 		Created *time.Time `json:"created"`
 	}
-	if err := json.Unmarshal(res.Body, &user); err != nil {
-		return event.Page{}, report, fmt.Errorf("decode Forgejo account: %w", err)
+	var user account
+	if state.AccountID != "" {
+		res, upstream, err := c.client.Get(ctx, "/users/search", url.Values{"uid": {state.AccountID}, "limit": {"1"}}, quotaBucket)
+		mergeReport(&report, upstream)
+		if err != nil {
+			return event.Page{}, report, fmt.Errorf("refresh Forgejo account: %w", err)
+		}
+		var found struct {
+			Data []account `json:"data"`
+		}
+		if err := json.Unmarshal(res.Body, &found); err != nil {
+			return event.Page{}, report, fmt.Errorf("decode Forgejo account search: %w", err)
+		}
+		if len(found.Data) != 1 || strconv.FormatInt(found.Data[0].ID, 10) != state.AccountID {
+			return event.Page{}, report, errors.New("the Forgejo account is no longer available")
+		}
+		user = found.Data[0]
+	} else {
+		res, upstream, err := c.client.Get(ctx, "/users/"+url.PathEscape(state.Login), nil, quotaBucket)
+		mergeReport(&report, upstream)
+		if err != nil {
+			return event.Page{}, report, fmt.Errorf("resolve Forgejo account: %w", err)
+		}
+		if err := json.Unmarshal(res.Body, &user); err != nil {
+			return event.Page{}, report, fmt.Errorf("decode Forgejo account: %w", err)
+		}
 	}
 	if user.ID <= 0 || !identity.ValidHandle(user.Login) {
 		return event.Page{}, report, errors.New("upstream returned an invalid Forgejo account identity")
@@ -239,6 +260,7 @@ func (c *Connector) feed(ctx context.Context, request event.PageRequest, state *
 		}
 	}
 	if len(activities) == 0 || reachedCutoff {
+		state.Exhausted = len(activities) == 0 && !reachedCutoff
 		state.Stage, state.Page = "heatmap", 0
 		return events, nil
 	}
@@ -358,14 +380,52 @@ func (c *Connector) heatmap(ctx context.Context, state *scanState, report *event
 			Date: day, Metric: "heatmap_contributions", Value: value,
 		})
 	}
-	if state.Cutoff == nil && state.Earliest != nil && !state.Start.IsZero() &&
-		state.Earliest.Sub(state.Start) > 24*time.Hour {
-		report.Gaps = append(report.Gaps, event.Gap{
-			From: state.Start, To: *state.Earliest, Reason: "Forgejo activity feed does not reach the start of the window",
-		})
+	if gap := feedGap(state, byDay); gap != nil {
+		report.Gaps = append(report.Gaps, *gap)
 	}
 	state.Stage = "done"
 	return nil
+}
+
+// feedGap reports activity the feed could not serve. A feed that ended before
+// the cutoff and starts later than the window does not reach the beginning of
+// it; an incremental scan needs heatmap evidence of earlier contributions,
+// because a quiet account legitimately has a short feed. The gap is a source
+// limit, so it is marked as a boundary.
+func feedGap(state *scanState, byDay map[time.Time]int64) *event.Gap {
+	if !state.Exhausted {
+		return nil
+	}
+	from := state.Start
+	if state.Cutoff != nil {
+		from = *state.Cutoff
+	}
+	if from.IsZero() {
+		return nil
+	}
+	to := time.Now().UTC()
+	if state.Earliest != nil {
+		to = *state.Earliest
+	}
+	if state.Cutoff == nil && state.Earliest != nil {
+		if to.Sub(from) <= 24*time.Hour {
+			return nil
+		}
+	} else {
+		evidence := false
+		for day, value := range byDay {
+			if value > 0 && !day.Before(from.Truncate(24*time.Hour)) && day.Before(to.Truncate(24*time.Hour)) {
+				evidence = true
+			}
+		}
+		if !evidence || !from.Before(to) {
+			return nil
+		}
+	}
+	return &event.Gap{
+		From: from, To: to, Boundary: true,
+		Reason: "Forgejo activity feed does not reach the start of the window",
+	}
 }
 
 func mergeReport(dst *event.FetchReport, src event.FetchReport) {
