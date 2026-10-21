@@ -39,8 +39,11 @@ documentation and live responses on 2026-10-18.
   request events in full and that the contribution calendar covers only the
   last 12 months. It is therefore not a complete history source.
 - Responses carry `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`
-  and `RateLimit-Name` headers. Unauthenticated requests were observed at
-  500 per minute.
+  and `RateLimit-Name` headers. These describe the applicable rate-limit
+  bucket; they do not mean authenticated requests are unlimited. GitLab.com
+  currently documents a limit of 2,000 authenticated API requests per minute
+  per user and 500 unauthenticated requests per minute per IP address, in
+  addition to endpoint-specific limits ([rate limits](https://docs.gitlab.com/user/gitlab_com/rate_limits/#current-rate-limits)).
 - Releases are listed per project; there is no global release-by-author
   endpoint.
 

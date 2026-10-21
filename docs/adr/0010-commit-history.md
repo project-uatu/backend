@@ -56,7 +56,11 @@ Checked against live responses on 2026-10-18.
   `all=true` (every ref) and `per_page`, with `x-next-page` pagination.
 - Items expose `author_name`, `author_email` and committer fields only. There
   is no linked account or user ID, so attribution can use email only.
-- Quota is `RateLimit-*` (500 per minute unauthenticated).
+- `RateLimit-*` headers describe the applicable rate-limit bucket; they do
+  not mean authenticated requests are unlimited. GitLab.com currently
+  documents 2,000 authenticated API requests per minute per user and 500
+  unauthenticated requests per minute per IP address, alongside
+  endpoint-specific limits ([rate limits](https://docs.gitlab.com/user/gitlab_com/rate_limits/#current-rate-limits)).
 
 **Codeberg (Forgejo)**
 
