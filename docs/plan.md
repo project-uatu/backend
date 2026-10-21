@@ -287,16 +287,24 @@ Acceptance:
 
 Dependencies: steps 5 and 8.
 
-Accept an ADR comparing upstream commit APIs against clone-based extraction,
-including branch coverage, attribution and resource/cache policy.
+[Accepted ADR 0010](adr/0010-commit-history.md) selects bounded upstream API
+scans of known public repositories, default-branch-only coverage, and verified
+author/co-author attribution. Cloning and explicit seed lists remain out of
+scope.
 
 Acceptance:
-- Bound repository discovery and request/CPU/disk budgets per person and host.
-- Prefer supported upstream enumeration; use pure-Go cloning only where justified.
-- Report shallow/truncated branches and unavailable history as incomplete.
-- Match verified evidence without assuming every commit email is an account claim.
-- Keep disposable clone caches non-authoritative; test pruning, restarts,
-  malformed repositories and static distroless compatibility.
+- Cap scans at the accepted repository and page budgets, persist per-repository
+  cursors, and report capped or unavailable ranges as coverage gaps.
+- Collect from GitHub, GitLab.com and Codeberg using their supported commit
+  APIs and existing per-host quota coordination.
+- Attribute primary authorship through verified account IDs or assigned email
+  identities; attribute co-authorship only through a `Co-authored-by` trailer
+  whose email is already assigned to the person. Never infer identity from
+  names or create identity claims from commit data.
+- Store only the accepted minimal commit payload; do not persist commit
+  messages, names or email addresses.
+- Test pagination, attribution, merge exclusion, budgets, failure/restart
+  behavior and idempotent re-scans with offline fixtures.
 
 ### 10. Deliver identity administration and privacy lifecycle
 

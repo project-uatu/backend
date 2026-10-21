@@ -1,8 +1,8 @@
 # 0010: Bounded seeded-repository commit history
 
-Status: Proposed
+Status: Accepted
 
-Date: 2026-10-18
+Date: 2026-10-21
 
 Issue: [#9](https://github.com/project-uatu/backend/issues/9)
 
@@ -14,7 +14,7 @@ Prerequisites: accepted ADRs [0001](0001-postgresql-backend-scope.md),
 [0008](0008-kubernetes-delivery-contract.md) and
 [0009](0009-gitlab-codeberg-connectors.md).
 
-Decision authority: the maintainer must accept this ADR before implementation.
+Decision authority: Accepted by the maintainer on 2026-10-21.
 
 ## Context
 
@@ -134,7 +134,13 @@ claim.
 - **GitLab:** there is no linked account. Count a commit only when its author
   email is an assigned email identity of the person.
 - The collector never creates identity claims from commit data, never matches
-  names, and ignores `Co-authored-by` trailers and committer fields.
+  names, and does not attribute commits from committer fields. Parse
+  `Co-authored-by` trailers as attribution claims: credit a co-author only
+  when the trailer email matches an email identity already assigned to that
+  person under ADR 0004. Never resolve a co-author by trailer name or create
+  an identity claim from a trailer. Represent verified co-authorship separately
+  from primary authorship; do not count the same person's role twice for one
+  commit. Unassigned or shared emails do not establish attribution.
 - Merge commits (more than one parent) are not counted.
 
 ### Storage and normalization
@@ -184,6 +190,9 @@ matching in memory and are not persisted by this connector.
   filter by author server-side.
 - GitLab attribution depends on the person's assigned emails, so a person with
   no verified emails gets no GitLab commits.
+- Co-authorship is credited only when a trailer email matches an already
+  assigned identity. Contributions without trailers, with unassigned emails or
+  with ambiguous/shared email identities are not attributed as co-authored.
 - Commits on non-default branches, in forks, or in repositories with no other
   observed activity are absent until a later decision adds them.
 - Static, distroless and non-root constraints are untouched because no clone
@@ -193,8 +202,12 @@ matching in memory and are not persisted by this connector.
 
 - Unit tests with recorded sanitized fixtures for each host: author filtering,
   linked and unlinked authors, noreply emails, assigned and unassigned emails,
-  merge commits, forks, empty repositories, 404/409/451, and pagination.
+  verified and unverified `Co-authored-by` trailers, merge commits, forks,
+  empty repositories, 404/409/451, and pagination.
 - Tests that payloads and cursors contain no message, name or email.
+- Tests that trailer names never establish identity, trailer parsing does not
+  create identity claims, and the same person is not credited twice for one
+  commit.
 - Tests that over-cap repositories and over-budget scans become visible gaps and
   that a boundary gap does not force a new backfill.
 - Store tests for source-filtered claims, checkpoint resume, retries, idempotent
@@ -204,12 +217,3 @@ matching in memory and are not persisted by this connector.
   queued until a capable replica claims them.
 - The README documents the sources, the budgets, the coverage scope and the
   attribution rules.
-
-## Questions for the maintainer
-
-1. Is default-branch-only coverage acceptable for the first release?
-2. Are 50 repositories and 2,000 commits per repository the right defaults?
-3. Should forks be excluded, as proposed, or included when they have
-   observed activity?
-4. Do you accept deferring cloning to a separate ADR, and explicit seed lists to
-   a later change?
