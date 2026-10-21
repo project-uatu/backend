@@ -1,0 +1,76 @@
+name: Contribution
+
+# Enforces the rules in CONTRIBUTING.md. These checks do not depend on changed
+# paths, so they run for every pull request.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  commits:
+    name: commits
+    runs-on: ubuntu-latest
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check pull request title and commit subjects
+        run: |
+          pattern='^(feat|fix|docs|chore|ci|test|refactor|perf|build|style|revert)(\([a-z0-9._-]+\))?!?: [^A-Z]+$'
+          status=0
+          check() {
+            if ! printf '%s' "$2" | grep -Eq "$pattern"; then
+              echo "::error::$1 must be a lowercase conventional commit without issue numbers: $2"
+              status=1
+            fi
+            if printf '%s' "$2" | grep -Eq '\(#[0-9]+\)|#[0-9]+'; then
+              echo "::error::$1 must not contain an issue or pull request number: $2"
+              status=1
+            fi
+          }
+          check "Pull request title" "$PR_TITLE"
+          while IFS= read -r line; do
+            sha=${line%% *}
+            check "Commit $sha" "${line#* }"
+          done < <(git log --no-merges --format='%h %s' "$BASE_SHA..$HEAD_SHA")
+          exit $status
+      - name: Check DCO sign-off
+        run: |
+          status=0
+          while IFS= read -r sha; do
+            author_email=$(git log -1 --format=%ae "$sha")
+            case "$author_email" in
+              *'[bot]'*) continue ;;
+            esac
+            if ! git log -1 --format=%B "$sha" | grep -Eq '^Signed-off-by: .+ <.+@.+>$'; then
+              echo "::error::Commit $sha has no Signed-off-by trailer; use git commit -s"
+              status=1
+            elif ! git log -1 --format=%B "$sha" | grep -Fq "<$author_email>"; then
+              echo "::error::Commit $sha is not signed off by its author $author_email"
+              status=1
+            fi
+          done < <(git rev-list --no-merges "$BASE_SHA..$HEAD_SHA")
+          exit $status
+
+  license-headers:
+    name: license-headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check SPDX headers
+        run: |
+          status=0
+          while IFS= read -r file; do
+            if [ "$(head -n 1 "$file")" != "// SPDX-License-Identifier: Apache-2.0" ]; then
+              echo "::error file=$file::missing '// SPDX-License-Identifier: Apache-2.0' on the first line"
+              status=1
+            fi
+          done < <(git ls-files '*.go')
+          exit $status
