@@ -101,6 +101,9 @@ For every implementation: reference an accepted ADR, update directly related
 documentation and run the repository's required Go checks. Unit tests remain
 offline; PostgreSQL integration tests use isolated local/CI databases, never
 upstream services or a real GitHub token. No frontend work belongs in these issues.
+Additional contribution sources can be considered later through separate,
+bounded issues and source-specific ADRs; no further sources are currently
+committed to the roadmap.
 
 | Step | GitHub issue |
 |---|---|
@@ -114,8 +117,7 @@ upstream services or a real GitHub token. No frontend work belongs in these issu
 | 8. GitLab and Codeberg | [#8](https://github.com/project-uatu/backend/issues/8) |
 | 9. Commit history | [#9](https://github.com/project-uatu/backend/issues/9) |
 | 10. Identity/privacy lifecycle | [#10](https://github.com/project-uatu/backend/issues/10) |
-| 11. Gerrit and mailing lists | [#11](https://github.com/project-uatu/backend/issues/11) |
-| 12. Standalone and later extensions | [#12](https://github.com/project-uatu/backend/issues/12) |
+| 11. Standalone and later extensions | [#12](https://github.com/project-uatu/backend/issues/12) |
 
 ### 1. Decide PostgreSQL collector scheduling and replica coordination
 
@@ -311,19 +313,7 @@ Acceptance:
   and backups; keep raw identities out of default public responses.
 - Document ToS/public-data restrictions before public profile redistribution.
 
-### 11. Add Gerrit and mailing-list history
-
-Dependencies: steps 4 and 10.
-
-Accept source ADRs covering instance discovery, queries and identity confidence.
-
-Acceptance:
-- Add bounded configurable Gerrit instances and public archive collection.
-- Define archive access from verified documentation, not an assumed REST API.
-- Require suitable identity evidence/time bounds and handle reused email addresses.
-- Preserve public provenance, coverage gaps and rate limits with offline tests.
-
-### 12. Support standalone containers and later product extensions
+### 11. Support standalone containers and later product extensions
 
 Dependencies: step 7 for standalone packaging; steps 6 and 10 for product scope.
 
