@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.0](https://github.com/project-uatu/backend/compare/v0.1.0...v0.2.0) (2026-10-22)
+
+
+### Features
+
+* collect bounded commit history across forges ([#35](https://github.com/project-uatu/backend/issues/35)) ([2ed8451](https://github.com/project-uatu/backend/commit/2ed84516f3696a0ca5eeca8721fcb14f25988578))
+* collect gitlab.com and codeberg activity ([#30](https://github.com/project-uatu/backend/issues/30)) ([e6ba2b8](https://github.com/project-uatu/backend/commit/e6ba2b86e3a76e0e8c2a91c0df8459ecf6de1d3d))
+* Kubernetes runtime contract and e2e harness ([70f5238](https://github.com/project-uatu/backend/commit/70f5238c4cf5e36050f8f13839afa57108af4482))
+
 ## 0.1.0 (2026-10-17)
 
 
