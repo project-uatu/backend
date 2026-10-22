@@ -128,7 +128,10 @@ claim.
 - **GitHub:** count a commit when its linked `author.id` equals the tracked
   account ID. A GitHub noreply email of the form `ID+login@users.noreply.github.com`
   also verifies the ID. An unlinked commit counts only when its email is an
-  email identity already **assigned** to this person (ADR 0004).
+  email identity already **assigned** to this person (ADR 0004). The API scan
+  uses GitHub's author filter; a commit where this person appears only in a
+  co-author trailer is not discoverable unless its primary author also matches
+  one of the filters.
 - **Codeberg:** count a commit when the linked `author.id` equals the tracked
   account ID, or when its email is an assigned email identity of the person.
 - **GitLab:** there is no linked account. Count a commit only when its author
@@ -151,7 +154,7 @@ claim.
 - The raw event kind is `commit` with external ID `commit:{repository_id}:{sha}`.
   The payload holds only the SHA, repository path, repository URL, authored
   time, a merge flag and the attribution basis (`account_id`, `noreply` or
-  `assigned_email`). It holds **no message, names or email addresses**.
+  `assigned_email`, `coauthored_by`). It holds **no message, names or email addresses**.
 - The normalizer emits one `commit_authored` action at the authored time. The
   event is linked to the person by the existing account or assigned identity
   rules, not by a stored email. A change to identity assignments re-derives
@@ -193,6 +196,8 @@ matching in memory and are not persisted by this connector.
 - Co-authorship is credited only when a trailer email matches an already
   assigned identity. Contributions without trailers, with unassigned emails or
   with ambiguous/shared email identities are not attributed as co-authored.
+  GitHub's server-side author filter means co-author-only commits by another
+  primary author are outside this scan's coverage.
 - Commits on non-default branches, in forks, or in repositories with no other
   observed activity are absent until a later decision adds them.
 - Static, distroless and non-root constraints are untouched because no clone
