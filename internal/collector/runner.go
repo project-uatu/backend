@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -64,6 +65,8 @@ type Runner struct {
 	normalizer Normalizer
 	logger     *slog.Logger
 	options    RunnerOptions
+
+	claimRotation atomic.Uint32
 }
 
 // ErrInvalidConnectorPage indicates a connector violated the bounded page contract.
@@ -112,6 +115,29 @@ func NewRunner(s durableWork, connectors []Connector, transformer Normalizer, lo
 	}, nil
 }
 
+// claimVersions lists the normalizer versions this worker may claim, starting
+// with a rotating one so no version starves another.
+func (r *Runner) claimVersions() []int {
+	versions := []int{r.options.NormalizerVersion}
+	for _, connector := range r.connectors {
+		versioned, ok := connector.(interface{ NormalizerVersion() int })
+		if ok && !slices.Contains(versions, versioned.NormalizerVersion()) {
+			versions = append(versions, versioned.NormalizerVersion())
+		}
+	}
+	slices.Sort(versions)
+	start := int(r.claimRotation.Add(1)) % len(versions)
+	return append(versions[start:], versions[:start]...)
+}
+
+// pageVersion returns the normalization version for pages from one connector.
+func (r *Runner) pageVersion(connector Connector) int {
+	if versioned, ok := connector.(interface{ NormalizerVersion() int }); ok {
+		return versioned.NormalizerVersion()
+	}
+	return r.options.NormalizerVersion
+}
+
 // sources lists the sources this worker has connectors for.
 func (r *Runner) sources() []string {
 	sources := make([]string, 0, len(r.connectors))
@@ -124,13 +150,15 @@ func (r *Runner) sources() []string {
 
 // RunOnce processes one normalization item or one complete source scan.
 func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
-	normalization, found, err := r.store.ClaimNormalizationJob(
-		ctx, r.options.Owner, r.options.NormalizerVersion, r.options.LeaseDuration)
-	if err != nil {
-		return false, fmt.Errorf("claim normalization work: %w", err)
-	}
-	if found {
-		return true, r.processNormalization(ctx, normalization)
+	for _, version := range r.claimVersions() {
+		normalization, found, err := r.store.ClaimNormalizationJob(
+			ctx, r.options.Owner, version, r.options.LeaseDuration)
+		if err != nil {
+			return false, fmt.Errorf("claim normalization work: %w", err)
+		}
+		if found {
+			return true, r.processNormalization(ctx, normalization)
+		}
 	}
 	claim, found, err := r.store.ClaimCollectionJobForSources(ctx, r.options.Owner, r.options.LeaseDuration, r.sources())
 	if err != nil {
@@ -205,6 +233,7 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 			AccountNodeID: claim.AccountNodeID, CurrentLogin: claim.CurrentAccountLogin,
 			KnownRepositories: claim.KnownRepositories,
 		}
+		pageVersion := r.pageVersion(connector)
 		bucket := connector.QuotaBucket()
 		if dynamicQuota, ok := connector.(interface {
 			QuotaBucketFor(event.PageRequest) string
@@ -248,7 +277,7 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 				report.Errors = append(report.Errors, "connector returned an invalid page")
 				persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 				_, persistErr := r.store.PersistCollectionPage(
-					persistCtx, claim, page, report, false, r.options.NormalizerVersion, reservationID)
+					persistCtx, claim, page, report, false, pageVersion, reservationID)
 				cancel()
 				if persistErr != nil {
 					fetchErr = errors.Join(fetchErr, fmt.Errorf("persist invalid page report: %w", persistErr))
@@ -272,7 +301,7 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 				persistCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			}
 			_, persistErr := r.store.PersistCollectionPage(
-				persistCtx, claim, page, report, false, r.options.NormalizerVersion, reservationID)
+				persistCtx, claim, page, report, false, pageVersion, reservationID)
 			cancel()
 			if persistErr != nil && reservationID != uuid.Nil {
 				releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -296,7 +325,7 @@ func (r *Runner) processCollection(ctx context.Context, claim store.JobClaim) er
 			return r.store.RetryCollectionJob(ctx, claim, errors.New(safeFetchFailure(fetchErr)), retryAt)
 		}
 		done, err := r.store.PersistCollectionPage(
-			ctx, claim, page, report, true, r.options.NormalizerVersion, reservationID)
+			ctx, claim, page, report, true, pageVersion, reservationID)
 		if err != nil {
 			var cleanupErr error
 			if reservationID != uuid.Nil {

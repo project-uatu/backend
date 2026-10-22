@@ -54,6 +54,9 @@ func NewCommitConnector(options Options, maxRepos, maxPages int) (*CommitConnect
 // Source identifies the connector's durable commit stream.
 func (c *CommitConnector) Source() event.Source { return CommitSource }
 
+// NormalizerVersion isolates commit normalization from workers that predate commit handlers.
+func (c *CommitConnector) NormalizerVersion() int { return commit.NormalizerVersion }
+
 // QuotaBucket names the GitLab.com API quota.
 func (c *CommitConnector) QuotaBucket() string { return quotaBucket }
 
@@ -247,7 +250,7 @@ func buildGitLabCommit(request event.PageRequest, repository string, repositoryI
 		return event.RawEvent{}, false, nil
 	}
 	if record.ID == "" || repositoryID <= 0 || record.AuthoredDate.IsZero() ||
-		record.WebURL == "" || len(record.ParentIDs) == 0 {
+		record.WebURL == "" || record.ParentIDs == nil {
 		return event.RawEvent{}, false, errors.New("GitLab returned an incomplete commit record")
 	}
 	attribution := commit.ResolveAttribution(request, "gitlab", "", record.AuthorEmail, record.Message)

@@ -24,6 +24,10 @@ const Kind event.Kind = "commit"
 // ActionKind identifies an authored commit contribution.
 const ActionKind event.Kind = "commit_authored"
 
+// NormalizerVersion is the normalization job version for commit events. Workers
+// that predate commit handlers only claim version 1, so they never claim commit jobs.
+const NormalizerVersion = 2
+
 // Payload contains commit metadata that is safe to persist.
 type Payload struct {
 	SHA              string    `json:"sha"`

@@ -53,6 +53,9 @@ func NewCommitConnector(options Options, maxRepos, maxPages int) (*CommitConnect
 // Source identifies the connector's durable commit stream.
 func (c *CommitConnector) Source() event.Source { return CommitSource }
 
+// NormalizerVersion isolates commit normalization from workers that predate commit handlers.
+func (c *CommitConnector) NormalizerVersion() int { return commit.NormalizerVersion }
+
 // QuotaBucket names the Codeberg API quota.
 func (c *CommitConnector) QuotaBucket() string { return quotaBucket }
 
@@ -237,7 +240,7 @@ func buildForgejoCommit(request event.PageRequest, repository string, repository
 		return event.RawEvent{}, false, nil
 	}
 	if record.SHA == "" || repositoryID <= 0 || record.Commit.Author.Date.IsZero() ||
-		record.URL == "" || len(record.Parents) == 0 {
+		record.URL == "" || record.Parents == nil {
 		return event.RawEvent{}, false, errors.New("codeberg returned an incomplete commit record")
 	}
 	accountID := ""

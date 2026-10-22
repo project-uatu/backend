@@ -50,6 +50,9 @@ func NewCommitConnector(client *Client, maxRepos, maxPages int) (*CommitConnecto
 // Source identifies the connector's durable commit stream.
 func (c *CommitConnector) Source() event.Source { return CommitSource }
 
+// NormalizerVersion isolates commit normalization from workers that predate commit handlers.
+func (c *CommitConnector) NormalizerVersion() int { return commit.NormalizerVersion }
+
 // QuotaBucket names the GitHub REST core quota.
 func (c *CommitConnector) QuotaBucket() string { return commitBucket }
 
@@ -265,7 +268,7 @@ func buildGitHubCommit(request event.PageRequest, repository string, repositoryI
 		return event.RawEvent{}, false, nil
 	}
 	if record.SHA == "" || record.Commit.Author.Date.IsZero() || record.URL == "" ||
-		repositoryID <= 0 || len(record.Parents) == 0 {
+		repositoryID <= 0 || record.Parents == nil {
 		return event.RawEvent{}, false, errors.New("GitHub returned an incomplete commit record")
 	}
 	accountID := ""

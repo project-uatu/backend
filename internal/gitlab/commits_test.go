@@ -3,6 +3,7 @@
 package gitlab
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -130,5 +131,38 @@ func TestCommitConnector_skipsForkProject(t *testing.T) {
 	}
 	if !page.Done || len(page.Events) != 0 || len(report.Gaps) != 1 {
 		t.Errorf("page = %+v, gaps = %+v; want done, no events, one gap", page, report.Gaps)
+	}
+}
+
+func TestBuildGitLabCommit_acceptsRootCommitAndRejectsMissingParents(t *testing.T) {
+	request := event.PageRequest{
+		ForgeInstanceID: uuid.New(), Source: CommitSource,
+		IdentityKeys: []event.ActorKey{{IdentityKey: identity.Key{Kind: identity.KindEmail, Value: "writer@example.com"}}},
+	}
+	tests := []struct {
+		name    string
+		parents string
+		wantErr bool
+	}{
+		{name: "root commit", parents: `"parent_ids":[]`},
+		{name: "missing parents", wantErr: true},
+		{name: "null parents", parents: `"parent_ids":null`, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := `{"id":"abc","web_url":"https://gitlab.com/org/app/-/commit/abc",
+				"author_email":"writer@example.com","authored_date":"2025-01-02T03:04:05Z"`
+			if test.parents != "" {
+				body += "," + test.parents
+			}
+			var record gitLabCommit
+			if err := json.Unmarshal([]byte(body+"}"), &record); err != nil {
+				t.Fatal(err)
+			}
+			_, ok, err := buildGitLabCommit(request, "org/app", 7, record)
+			if (err != nil) != test.wantErr || (err == nil && !ok) {
+				t.Errorf("buildGitLabCommit() ok = %t, err = %v; wantErr %t", ok, err, test.wantErr)
+			}
+		})
 	}
 }

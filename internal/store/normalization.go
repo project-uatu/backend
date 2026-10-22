@@ -228,6 +228,7 @@ func (s *Store) CompleteNormalization(ctx context.Context, claim NormalizationCl
 				}
 			}
 		}
+		links = dropRedundantCoAuthors(links)
 		if _, err := tx.Exec(ctx, "DELETE FROM event_people WHERE normalized_event_id = $1", normalizedID); err != nil {
 			return fmt.Errorf("replace normalized event person links: %w", err)
 		}
@@ -388,6 +389,24 @@ func loadRawEvent(ctx context.Context, q interface {
 
 type actorResolver interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+// dropRedundantCoAuthors removes co-author links for people who also have an
+// author link, since separate scans can report both roles for one commit.
+func dropRedundantCoAuthors(links []personLink) []personLink {
+	authors := make(map[uuid.UUID]bool, len(links))
+	for _, link := range links {
+		if link.role == "author" {
+			authors[link.personID] = true
+		}
+	}
+	kept := make([]personLink, 0, len(links))
+	for _, link := range links {
+		if link.role != "co_author" || !authors[link.personID] {
+			kept = append(kept, link)
+		}
+	}
+	return kept
 }
 
 type personLink struct {

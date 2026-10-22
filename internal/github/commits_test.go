@@ -3,6 +3,7 @@
 package github
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -114,5 +115,41 @@ func testCommitConnector_skipsRepository(t *testing.T, metadata string) {
 	}
 	if !page.Done || len(page.Events) != 0 || len(report.Gaps) != 1 {
 		t.Errorf("page = %+v, report gaps = %+v; want done, no events, one gap", page, report.Gaps)
+	}
+}
+
+func TestBuildGitHubCommit_acceptsRootCommitAndRejectsMissingParents(t *testing.T) {
+	forgeID := uuid.New()
+	request := event.PageRequest{
+		ForgeInstanceID: forgeID, Source: CommitSource,
+		IdentityKeys: []event.ActorKey{{
+			IdentityKey: identity.Key{Kind: identity.KindAccountID, Value: "42"}, ForgeInstanceID: &forgeID,
+		}},
+	}
+	tests := []struct {
+		name    string
+		parents string
+		wantErr bool
+	}{
+		{name: "root commit", parents: `"parents":[]`},
+		{name: "missing parents", wantErr: true},
+		{name: "null parents", parents: `"parents":null`, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := `{"sha":"abc","html_url":"https://github.com/org/app/commit/abc",
+				"commit":{"author":{"date":"2025-01-02T03:04:05Z"}},"author":{"id":42}`
+			if test.parents != "" {
+				body += "," + test.parents
+			}
+			var record githubCommit
+			if err := json.Unmarshal([]byte(body+"}"), &record); err != nil {
+				t.Fatal(err)
+			}
+			_, ok, err := buildGitHubCommit(request, "org/app", 7, record)
+			if (err != nil) != test.wantErr || (err == nil && !ok) {
+				t.Errorf("buildGitHubCommit() ok = %t, err = %v; wantErr %t", ok, err, test.wantErr)
+			}
+		})
 	}
 }

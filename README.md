@@ -49,7 +49,10 @@ separately on fetched commits; GitHub's author filter cannot discover commits
 where the tracked person appears only as a co-author. Commit messages, names and
 emails are not stored. Coverage gaps record repositories or ranges omitted by
 those limits. Repeating the command reuses the person record and schedules
-incremental scans with a seven-day overlap after a successful backfill.
+incremental scans with a seven-day overlap after a successful backfill. A commit
+scan that finds a repository not yet covered by a completed commit scan
+backfills from the account's start instead. Commit normalization jobs use
+version 2, so workers that predate commit handlers never claim them.
 
 `GITHUB_TOKEN` is required for all `collect` modes: GitHub GraphQL requires
 authentication for stable account refresh and contribution aggregates. Serving

@@ -866,6 +866,14 @@ func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page 
 			WHERE id = $1 AND fencing_token = $2`, claim.ID, claim.Token); err != nil {
 			return false, fmt.Errorf("complete collection job: %w", err)
 		}
+		if scanComplete && isCommitSource(claim.SourceKey) && len(claim.KnownRepositories) > 0 {
+			if _, err := tx.Exec(ctx, `
+				UPDATE known_repositories SET commit_scanned_through = $4
+				WHERE forge_instance_id = $1 AND person_id = $2 AND repository = ANY($3)`,
+				claim.ForgeInstanceID, claim.PersonID, claim.KnownRepositories, claim.Window.To.UTC()); err != nil {
+				return false, fmt.Errorf("record commit scan repository progress: %w", err)
+			}
+		}
 		if claim.SourceKey == SourceGitHubHistory ||
 			claim.SourceKey == SourceGitLabHistory ||
 			claim.SourceKey == SourceForgejoHistory {
@@ -914,8 +922,18 @@ func enqueueCommitScanTx(ctx context.Context, tx pgx.Tx, claim JobClaim) error {
 	case err != nil:
 		return fmt.Errorf("load commit scan checkpoint: %w", err)
 	case backfillComplete && completedThrough != nil:
-		input.ScanMode = "incremental"
-		input.Window.From = completedThrough.Add(-7 * 24 * time.Hour).UTC()
+		var unscanned bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM known_repositories
+				WHERE forge_instance_id = $1 AND person_id = $2 AND commit_scanned_through IS NULL)`,
+			claim.ForgeInstanceID, claim.PersonID).Scan(&unscanned); err != nil {
+			return fmt.Errorf("check commit scan repository progress: %w", err)
+		}
+		if !unscanned {
+			input.ScanMode = "incremental"
+			input.Window.From = completedThrough.Add(-7 * 24 * time.Hour).UTC()
+		}
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO jobs
@@ -1135,6 +1153,7 @@ func assignedActorKeys(ctx context.Context, tx pgx.Tx, personID, instanceID uuid
 
 func upsertRawEvent(ctx context.Context, tx pgx.Tx, raw event.RawEvent, actorJSON []byte, successful bool) (uuid.UUID, bool, error) {
 	eventID := uuid.New()
+	var storedActors []event.Actor
 	query := `
 		INSERT INTO raw_events
 			(id, forge_instance_id, external_id, source_key, kind, occurred_at, payload,
@@ -1142,7 +1161,7 @@ func upsertRawEvent(ctx context.Context, tx pgx.Tx, raw event.RawEvent, actorJSO
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (forge_instance_id, external_id)
 		DO NOTHING
-		RETURNING id`
+		RETURNING id, actor_keys`
 	if successful {
 		query = `
 			INSERT INTO raw_events
@@ -1154,14 +1173,22 @@ func upsertRawEvent(ctx context.Context, tx pgx.Tx, raw event.RawEvent, actorJSO
 			              kind = EXCLUDED.kind,
 			              occurred_at = COALESCE(EXCLUDED.occurred_at, raw_events.occurred_at),
 			              payload = EXCLUDED.payload,
-			              actor_keys = EXCLUDED.actor_keys,
+			              actor_keys = CASE
+			                  WHEN raw_events.kind = 'commit'
+			                   AND jsonb_typeof(raw_events.actor_keys) = 'array'
+			                   AND jsonb_typeof(EXCLUDED.actor_keys) = 'array'
+			                  THEN (SELECT COALESCE(jsonb_agg(DISTINCT merged.actor), '[]'::jsonb)
+			                        FROM jsonb_array_elements(raw_events.actor_keys || EXCLUDED.actor_keys)
+			                             AS merged(actor))
+			                  ELSE EXCLUDED.actor_keys
+			              END,
 			              payload_schema_version = EXCLUDED.payload_schema_version,
 			              observed_at = now()
-			RETURNING id`
+			RETURNING id, actor_keys`
 	}
 	err := tx.QueryRow(ctx, query, eventID, raw.ForgeInstanceID, raw.ExternalID,
 		string(raw.Source), string(raw.Kind), raw.OccurredAt, raw.Payload, actorJSON,
-		raw.PayloadSchemaVersion).Scan(&eventID)
+		raw.PayloadSchemaVersion).Scan(&eventID, &storedActors)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = tx.QueryRow(ctx, `
 			SELECT id FROM raw_events
@@ -1175,7 +1202,7 @@ func upsertRawEvent(ctx context.Context, tx pgx.Tx, raw event.RawEvent, actorJSO
 	if err != nil {
 		return uuid.Nil, false, fmt.Errorf("persist raw event %s: %w", raw.ExternalID, err)
 	}
-	if err := replaceRawEventActorKeys(ctx, tx, eventID, raw.Actors); err != nil {
+	if err := replaceRawEventActorKeys(ctx, tx, eventID, storedActors); err != nil {
 		return uuid.Nil, false, err
 	}
 	return eventID, true, nil
