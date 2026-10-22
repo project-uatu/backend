@@ -39,9 +39,20 @@ building the backend. Follow [Running with Docker](#running-with-docker) below.
 `collect octocat` resolves the immutable GitHub account ID, tracks the account,
 and runs a resumable public-history backfill from the account's creation date.
 The collector records authored issues and pull requests, reviews, releases in
-known public repositories, source-reported contribution counts and search
-coverage gaps. Repeating the command reuses the person record and schedules an
-incremental scan with a seven-day overlap after a successful backfill.
+known public repositories, verified non-merge commits on the default branch of
+known public non-fork repositories, source-reported contribution counts and
+search coverage gaps. Commit scans are bounded to 50 repositories and 20 pages
+of 100 commits per repository by default; attribution uses linked forge
+accounts, verified GitHub numeric noreply addresses or already assigned email
+identities, never names alone. Verified `Co-authored-by` trailers are credited
+separately on fetched commits; GitHub's author filter cannot discover commits
+where the tracked person appears only as a co-author. Commit messages, names and
+emails are not stored. Coverage gaps record repositories or ranges omitted by
+those limits. Repeating the command reuses the person record and schedules
+incremental scans with a seven-day overlap after a successful backfill. A commit
+scan that finds a repository not yet covered by a completed commit scan
+backfills from the account's start instead. Commit normalization jobs use
+version 2, so workers that predate commit handlers never claim them.
 
 `GITHUB_TOKEN` is required for all `collect` modes: GitHub GraphQL requires
 authentication for stable account refresh and contribution aggregates. Serving
@@ -108,6 +119,8 @@ curl -H "Authorization: Bearer $UATU_API_KEY" \
 | `GITHUB_TOKEN` | Required for `collect` when GitHub is enabled | GitHub API token for identity refresh and public contribution counts |
 | `GITLAB_TOKEN` | Optional | Read-only GitLab.com token for `collect`; raises rate limits, never stored or logged |
 | `CODEBERG_TOKEN` | Optional | Read-only Codeberg token for `collect`; raises rate limits, never stored or logged |
+| `UATU_COMMIT_MAX_REPOS` | `50` | Maximum known repositories scanned per person and forge (1–1000) |
+| `UATU_COMMIT_MAX_PAGES` | `20` | Maximum pages of 100 commits scanned per repository (1–1000) |
 | `UATU_FORGES` | All | Comma-separated enabled forges: `github.com`, `gitlab.com`, `codeberg.org` |
 
 Migration `007` renames the GitHub-named tables to `source_accounts` and

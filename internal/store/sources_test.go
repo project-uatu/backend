@@ -161,7 +161,13 @@ func TestStore_boundaryGapsStillLetBackfillComplete(t *testing.T) {
 		From: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), To: time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC),
 		Reason: "source limit", Boundary: true,
 	}
-	if _, err := s.PersistCollectionPage(ctx, claim, event.Page{Done: true},
+	page := event.Page{
+		Done: true,
+		ResolvedAccount: &event.ResolvedAccount{
+			AccountID: "42", Login: "jane.doe",
+		},
+	}
+	if _, err := s.PersistCollectionPage(ctx, claim, page,
 		event.FetchReport{Gaps: []event.Gap{gap}}, true, 1, uuid.Nil); err != nil {
 		t.Fatalf("PersistCollectionPage: %v", err)
 	}

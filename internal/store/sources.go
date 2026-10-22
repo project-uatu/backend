@@ -14,8 +14,12 @@ import (
 const (
 	// SourceGitLabHistory identifies person-centric GitLab activity collection.
 	SourceGitLabHistory = "gitlab_history"
+	// SourceGitLabCommits identifies GitLab commit collection.
+	SourceGitLabCommits = "gitlab_commits"
 	// SourceForgejoHistory identifies person-centric Forgejo activity collection.
 	SourceForgejoHistory = "forgejo_history"
+	// SourceForgejoCommits identifies Forgejo commit collection.
+	SourceForgejoCommits = "forgejo_commits"
 )
 
 // ErrUnknownForge reports a forge host that is not enabled for collection.
@@ -23,10 +27,11 @@ var ErrUnknownForge = errors.New("forge is not supported")
 
 // SourceProfile describes one enabled forge and its person-history source.
 type SourceProfile struct {
-	Key      string
-	Provider string
-	Host     string
-	BaseURL  string
+	Key       string
+	CommitKey string
+	Provider  string
+	Host      string
+	BaseURL   string
 	// RequireNodeID and RequireCreatedAt state which optional account
 	// metadata the forge always provides.
 	RequireNodeID    bool
@@ -34,11 +39,11 @@ type SourceProfile struct {
 }
 
 var sourceProfiles = []SourceProfile{
-	{Key: SourceGitHubHistory, Provider: "github", Host: "github.com",
+	{Key: SourceGitHubHistory, CommitKey: SourceGitHubCommits, Provider: "github", Host: "github.com",
 		BaseURL: "https://github.com", RequireNodeID: true, RequireCreatedAt: true},
-	{Key: SourceGitLabHistory, Provider: "gitlab", Host: "gitlab.com",
+	{Key: SourceGitLabHistory, CommitKey: SourceGitLabCommits, Provider: "gitlab", Host: "gitlab.com",
 		BaseURL: "https://gitlab.com"},
-	{Key: SourceForgejoHistory, Provider: "forgejo", Host: "codeberg.org",
+	{Key: SourceForgejoHistory, CommitKey: SourceForgejoCommits, Provider: "forgejo", Host: "codeberg.org",
 		BaseURL: "https://codeberg.org"},
 }
 
@@ -61,6 +66,16 @@ func ProfileForHost(host string) (SourceProfile, bool) {
 func ProfileForProvider(provider string) (SourceProfile, bool) {
 	for _, profile := range sourceProfiles {
 		if profile.Provider == provider {
+			return profile, true
+		}
+	}
+	return SourceProfile{}, false
+}
+
+// ProfileForCommitSource returns the forge profile for a commit source key.
+func ProfileForCommitSource(source string) (SourceProfile, bool) {
+	for _, profile := range sourceProfiles {
+		if profile.CommitKey == source {
 			return profile, true
 		}
 	}
@@ -115,6 +130,11 @@ func isAccountSource(key string) bool {
 		}
 	}
 	return false
+}
+
+func isCommitSource(key string) bool {
+	_, ok := ProfileForCommitSource(key)
+	return ok
 }
 
 // GitHubForge returns the canonical GitHub.com forge instance.

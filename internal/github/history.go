@@ -25,6 +25,15 @@ const historySource event.Source = "github_history"
 
 const historyCoverageScope = "authored issues, pull requests and reviews: public search; releases: known public repositories only"
 
+// StatusError reports a GitHub response status without including its body.
+type StatusError struct {
+	StatusCode int
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("GitHub returned HTTP %d", e.StatusCode)
+}
+
 type githubUser struct {
 	ID        int64     `json:"id"`
 	NodeID    string    `json:"node_id"`
@@ -957,6 +966,11 @@ func (c *Client) graphQLURL() string {
 }
 
 func (c *Client) do(ctx context.Context, method, target string, body []byte, bucket string) ([]byte, event.FetchReport, error) {
+	response, _, report, err := c.doWithHeaders(ctx, method, target, body, bucket)
+	return response, report, err
+}
+
+func (c *Client) doWithHeaders(ctx context.Context, method, target string, body []byte, bucket string) ([]byte, http.Header, event.FetchReport, error) {
 	var report event.FetchReport
 	var requestBody io.Reader
 	if len(body) > 0 {
@@ -964,7 +978,7 @@ func (c *Client) do(ctx context.Context, method, target string, body []byte, buc
 	}
 	req, err := http.NewRequestWithContext(ctx, method, target, requestBody)
 	if err != nil {
-		return nil, report, fmt.Errorf("build GitHub request: %w", err)
+		return nil, nil, report, fmt.Errorf("build GitHub request: %w", err)
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", forgehttp.UserAgent())
@@ -976,8 +990,9 @@ func (c *Client) do(ctx context.Context, method, target string, body []byte, buc
 	}
 	res, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, report, fmt.Errorf("request GitHub resource: %w", err)
+		return nil, nil, report, fmt.Errorf("request GitHub resource: %w", err)
 	}
+	headers := res.Header.Clone()
 	report.RateLimitBucket = bucket
 	report.RateLimitLimit = headerInt(res.Header, "X-RateLimit-Limit")
 	report.RateLimitRemaining = headerInt(res.Header, "X-RateLimit-Remaining")
@@ -1000,18 +1015,18 @@ func (c *Client) do(ctx context.Context, method, target string, body []byte, buc
 	response, readErr := io.ReadAll(io.LimitReader(res.Body, responseLimit+1))
 	closeErr := res.Body.Close()
 	if readErr != nil {
-		return nil, report, fmt.Errorf("read GitHub response: %w", readErr)
+		return nil, headers, report, fmt.Errorf("read GitHub response: %w", readErr)
 	}
 	if closeErr != nil {
-		return nil, report, fmt.Errorf("close GitHub response: %w", closeErr)
+		return nil, headers, report, fmt.Errorf("close GitHub response: %w", closeErr)
 	}
 	if len(response) > responseLimit {
-		return nil, report, fmt.Errorf("GitHub response exceeded %d bytes", responseLimit)
+		return nil, headers, report, fmt.Errorf("GitHub response exceeded %d bytes", responseLimit)
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, report, fmt.Errorf("GitHub returned HTTP %d", res.StatusCode)
+		return nil, headers, report, &StatusError{StatusCode: res.StatusCode}
 	}
-	return response, report, nil
+	return response, headers, report, nil
 }
 
 func headerInt(header http.Header, key string) *int {

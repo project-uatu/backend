@@ -44,6 +44,8 @@ func TestLoad_readsEnvironment(t *testing.T) {
 	t.Setenv("UATU_CORS_ORIGINS", "https://app.example, http://localhost:3000")
 	t.Setenv("GITHUB_TOKEN", "test-token")
 	t.Setenv("UATU_USERS", "alice, bob")
+	t.Setenv("UATU_COMMIT_MAX_REPOS", "75")
+	t.Setenv("UATU_COMMIT_MAX_PAGES", "30")
 
 	got, err := Load()
 	if err != nil {
@@ -57,6 +59,7 @@ func TestLoad_readsEnvironment(t *testing.T) {
 		got.APIKey != "01234567890123456789012345678901" ||
 		!reflect.DeepEqual(got.CORSOrigins, []string{"https://app.example", "http://localhost:3000"}) ||
 		got.GitHubToken != "test-token" ||
+		got.CommitMaxRepos != 75 || got.CommitMaxPages != 30 ||
 		!reflect.DeepEqual(got.Users, []string{"alice", "bob"}) {
 		t.Errorf("Load = %+v, want configured values", got)
 	}
@@ -68,6 +71,8 @@ func TestLoad_defaultsDatabasePool(t *testing.T) {
 	t.Setenv("UATU_DB_MIN_CONNS", "")
 	t.Setenv("UATU_DB_MAX_CONNS", "")
 	t.Setenv("UATU_DB_CONNECT_TIMEOUT", "")
+	t.Setenv("UATU_COMMIT_MAX_REPOS", "")
+	t.Setenv("UATU_COMMIT_MAX_PAGES", "")
 	t.Setenv("UATU_API_KEY", "")
 	t.Setenv("UATU_CORS_ORIGINS", "")
 
@@ -80,6 +85,10 @@ func TestLoad_defaultsDatabasePool(t *testing.T) {
 		got.DatabaseMaxConns != 10 ||
 		got.DatabaseConnectTimeout != 5*time.Second {
 		t.Errorf("Load database defaults = %+v, want secure TLS and default pool values", got)
+	}
+	if got.CommitMaxRepos != 50 || got.CommitMaxPages != 20 {
+		t.Errorf("Load commit limits = %d repos, %d pages, want 50 and 20",
+			got.CommitMaxRepos, got.CommitMaxPages)
 	}
 }
 
@@ -147,6 +156,18 @@ func TestLoad_rejectsInvalidPoolSettings(t *testing.T) {
 			name: "duplicate CORS origin",
 			set: func(t *testing.T) {
 				t.Setenv("UATU_CORS_ORIGINS", "https://app.example,https://app.example")
+			},
+		},
+		{
+			name: "zero commit repository limit",
+			set: func(t *testing.T) {
+				t.Setenv("UATU_COMMIT_MAX_REPOS", "0")
+			},
+		},
+		{
+			name: "excessive commit page limit",
+			set: func(t *testing.T) {
+				t.Setenv("UATU_COMMIT_MAX_PAGES", "1001")
 			},
 		},
 	}

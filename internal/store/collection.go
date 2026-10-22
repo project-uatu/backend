@@ -542,7 +542,7 @@ func (s *Store) ClaimCollectionJobForSources(ctx context.Context, owner string, 
 	var accountNodeID, currentLogin string
 	var accountCreatedAt time.Time
 	var knownRepositories []string
-	if isAccountSource(job.SourceKey) {
+	if isAccountSource(job.SourceKey) || isCommitSource(job.SourceKey) {
 		var nodeID *string
 		var createdAt *time.Time
 		err := tx.QueryRow(ctx, `
@@ -556,6 +556,9 @@ func (s *Store) ClaimCollectionJobForSources(ctx context.Context, owner string, 
 			accountCreatedAt = *createdAt
 		}
 		if errors.Is(err, pgx.ErrNoRows) {
+			if isCommitSource(job.SourceKey) {
+				return JobClaim{}, false, errors.New("commit collection requires a resolved source account")
+			}
 			currentLogin = job.OnboardingLogin
 			if currentLogin == "" {
 				return JobClaim{}, false, ErrOnboardingTargetUnavailable
@@ -863,11 +866,88 @@ func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page 
 			WHERE id = $1 AND fencing_token = $2`, claim.ID, claim.Token); err != nil {
 			return false, fmt.Errorf("complete collection job: %w", err)
 		}
+		if scanComplete && isCommitSource(claim.SourceKey) && len(claim.KnownRepositories) > 0 {
+			if _, err := tx.Exec(ctx, `
+				UPDATE known_repositories SET commit_scanned_through = $4
+				WHERE forge_instance_id = $1 AND person_id = $2 AND repository = ANY($3)`,
+				claim.ForgeInstanceID, claim.PersonID, claim.KnownRepositories, claim.Window.To.UTC()); err != nil {
+				return false, fmt.Errorf("record commit scan repository progress: %w", err)
+			}
+		}
+		if claim.SourceKey == SourceGitHubHistory ||
+			claim.SourceKey == SourceGitLabHistory ||
+			claim.SourceKey == SourceForgejoHistory {
+			if err := enqueueCommitScanTx(ctx, tx, claim); err != nil {
+				return false, err
+			}
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit collection page: %w", err)
 	}
 	return page.Done, nil
+}
+
+func enqueueCommitScanTx(ctx context.Context, tx pgx.Tx, claim JobClaim) error {
+	profile, err := profileForForge(ctx, tx, claim.ForgeInstanceID)
+	if err != nil {
+		return err
+	}
+	if profile.Key != claim.SourceKey || profile.CommitKey == "" {
+		return nil
+	}
+	var accountCreatedAt *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT account_created_at FROM source_accounts
+		WHERE forge_instance_id = $1 AND person_id = $2`,
+		claim.ForgeInstanceID, claim.PersonID).Scan(&accountCreatedAt); err != nil {
+		return fmt.Errorf("load account date for commit scan: %w", err)
+	}
+	input := CollectionJobInput{
+		PersonID: claim.PersonID, ForgeInstanceID: claim.ForgeInstanceID,
+		SourceKey: profile.CommitKey, ScanMode: "backfill", Window: event.Window{To: claim.Window.To},
+	}
+	if accountCreatedAt != nil {
+		input.Window.From = accountCreatedAt.UTC()
+	}
+	var backfillComplete bool
+	var completedThrough *time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT backfill_complete, completed_through FROM checkpoints
+		WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3`,
+		claim.PersonID, claim.ForgeInstanceID, profile.CommitKey).
+		Scan(&backfillComplete, &completedThrough)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+	case err != nil:
+		return fmt.Errorf("load commit scan checkpoint: %w", err)
+	case backfillComplete && completedThrough != nil:
+		var unscanned bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM known_repositories
+				WHERE forge_instance_id = $1 AND person_id = $2 AND commit_scanned_through IS NULL)`,
+			claim.ForgeInstanceID, claim.PersonID).Scan(&unscanned); err != nil {
+			return fmt.Errorf("check commit scan repository progress: %w", err)
+		}
+		if !unscanned {
+			input.ScanMode = "incremental"
+			input.Window.From = completedThrough.Add(-7 * 24 * time.Hour).UTC()
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO jobs
+			(id, person_id, forge_instance_id, source_key, status, due_at, max_attempts,
+			 cursor, scan_mode, onboarding_login, window_start, window_end)
+		VALUES ($1, $2, $3, $4, 'queued', now(), 10, '', $5, '', $6, $7)
+		ON CONFLICT (person_id, forge_instance_id, source_key)
+			WHERE status IN ('queued', 'running')
+		DO NOTHING`,
+		uuid.New(), claim.PersonID, claim.ForgeInstanceID, profile.CommitKey,
+		input.ScanMode, nullableTime(input.Window.From), input.Window.To); err != nil {
+		return fmt.Errorf("enqueue commit history scan: %w", err)
+	}
+	return nil
 }
 
 // RetryCollectionJob releases a claimed job for a bounded retry or marks it
@@ -1073,6 +1153,7 @@ func assignedActorKeys(ctx context.Context, tx pgx.Tx, personID, instanceID uuid
 
 func upsertRawEvent(ctx context.Context, tx pgx.Tx, raw event.RawEvent, actorJSON []byte, successful bool) (uuid.UUID, bool, error) {
 	eventID := uuid.New()
+	var storedActors []event.Actor
 	query := `
 		INSERT INTO raw_events
 			(id, forge_instance_id, external_id, source_key, kind, occurred_at, payload,
@@ -1080,7 +1161,7 @@ func upsertRawEvent(ctx context.Context, tx pgx.Tx, raw event.RawEvent, actorJSO
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (forge_instance_id, external_id)
 		DO NOTHING
-		RETURNING id`
+		RETURNING id, actor_keys`
 	if successful {
 		query = `
 			INSERT INTO raw_events
@@ -1092,14 +1173,22 @@ func upsertRawEvent(ctx context.Context, tx pgx.Tx, raw event.RawEvent, actorJSO
 			              kind = EXCLUDED.kind,
 			              occurred_at = COALESCE(EXCLUDED.occurred_at, raw_events.occurred_at),
 			              payload = EXCLUDED.payload,
-			              actor_keys = EXCLUDED.actor_keys,
+			              actor_keys = CASE
+			                  WHEN raw_events.kind = 'commit'
+			                   AND jsonb_typeof(raw_events.actor_keys) = 'array'
+			                   AND jsonb_typeof(EXCLUDED.actor_keys) = 'array'
+			                  THEN (SELECT COALESCE(jsonb_agg(DISTINCT merged.actor), '[]'::jsonb)
+			                        FROM jsonb_array_elements(raw_events.actor_keys || EXCLUDED.actor_keys)
+			                             AS merged(actor))
+			                  ELSE EXCLUDED.actor_keys
+			              END,
 			              payload_schema_version = EXCLUDED.payload_schema_version,
 			              observed_at = now()
-			RETURNING id`
+			RETURNING id, actor_keys`
 	}
 	err := tx.QueryRow(ctx, query, eventID, raw.ForgeInstanceID, raw.ExternalID,
 		string(raw.Source), string(raw.Kind), raw.OccurredAt, raw.Payload, actorJSON,
-		raw.PayloadSchemaVersion).Scan(&eventID)
+		raw.PayloadSchemaVersion).Scan(&eventID, &storedActors)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = tx.QueryRow(ctx, `
 			SELECT id FROM raw_events
@@ -1113,7 +1202,7 @@ func upsertRawEvent(ctx context.Context, tx pgx.Tx, raw event.RawEvent, actorJSO
 	if err != nil {
 		return uuid.Nil, false, fmt.Errorf("persist raw event %s: %w", raw.ExternalID, err)
 	}
-	if err := replaceRawEventActorKeys(ctx, tx, eventID, raw.Actors); err != nil {
+	if err := replaceRawEventActorKeys(ctx, tx, eventID, storedActors); err != nil {
 		return uuid.Nil, false, err
 	}
 	return eventID, true, nil

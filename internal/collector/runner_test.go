@@ -511,6 +511,29 @@ func TestRunner_RunOnce_onlyClaimsSupportedNormalizerVersion(t *testing.T) {
 	}
 }
 
+type versionedConnector struct {
+	pageConnector
+	version int
+}
+
+func (c *versionedConnector) NormalizerVersion() int { return c.version }
+
+func TestRunner_RunOnce_claimsVersionsOfItsVersionedConnectors(t *testing.T) {
+	connector := &versionedConnector{pageConnector: pageConnector{source: "test_commits"}, version: 2}
+	for _, version := range []int{1, 2} {
+		storeStub := &runnerStore{normalization: &store.NormalizationClaim{
+			RawEventID: uuid.New(), NormalizerVersion: version,
+			Event: event.RawEvent{Source: "test_commits", Kind: "commit", ExternalID: "stored"},
+		}}
+		runner := newTestRunner(t, storeStub, []Connector{connector}, normalizerFunc(func(event.RawEvent) ([]event.Action, error) {
+			return nil, nil
+		}))
+		if worked, err := runner.RunOnce(t.Context()); !worked || err != nil || storeStub.completed != 1 {
+			t.Errorf("RunOnce(version %d) = %t, %v, completed %d; want claimed", version, worked, err, storeStub.completed)
+		}
+	}
+}
+
 func TestRunner_RunOnce_renewsLongNormalizationLease(t *testing.T) {
 	storeStub := &runnerStore{normalization: &store.NormalizationClaim{
 		RawEventID: uuid.New(), NormalizerVersion: 1,

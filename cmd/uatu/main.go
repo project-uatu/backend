@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/project-uatu/backend/internal/collector"
+	commitnorm "github.com/project-uatu/backend/internal/commit"
 	"github.com/project-uatu/backend/internal/config"
 	"github.com/project-uatu/backend/internal/event"
 	"github.com/project-uatu/backend/internal/forgejo"
@@ -214,15 +215,41 @@ func runCollectionWorker(ctx context.Context, db *store.Store, cfg config.Config
 			return fmt.Errorf("configure forge normalizer: %w", err)
 		}
 	}
+	for _, source := range []event.Source{github.CommitSource, gitlab.CommitSource, forgejo.CommitSource} {
+		if err := commitnorm.Register(transformer, source); err != nil {
+			return fmt.Errorf("configure commit normalizer: %w", err)
+		}
+	}
 	var connectors []collector.Connector
 	if cfg.ForgeEnabled("github.com") {
 		connectors = append(connectors, github.NewHistoryConnector(github.NewClient(cfg.GitHubToken, nil)))
+		commitConnector, err := github.NewCommitConnector(
+			github.NewClient(cfg.GitHubToken, nil), cfg.CommitMaxRepos, cfg.CommitMaxPages,
+		)
+		if err != nil {
+			return fmt.Errorf("configure GitHub commit connector: %w", err)
+		}
+		connectors = append(connectors, commitConnector)
 	}
 	if cfg.ForgeEnabled("gitlab.com") {
 		connectors = append(connectors, gitlab.New(gitlab.Options{Token: cfg.GitLabToken}))
+		commitConnector, err := gitlab.NewCommitConnector(
+			gitlab.Options{Token: cfg.GitLabToken}, cfg.CommitMaxRepos, cfg.CommitMaxPages,
+		)
+		if err != nil {
+			return fmt.Errorf("configure GitLab commit connector: %w", err)
+		}
+		connectors = append(connectors, commitConnector)
 	}
 	if cfg.ForgeEnabled("codeberg.org") {
 		connectors = append(connectors, forgejo.New(forgejo.Options{Token: cfg.CodebergToken}))
+		commitConnector, err := forgejo.NewCommitConnector(
+			forgejo.Options{Token: cfg.CodebergToken}, cfg.CommitMaxRepos, cfg.CommitMaxPages,
+		)
+		if err != nil {
+			return fmt.Errorf("configure Codeberg commit connector: %w", err)
+		}
+		connectors = append(connectors, commitConnector)
 	}
 	if len(connectors) == 0 {
 		return errors.New("no forges enabled; set UATU_FORGES")

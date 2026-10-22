@@ -14,7 +14,12 @@ import (
 )
 
 // SourceGitHubHistory identifies person-centric GitHub activity collection.
-const SourceGitHubHistory = "github_history"
+const (
+	// SourceGitHubHistory identifies person-centric GitHub activity collection.
+	SourceGitHubHistory = "github_history"
+	// SourceGitHubCommits identifies GitHub commit collection.
+	SourceGitHubCommits = "github_commits"
+)
 
 // Options configures the PostgreSQL connection pool.
 type Options struct {

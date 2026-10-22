@@ -26,8 +26,10 @@ type Config struct {
 	CORSOrigins            []string
 	GitHubToken            string
 	// GitLabToken and CodebergToken are optional read-only tokens.
-	GitLabToken   string
-	CodebergToken string
+	GitLabToken    string
+	CodebergToken  string
+	CommitMaxRepos int
+	CommitMaxPages int
 	// Forges lists the enabled forge hosts.
 	Forges []string
 	Users  []string
@@ -52,6 +54,18 @@ func Load() (Config, error) {
 	}
 	if connectTimeout <= 0 {
 		return Config{}, fmt.Errorf("UATU_DB_CONNECT_TIMEOUT must be positive")
+	}
+	commitMaxRepos, err := envInt32("UATU_COMMIT_MAX_REPOS", 50)
+	if err != nil {
+		return Config{}, err
+	}
+	commitMaxPages, err := envInt32("UATU_COMMIT_MAX_PAGES", 20)
+	if err != nil {
+		return Config{}, err
+	}
+	if commitMaxRepos < 1 || commitMaxRepos > 1000 ||
+		commitMaxPages < 1 || commitMaxPages > 1000 {
+		return Config{}, fmt.Errorf("commit scan limits must be between 1 and 1000")
 	}
 	apiKey := os.Getenv("UATU_API_KEY")
 	if apiKey != "" && (len(apiKey) < 32 || strings.ContainsAny(apiKey, " \t\r\n")) {
@@ -84,6 +98,8 @@ func Load() (Config, error) {
 		GitHubToken:            os.Getenv("GITHUB_TOKEN"),
 		GitLabToken:            os.Getenv("GITLAB_TOKEN"),
 		CodebergToken:          os.Getenv("CODEBERG_TOKEN"),
+		CommitMaxRepos:         int(commitMaxRepos),
+		CommitMaxPages:         int(commitMaxPages),
 		Forges:                 forges,
 		Users:                  splitUsers(os.Getenv("UATU_USERS")),
 	}, nil
