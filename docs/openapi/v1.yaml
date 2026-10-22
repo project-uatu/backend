@@ -500,6 +500,7 @@ components:
           format: uuid
         kind:
           type: string
+          description: Includes commit_authored for verified commits in bounded known public repositories.
         role:
           type: string
         occurred_at:

@@ -786,7 +786,7 @@ func TestStore_EnqueueHistoryUsesBackfillThenOverlap(t *testing.T) {
 		t.Errorf("initial GitHub scan = mode %q, from %s; want backfill from account creation %s",
 			initial.ScanMode, initial.Window.From, createdAt)
 	}
-	claim, found, err := s.ClaimCollectionJob(ctx, "backfill-worker", time.Minute)
+	claim, found, err := s.ClaimCollectionJobForSources(ctx, "backfill-worker", time.Minute, []string{SourceGitHubHistory})
 	if err != nil || !found {
 		t.Fatalf("ClaimCollectionJob = %t, %v; want initial backfill", found, err)
 	}
@@ -802,7 +802,7 @@ func TestStore_EnqueueHistoryUsesBackfillThenOverlap(t *testing.T) {
 	if err := s.ReleaseCollectionJob(ctx, claim); err != nil {
 		t.Fatalf("ReleaseCollectionJob: %v", err)
 	}
-	claim, found, err = s.ClaimCollectionJob(ctx, "resumed-worker", time.Minute)
+	claim, found, err = s.ClaimCollectionJobForSources(ctx, "resumed-worker", time.Minute, []string{SourceGitHubHistory})
 	if err != nil || !found || claim.ID != initial.ID || claim.Cursor != "page-2" ||
 		!claim.Window.To.Equal(initial.Window.To) {
 		t.Fatalf("resumed scan = %+v, found %t, error %v; want original job, window and cursor", claim, found, err)
@@ -822,12 +822,98 @@ func TestStore_EnqueueHistoryUsesBackfillThenOverlap(t *testing.T) {
 		t.Errorf("incremental scan = mode %q, from %s; want from %s with seven-day overlap",
 			incremental.ScanMode, incremental.Window.From, wantFrom)
 	}
-	nextClaim, found, err := s.ClaimCollectionJob(ctx, "incremental-worker", time.Minute)
+	nextClaim, found, err := s.ClaimCollectionJobForSources(ctx, "incremental-worker", time.Minute, []string{SourceGitHubHistory})
 	if err != nil || !found {
 		t.Fatalf("ClaimCollectionJob(incremental) = %t, %v", found, err)
 	}
 	if len(nextClaim.KnownRepositories) != 1 || nextClaim.KnownRepositories[0] != "other/repo" {
 		t.Errorf("incremental known repositories = %v, want persisted other/repo", nextClaim.KnownRepositories)
+	}
+}
+
+func TestStore_completedHistoryQueuesBoundedCommitSource(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	forge := githubForge(t, s)
+	createdAt := time.Date(2011, 1, 25, 18, 44, 36, 0, time.UTC)
+	tracked, err := s.TrackGitHubAccount(ctx, forge.ID, GitHubAccount{
+		AccountID: "42", NodeID: "MDQ6VXNlcjQy", Login: "octocat", AccountCreatedAt: createdAt,
+	})
+	if err != nil {
+		t.Fatalf("TrackGitHubAccount: %v", err)
+	}
+	history, err := s.EnqueueHistory(ctx, tracked.PersonID, forge.ID)
+	if err != nil {
+		t.Fatalf("EnqueueHistory: %v", err)
+	}
+	claim, found, err := s.ClaimCollectionJobForSources(
+		ctx, "history-worker", time.Minute, []string{SourceGitHubHistory},
+	)
+	if err != nil || !found || claim.ID != history.ID {
+		t.Fatalf("ClaimCollectionJobForSources(history) = %+v, %t, %v", claim, found, err)
+	}
+	if _, err := s.PersistCollectionPage(ctx, claim, event.Page{Done: true},
+		event.FetchReport{KnownRepositories: []string{"octo/app"}}, true, 1, uuid.Nil); err != nil {
+		t.Fatalf("PersistCollectionPage(history): %v", err)
+	}
+	var scanMode string
+	var windowStart, windowEnd *time.Time
+	if err := s.db.QueryRow(ctx, `
+		SELECT scan_mode, window_start, window_end FROM jobs
+		WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3 AND status = 'queued'`,
+		tracked.PersonID, forge.ID, SourceGitHubCommits).Scan(&scanMode, &windowStart, &windowEnd); err != nil {
+		t.Fatalf("load queued commit job: %v", err)
+	}
+	if scanMode != "backfill" || windowStart == nil || !windowStart.Equal(createdAt) ||
+		windowEnd == nil || !windowEnd.Equal(claim.Window.To) {
+		t.Errorf("commit job = mode %q, range [%v, %v); want backfill from %s through %s",
+			scanMode, windowStart, windowEnd, createdAt, claim.Window.To)
+	}
+	if _, found, err := s.ClaimCollectionJobForSources(
+		ctx, "old-worker", time.Minute, []string{SourceGitHubHistory},
+	); err != nil || found {
+		t.Fatalf("worker without commit connector claimed = %t, %v; want no claim", found, err)
+	}
+	nextHistory, err := s.EnqueueHistory(ctx, tracked.PersonID, forge.ID)
+	if err != nil {
+		t.Fatalf("EnqueueHistory(incremental): %v", err)
+	}
+	historyClaim, found, err := s.ClaimCollectionJobForSources(
+		ctx, "history-worker", time.Minute, []string{SourceGitHubHistory},
+	)
+	if err != nil || !found || historyClaim.ID != nextHistory.ID {
+		t.Fatalf("ClaimCollectionJobForSources(next history) = %+v, %t, %v", historyClaim, found, err)
+	}
+	if _, err := s.PersistCollectionPage(ctx, historyClaim, event.Page{Done: true},
+		event.FetchReport{KnownRepositories: []string{"octo/app"}}, true, 1, uuid.Nil); err != nil {
+		t.Fatalf("PersistCollectionPage(next history): %v", err)
+	}
+	if got := countRows(t, s, `
+		SELECT count(*) FROM jobs
+		WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3
+		  AND status IN ('queued', 'running')`,
+		tracked.PersonID, forge.ID, SourceGitHubCommits); got != 1 {
+		t.Fatalf("active commit jobs after overlapping history completion = %d, want 1", got)
+	}
+	commitClaim, found, err := s.ClaimCollectionJobForSources(
+		ctx, "commit-worker", time.Minute, []string{SourceGitHubCommits},
+	)
+	if err != nil || !found || commitClaim.SourceKey != SourceGitHubCommits {
+		t.Fatalf("ClaimCollectionJobForSources(commit) = %+v, %t, %v", commitClaim, found, err)
+	}
+	if len(commitClaim.KnownRepositories) != 1 || commitClaim.KnownRepositories[0] != "octo/app" ||
+		commitClaim.CurrentAccountLogin != "octocat" || commitClaim.AccountNodeID != "MDQ6VXNlcjQy" {
+		t.Errorf("commit claim source context = %+v", commitClaim)
+	}
+	if _, err := s.PersistCollectionPage(ctx, commitClaim, event.Page{Done: true},
+		event.FetchReport{}, true, 1, uuid.Nil); err != nil {
+		t.Fatalf("PersistCollectionPage(commit): %v", err)
+	}
+	if got := countRows(t, s, `
+		SELECT count(*) FROM checkpoints
+		WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = ANY($3)`,
+		tracked.PersonID, forge.ID, []string{SourceGitHubHistory, SourceGitHubCommits}); got != 2 {
+		t.Errorf("history and commit checkpoints = %d, want independent checkpoints", got)
 	}
 }
 

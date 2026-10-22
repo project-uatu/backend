@@ -542,7 +542,7 @@ func (s *Store) ClaimCollectionJobForSources(ctx context.Context, owner string, 
 	var accountNodeID, currentLogin string
 	var accountCreatedAt time.Time
 	var knownRepositories []string
-	if isAccountSource(job.SourceKey) {
+	if isAccountSource(job.SourceKey) || isCommitSource(job.SourceKey) {
 		var nodeID *string
 		var createdAt *time.Time
 		err := tx.QueryRow(ctx, `
@@ -556,6 +556,9 @@ func (s *Store) ClaimCollectionJobForSources(ctx context.Context, owner string, 
 			accountCreatedAt = *createdAt
 		}
 		if errors.Is(err, pgx.ErrNoRows) {
+			if isCommitSource(job.SourceKey) {
+				return JobClaim{}, false, errors.New("commit collection requires a resolved source account")
+			}
 			currentLogin = job.OnboardingLogin
 			if currentLogin == "" {
 				return JobClaim{}, false, ErrOnboardingTargetUnavailable
@@ -863,11 +866,70 @@ func (s *Store) PersistCollectionPage(ctx context.Context, claim JobClaim, page 
 			WHERE id = $1 AND fencing_token = $2`, claim.ID, claim.Token); err != nil {
 			return false, fmt.Errorf("complete collection job: %w", err)
 		}
+		if claim.SourceKey == SourceGitHubHistory ||
+			claim.SourceKey == SourceGitLabHistory ||
+			claim.SourceKey == SourceForgejoHistory {
+			if err := enqueueCommitScanTx(ctx, tx, claim); err != nil {
+				return false, err
+			}
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit collection page: %w", err)
 	}
 	return page.Done, nil
+}
+
+func enqueueCommitScanTx(ctx context.Context, tx pgx.Tx, claim JobClaim) error {
+	profile, err := profileForForge(ctx, tx, claim.ForgeInstanceID)
+	if err != nil {
+		return err
+	}
+	if profile.Key != claim.SourceKey || profile.CommitKey == "" {
+		return nil
+	}
+	var accountCreatedAt *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT account_created_at FROM source_accounts
+		WHERE forge_instance_id = $1 AND person_id = $2`,
+		claim.ForgeInstanceID, claim.PersonID).Scan(&accountCreatedAt); err != nil {
+		return fmt.Errorf("load account date for commit scan: %w", err)
+	}
+	input := CollectionJobInput{
+		PersonID: claim.PersonID, ForgeInstanceID: claim.ForgeInstanceID,
+		SourceKey: profile.CommitKey, ScanMode: "backfill", Window: event.Window{To: claim.Window.To},
+	}
+	if accountCreatedAt != nil {
+		input.Window.From = accountCreatedAt.UTC()
+	}
+	var backfillComplete bool
+	var completedThrough *time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT backfill_complete, completed_through FROM checkpoints
+		WHERE person_id = $1 AND forge_instance_id = $2 AND source_key = $3`,
+		claim.PersonID, claim.ForgeInstanceID, profile.CommitKey).
+		Scan(&backfillComplete, &completedThrough)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+	case err != nil:
+		return fmt.Errorf("load commit scan checkpoint: %w", err)
+	case backfillComplete && completedThrough != nil:
+		input.ScanMode = "incremental"
+		input.Window.From = completedThrough.Add(-7 * 24 * time.Hour).UTC()
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO jobs
+			(id, person_id, forge_instance_id, source_key, status, due_at, max_attempts,
+			 cursor, scan_mode, onboarding_login, window_start, window_end)
+		VALUES ($1, $2, $3, $4, 'queued', now(), 10, '', $5, '', $6, $7)
+		ON CONFLICT (person_id, forge_instance_id, source_key)
+			WHERE status IN ('queued', 'running')
+		DO NOTHING`,
+		uuid.New(), claim.PersonID, claim.ForgeInstanceID, profile.CommitKey,
+		input.ScanMode, nullableTime(input.Window.From), input.Window.To); err != nil {
+		return fmt.Errorf("enqueue commit history scan: %w", err)
+	}
+	return nil
 }
 
 // RetryCollectionJob releases a claimed job for a bounded retry or marks it
