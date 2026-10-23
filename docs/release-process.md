@@ -75,6 +75,14 @@ ordinary pushes never publish an image.
 - Permissions: the job uses the built-in `GITHUB_TOKEN` with `packages: write`,
   `id-token: write` and `attestations: write`. No registry secret is needed.
 
+If the publish job did not run (for example after an Actions outage, when
+re-running Release Please finds the release already created and skips it), run
+the **Publish Image** workflow manually from `main` with the existing release
+tag, for example `gh workflow run publish-image.yml -f tag=v0.2.0`. It verifies
+the release exists, builds that tag and applies the same tags and provenance.
+Set `-f latest=false` to leave `latest` unchanged when republishing an older
+release.
+
 On the first publish, GitHub creates the package as private. In the package
 settings, make it public and confirm that it is linked to this repository so
 that anonymous pulls work.
